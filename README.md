@@ -148,6 +148,7 @@ experiments/            # Compression experiments
   flatten_video.py      # Flatten/deflatten bottleneck (temporal)
 
 pretrained/             # Pretrained checkpoints
+  3ch_S8x.pt            # 3ch RGB, 8x spatial, static
   3ch_S8x_T4x.pt       # 3ch RGB, 8x spatial, 4x temporal
 ```
 
@@ -163,3 +164,7 @@ pretrained/             # Pretrained checkpoints
 - **[TAEHV](https://github.com/madebyollin/taehv)** by madebyollin — the causal temporal VAE architecture (MemBlock, TPool, TGrow) that this project builds on
 - **[Revisiting Dead Leaves Model: Training with Synthetic Data](https://ieeexplore.ieee.org/document/9633158/)** (Madhusudana et al., 2021) — demonstrated that neural networks trained on procedural dead leaves images can approach the performance of networks trained on real data
 - **[Finite Scalar Quantization: VQ-VAE Made Simple](https://arxiv.org/abs/2309.15505)** (Mentzer et al., ICLR 2024) — the FSQ quantization method used for discrete latent tokens
+
+## License
+
+MIT with Attribution — free to use, modify, and distribute, but you must credit the original author and link back to this repository. See [LICENSE](LICENSE) for details.
