@@ -1,0 +1,31 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Training artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+!pretrained/*.pt
+
+# Logs
+*_logs/
+logs/
+
+# Data
+data/
+bank/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
