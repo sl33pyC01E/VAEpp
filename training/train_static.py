@@ -246,8 +246,10 @@ def train(args):
                 recon, latent = model(x)
 
                 T_out = recon.shape[1]
-                gt = x[:, x.shape[1] - T_out:]
-                rc = recon
+                T_in = x.shape[1]
+                T_match = min(T_out, T_in)
+                gt = x[:, T_in - T_match:]
+                rc = recon[:, T_out - T_match:]
 
                 mse = F.mse_loss(rc, gt)
                 total = args.w_mse * mse
