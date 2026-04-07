@@ -202,6 +202,7 @@ def save_preview(vae, bottleneck, gen, logdir, step, device, amp_dtype):
         import traceback
         print(f"  preview failed: {e}", flush=True)
         traceback.print_exc()
+        bottleneck.train()
 
 
 # -- Training ------------------------------------------------------------------
