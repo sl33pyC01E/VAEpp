@@ -177,21 +177,22 @@ def train(args):
             model.load_state_dict(ckpt, strict=False)
         print(f"Resumed from {args.resume} at step {global_step}")
 
-    if global_step > 0 and not args.fresh_opt:
-        if ckpt.get("scheduler"):
-            sched.load_state_dict(ckpt["scheduler"])
-        else:
-            # Fallback for old checkpoints without scheduler state
-            for _ in range(global_step):
-                sched.step()
-        if ckpt.get("scaler") and args.precision == "fp16":
-            scaler.load_state_dict(ckpt["scaler"])
-
     # -- Precision --
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
                  "fp32": torch.float32}[args.precision]
     scaler = torch.amp.GradScaler("cuda",
                                    enabled=(args.precision == "fp16"))
+
+    if global_step > 0 and not args.fresh_opt:
+        if ckpt.get("scheduler"):
+            sched.load_state_dict(ckpt["scheduler"])
+        else:
+            # Fallback for old checkpoints: rebuild scheduler at correct position
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01,
+                last_epoch=global_step)
+        if ckpt.get("scaler") and args.precision == "fp16":
+            scaler.load_state_dict(ckpt["scaler"])
 
     gen_bs = args.gen_batch if args.gen_batch > 0 else args.batch_size
     accum = args.grad_accum
