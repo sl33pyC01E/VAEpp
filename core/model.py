@@ -101,14 +101,18 @@ def apply_model_with_memblocks_sequential_single_step(model, memory, work_queue,
                 memory[i] = []
             memory[i].append(xt)
             if len(memory[i]) == b.stride:
-                N, C, H, W = xt.shape
-                xt = b(torch.cat(memory[i], 1).view(N * b.stride, C, H, W))
+                # Stack along temporal dim then reshape to (N*stride, C, H, W)
+                # so each batch item's frames are contiguous — matching the
+                # parallel path's x.reshape(N*T, C, H, W) layout.
+                xt = b(torch.stack(memory[i], 1).reshape(-1, *xt.shape[1:]))
                 memory[i] = []
                 work_queue.insert(0, TWorkItem(xt, i + 1))
         elif isinstance(b, TGrow):
-            xt = b(xt)
-            NT, C, H, W = xt.shape
-            for xt_next in reversed(xt.view(NT // b.stride, b.stride * C, H, W).chunk(b.stride, 1)):
+            xt = b(xt)  # (N*stride, C, H, W)
+            N_batch = xt.shape[0] // b.stride
+            # Reshape to (N, stride, C, H, W) and unbind along temporal dim
+            for xt_next in reversed(list(
+                    xt.reshape(N_batch, b.stride, *xt.shape[1:]).unbind(1))):
                 work_queue.insert(0, TWorkItem(xt_next, i + 1))
         else:
             xt = b(xt)

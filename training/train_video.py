@@ -217,7 +217,13 @@ def train(args):
         print(f"  Fresh optimizer from step {global_step}")
 
     if global_step > 0 and not args.fresh_opt:
-        sched.last_epoch = global_step
+        if ckpt.get("scheduler"):
+            sched.load_state_dict(ckpt["scheduler"])
+        else:
+            for _ in range(global_step):
+                sched.step()
+        if ckpt.get("scaler") and args.precision == "fp16":
+            scaler.load_state_dict(ckpt["scaler"])
 
     # -- Precision --
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
@@ -346,6 +352,8 @@ def train(args):
             d = {
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
+                "scheduler": sched.state_dict(),
+                "scaler": scaler.state_dict(),
                 "global_step": global_step,
                 "config": {
                     "latent_channels": args.latent_ch,
@@ -373,6 +381,8 @@ def train(args):
         d = {
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
+            "scaler": scaler.state_dict(),
             "global_step": global_step,
             "config": {
                 "latent_channels": args.latent_ch,

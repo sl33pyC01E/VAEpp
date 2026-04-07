@@ -221,9 +221,10 @@ class FlattenInferenceTab(tk.Frame):
             ch = config.get("image_channels", 3)
             lat = config.get("latent_channels", 32)
 
+            enc_ch, dec_ch = parse_arch_config(config)
             self.vae = MiniVAE(
                 latent_channels=lat, image_channels=ch, output_channels=ch,
-                encoder_channels=64, decoder_channels=(256, 128, 64),
+                encoder_channels=enc_ch, decoder_channels=dec_ch,
                 encoder_time_downscale=(False, False, False),
                 decoder_time_upscale=(False, False, False),
             ).cuda()
@@ -268,37 +269,42 @@ class FlattenInferenceTab(tk.Frame):
         except Exception as e:
             self.status.config(text=f"Error: {e}")
 
-    @torch.no_grad()
     def test_synthetic(self):
         if self.vae is None or self.bottleneck is None:
             self.status.config(text="Load models first")
             return
 
-        sys.path.insert(0, PROJECT_ROOT)
-        from core.generator import VAEppGenerator
-
         self.status.config(text="Generating...")
-        self.update()
 
-        gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
-                                  n_base_layers=64)
-        gen.build_banks()
-        images = gen.generate(4)  # (4, 3, H, W)
-        x = images.unsqueeze(1).cuda()
+        def _bg():
+            try:
+                import torch
+                sys.path.insert(0, PROJECT_ROOT)
+                from core.generator import VAEppGenerator
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            recon_vae, _ = self.vae(x)
-            lat = self.vae.encode_video(x).squeeze(1)
-            lat_recon, _ = self.bottleneck(lat)
-            recon_flat = self.vae.decode_video(lat_recon.unsqueeze(1))
+                gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
+                                          n_base_layers=64)
+                gen.build_banks()
+                images = gen.generate(4)
+                x = images.unsqueeze(1).cuda()
 
-        gt = images.cpu().numpy()
-        rc_vae = recon_vae[:, -1, :3].clamp(0, 1).float().cpu().numpy()
-        rc_flat = recon_flat[:, -1, :3].clamp(0, 1).float().cpu().numpy()
-        self._display_grid(gt, rc_vae, rc_flat)
-        self.status.config(text="GT | VAE | Flatten (synthetic)")
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    recon_vae, _ = self.vae(x)
+                    lat = self.vae.encode_video(x).squeeze(1)
+                    lat_recon, _ = self.bottleneck(lat)
+                    recon_flat = self.vae.decode_video(lat_recon.unsqueeze(1))
 
-    @torch.no_grad()
+                gt = images.cpu().numpy()
+                rc_vae = recon_vae[:, -1, :3].clamp(0, 1).float().cpu().numpy()
+                rc_flat = recon_flat[:, -1, :3].clamp(0, 1).float().cpu().numpy()
+                self.after(0, self._display_grid, gt, rc_vae, rc_flat)
+                self.after(0, lambda: self.status.config(
+                    text="GT | VAE | Flatten (synthetic)"))
+            except Exception as e:
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def test_image(self):
         """Test on a user-provided image file."""
         if self.vae is None or self.bottleneck is None:
@@ -307,7 +313,6 @@ class FlattenInferenceTab(tk.Frame):
 
         path = self.input_path.get().strip()
         if not path:
-            # Fall back to file dialog
             from tkinter import filedialog
             path = filedialog.askopenfilename(
                 filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tiff"),
@@ -317,33 +322,38 @@ class FlattenInferenceTab(tk.Frame):
             self.input_path.set(path)
 
         self.status.config(text=f"Loading {os.path.basename(path)}...")
-        self.update()
 
-        try:
-            img = Image.open(path).convert("RGB")
-            img = img.resize((640, 360), Image.BILINEAR)
-            arr = np.array(img, dtype=np.float32) / 255.0  # (H, W, 3)
-            t = torch.from_numpy(arr).permute(2, 0, 1)  # (3, H, W)
+        def _bg():
+            try:
+                import torch
+                img = Image.open(path).convert("RGB")
+                img = img.resize((640, 360), Image.BILINEAR)
+                arr = np.array(img, dtype=np.float32) / 255.0
+                t = torch.from_numpy(arr).permute(2, 0, 1)
 
-            ch = getattr(self, '_image_channels', 3)
-            if ch > 3:
-                t = torch.cat([t, torch.zeros(ch - 3, 360, 640)], dim=0)
+                ch = getattr(self, '_image_channels', 3)
+                if ch > 3:
+                    t = torch.cat([t, torch.zeros(ch - 3, 360, 640)], dim=0)
 
-            x = t.unsqueeze(0).unsqueeze(0).cuda()  # (1, 1, C, H, W)
+                x = t.unsqueeze(0).unsqueeze(0).cuda()
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                recon_vae, _ = self.vae(x)
-                lat = self.vae.encode_video(x).squeeze(1)
-                lat_recon, _ = self.bottleneck(lat)
-                recon_flat = self.vae.decode_video(lat_recon.unsqueeze(1))
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    recon_vae, _ = self.vae(x)
+                    lat = self.vae.encode_video(x).squeeze(1)
+                    lat_recon, _ = self.bottleneck(lat)
+                    recon_flat = self.vae.decode_video(lat_recon.unsqueeze(1))
 
-            gt = t[:3].unsqueeze(0).numpy()  # (1, 3, H, W)
-            rc_vae = recon_vae[:, -1, :3].clamp(0, 1).float().cpu().numpy()
-            rc_flat = recon_flat[:, -1, :3].clamp(0, 1).float().cpu().numpy()
-            self._display_grid(gt, rc_vae, rc_flat)
-            self.status.config(text=f"GT | VAE | Flatten — {os.path.basename(path)}")
-        except Exception as e:
-            self.status.config(text=f"Error: {e}")
+                gt = t[:3].unsqueeze(0).numpy()
+                rc_vae = recon_vae[:, -1, :3].clamp(0, 1).float().cpu().numpy()
+                rc_flat = recon_flat[:, -1, :3].clamp(0, 1).float().cpu().numpy()
+                basename = os.path.basename(path)
+                self.after(0, self._display_grid, gt, rc_vae, rc_flat)
+                self.after(0, lambda: self.status.config(
+                    text=f"GT | VAE | Flatten — {basename}"))
+            except Exception as e:
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _display_grid(self, gt, rc_vae, rc_flat):
         """Show GT | VAE | Flatten grid for 1-4 images."""
@@ -631,9 +641,10 @@ class FlattenVideoInferenceTab(tk.Frame):
             ch = config.get("image_channels", 3)
             lat = config.get("latent_channels", 32)
 
+            enc_ch, dec_ch = parse_arch_config(config)
             self.vae = MiniVAE(
                 latent_channels=lat, image_channels=ch, output_channels=ch,
-                encoder_channels=64, decoder_channels=(256, 128, 64),
+                encoder_channels=enc_ch, decoder_channels=dec_ch,
                 encoder_time_downscale=(True, True, False),
                 decoder_time_upscale=(False, True, True),
             ).cuda()
@@ -679,42 +690,48 @@ class FlattenVideoInferenceTab(tk.Frame):
         except Exception as e:
             self.status.config(text=f"Error: {e}")
 
-    @torch.no_grad()
     def test_synthetic(self):
         if self.vae is None or self.bottleneck is None:
             self.status.config(text="Load models first")
             return
 
-        sys.path.insert(0, PROJECT_ROOT)
-        from core.generator import VAEppGenerator
-
         T = self.T_var.get()
         self.status.config(text=f"Generating T={T} clip...")
-        self.update()
 
-        gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
-                                  n_base_layers=64)
-        gen.build_banks()
-        clip = gen.generate_sequence(1, T=T)  # (1, T, 3, H, W)
-        x = clip.cuda()
+        def _bg():
+            try:
+                import torch
+                sys.path.insert(0, PROJECT_ROOT)
+                from core.generator import VAEppGenerator
 
-        recon_vae, recon_flat, lat = chunked_flatten_inference(
-            self.vae, self.bottleneck, x)
+                gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
+                                          n_base_layers=64)
+                gen.build_banks()
+                with torch.no_grad():
+                    clip = gen.generate_sequence(1, T=T)
+                    x = clip.cuda()
+                    recon_vae, recon_flat, lat = chunked_flatten_inference(
+                        self.vae, self.bottleneck, x)
 
-        T_vae = recon_vae.shape[1]
-        T_flat = recon_flat.shape[1]
-        T_in = x.shape[1]
-        T_show = min(T_vae, T_flat, T_in)
+                T_vae = recon_vae.shape[1]
+                T_flat = recon_flat.shape[1]
+                T_in = x.shape[1]
+                T_show = min(T_vae, T_flat, T_in)
 
-        gt = x[0, T_in - T_show:, :3].float().cpu().numpy()
-        rc_vae = recon_vae[0, T_vae - T_show:, :3].clamp(0, 1).float().cpu().numpy()
-        rc_flat = recon_flat[0, T_flat - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+                gt = x[0, T_in - T_show:, :3].float().cpu().numpy()
+                rc_vae = recon_vae[0, T_vae - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+                rc_flat = recon_flat[0, T_flat - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+                lat_T = lat.shape[1]
 
-        self.status.config(text=f"Input T={T_in}, Latent T'={lat.shape[1]}, "
-                           f"Output T''={T_vae}, showing {T_show} frames")
-        self._show_video(gt, rc_vae, rc_flat, T_show)
+                self.after(0, lambda: self.status.config(
+                    text=f"Input T={T_in}, Latent T'={lat_T}, "
+                         f"Output T''={T_vae}, showing {T_show} frames"))
+                self.after(0, self._show_video, gt, rc_vae, rc_flat, T_show)
+            except Exception as e:
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
 
-    @torch.no_grad()
+        threading.Thread(target=_bg, daemon=True).start()
+
     def test_video(self):
         """Test on user-provided video file (from path field or browse)."""
         if self.vae is None or self.bottleneck is None:
@@ -733,42 +750,52 @@ class FlattenVideoInferenceTab(tk.Frame):
 
         T = self.T_var.get()
         self.status.config(text=f"Loading {os.path.basename(path)}...")
-        self.update()
 
-        cmd = ["ffmpeg", "-v", "quiet", "-i", path,
-               "-frames:v", str(T), "-vf", "scale=640:360",
-               "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-        raw = subprocess.run(cmd, capture_output=True).stdout
-        fs = 360 * 640 * 3
-        n = min(len(raw) // fs, T)
-        if n < 2:
-            self.status.config(text="Not enough frames")
-            return
+        def _bg():
+            try:
+                import torch
+                cmd = ["ffmpeg", "-v", "quiet", "-i", path,
+                       "-frames:v", str(T), "-vf", "scale=640:360",
+                       "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+                raw = subprocess.run(cmd, capture_output=True).stdout
+                fs = 360 * 640 * 3
+                n = min(len(raw) // fs, T)
+                if n < 2:
+                    self.after(0, lambda: self.status.config(text="Not enough frames"))
+                    return
 
-        frames = np.frombuffer(raw[:n*fs], dtype=np.uint8).reshape(n, 360, 640, 3)
-        clip = torch.from_numpy(frames.astype(np.float32) / 255.0
-                                ).permute(0, 3, 1, 2).unsqueeze(0).cuda()
+                frames = np.frombuffer(raw[:n*fs], dtype=np.uint8).reshape(n, 360, 640, 3)
+                clip = torch.from_numpy(frames.astype(np.float32) / 255.0
+                                        ).permute(0, 3, 1, 2).unsqueeze(0).cuda()
 
-        ch = self.vae.image_channels
-        if ch > 3:
-            clip = torch.cat([clip, torch.zeros(1, n, ch - 3, 360, 640,
-                                                 device="cuda")], dim=2)
+                ch = self.vae.image_channels
+                if ch > 3:
+                    clip = torch.cat([clip, torch.zeros(1, n, ch - 3, 360, 640,
+                                                         device="cuda")], dim=2)
 
-        recon_vae, recon_flat, lat = chunked_flatten_inference(
-            self.vae, self.bottleneck, clip)
+                with torch.no_grad():
+                    recon_vae, recon_flat, lat = chunked_flatten_inference(
+                        self.vae, self.bottleneck, clip)
 
-        T_vae = recon_vae.shape[1]
-        T_flat = recon_flat.shape[1]
-        T_in = clip.shape[1]
-        T_show = min(T_vae, T_flat, T_in)
+                T_vae = recon_vae.shape[1]
+                T_flat = recon_flat.shape[1]
+                T_in = clip.shape[1]
+                T_show = min(T_vae, T_flat, T_in)
 
-        gt = clip[0, T_in - T_show:, :3].float().cpu().numpy()
-        rc_vae = recon_vae[0, T_vae - T_show:, :3].clamp(0, 1).float().cpu().numpy()
-        rc_flat = recon_flat[0, T_flat - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+                gt = clip[0, T_in - T_show:, :3].float().cpu().numpy()
+                rc_vae = recon_vae[0, T_vae - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+                rc_flat = recon_flat[0, T_flat - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+                basename = os.path.basename(path)
+                lat_T = lat.shape[1]
 
-        self.status.config(text=f"{os.path.basename(path)} — T={T_in}, "
-                           f"Latent T'={lat.shape[1]}, showing {T_show} frames")
-        self._show_video(gt, rc_vae, rc_flat, T_show)
+                self.after(0, lambda: self.status.config(
+                    text=f"{basename} — T={T_in}, Latent T'={lat_T}, "
+                         f"showing {T_show} frames"))
+                self.after(0, self._show_video, gt, rc_vae, rc_flat, T_show)
+            except Exception as e:
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _show_video(self, gt, rc_vae, rc_flat, T_show):
         """Play GT | VAE | Flatten side by side as looping video."""
@@ -1034,22 +1061,27 @@ class FSQInferenceTab(tk.Frame):
         except Exception as e:
             self.status.config(text=f"Error: {e}")
 
-    @torch.no_grad()
     def test_synthetic(self):
         if self.vae is None:
             self.status.config(text="Load a model first")
             return
-        sys.path.insert(0, PROJECT_ROOT)
-        from core.generator import VAEppGenerator
         self.status.config(text="Generating...")
-        self.update()
-        gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
-                                  n_base_layers=64)
-        gen.build_banks()
-        images = gen.generate(4)
-        self._run_inference(images)
 
-    @torch.no_grad()
+        def _bg():
+            try:
+                import torch
+                sys.path.insert(0, PROJECT_ROOT)
+                from core.generator import VAEppGenerator
+                gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
+                                          n_base_layers=64)
+                gen.build_banks()
+                images = gen.generate(4)
+                self._run_inference_bg(images)
+            except Exception as e:
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def test_image(self):
         if self.vae is None:
             self.status.config(text="Load a model first")
@@ -1060,17 +1092,24 @@ class FSQInferenceTab(tk.Frame):
             path = self.input_path.get().strip()
             if not path:
                 return
-        try:
-            img = Image.open(path).convert("RGB").resize((640, 360), Image.BILINEAR)
-            arr = np.array(img, dtype=np.float32) / 255.0
-            t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-            self._run_inference(t)
-        except Exception as e:
-            self.status.config(text=f"Error: {e}")
 
-    def _run_inference(self, images):
+        def _bg():
+            try:
+                import torch
+                img = Image.open(path).convert("RGB").resize((640, 360), Image.BILINEAR)
+                arr = np.array(img, dtype=np.float32) / 255.0
+                t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+                self._run_inference_bg(t)
+            except Exception as e:
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _run_inference_bg(self, images):
+        """Run inference on background thread, marshal results to main thread."""
+        import torch
         x = images.unsqueeze(1).cuda() if images.dim() == 4 else images.unsqueeze(1).cuda()
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             recon_cont, _ = self.vae(x)
             lat = self.vae.encode_video(x).squeeze(1)
             lat_q, indices = self.fsq(lat)
@@ -1095,18 +1134,21 @@ class FSQInferenceTab(tk.Frame):
             rows.append(row)
         grid = np.concatenate(sum([[r, gap] for r in rows], [])[:-1], axis=0)
         pil = Image.fromarray(grid)
+
+        inf_dir = os.path.join(PROJECT_ROOT, "fsq_logs", "inference")
+        os.makedirs(inf_dir, exist_ok=True)
+        import time as _time
+        pil.save(os.path.join(inf_dir, f"fsq_inf_{int(_time.time())}.png"))
+
+        self.after(0, self._show_fsq_result, pil)
+
+    def _show_fsq_result(self, pil):
         scale = min(900 / pil.width, 500 / pil.height, 1.0)
         if scale < 1:
             pil = pil.resize((int(pil.width * scale), int(pil.height * scale)),
                              Image.BILINEAR)
         self._preview_photo = ImageTk.PhotoImage(pil)
         self.preview_label.config(image=self._preview_photo)
-
-        # Save inference output
-        inf_dir = os.path.join(PROJECT_ROOT, "fsq_logs", "inference")
-        os.makedirs(inf_dir, exist_ok=True)
-        import time as _time
-        pil.save(os.path.join(inf_dir, f"fsq_inf_{int(_time.time())}.png"))
         self.status.config(text="GT | Continuous | FSQ")
 
 

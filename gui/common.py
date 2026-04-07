@@ -77,22 +77,24 @@ class ProcRunner:
             self.proc = None
 
     def stop(self):
-        if self.proc:
+        proc = self.proc  # snapshot to avoid race with finally block
+        if proc:
             try:
                 if sys.platform == "win32":
-                    os.kill(self.proc.pid, signal.CTRL_BREAK_EVENT)
+                    os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
                 else:
-                    self.proc.terminate()
+                    proc.terminate()
                 self._append("\n[Stopping...]\n")
-            except ProcessLookupError:
+            except (ProcessLookupError, OSError):
                 pass
 
     def kill(self):
-        if self.proc:
+        proc = self.proc  # snapshot to avoid race with finally block
+        if proc:
             try:
-                self.proc.kill()
+                proc.kill()
                 self._append("\n[Killed]\n")
-            except ProcessLookupError:
+            except (ProcessLookupError, OSError):
                 pass
 
     def _append(self, text):
@@ -104,6 +106,21 @@ class ProcRunner:
 
 
 # -- Helpers -------------------------------------------------------------------
+def parse_arch_config(config):
+    """Extract architecture params from checkpoint config dict.
+
+    Returns (encoder_channels, decoder_channels) with proper types,
+    falling back to defaults for old checkpoints.
+    """
+    enc_ch = config.get("encoder_channels", 64)
+    if isinstance(enc_ch, str):
+        enc_ch = int(enc_ch)
+    dec_ch = config.get("decoder_channels", (256, 128, 64))
+    if isinstance(dec_ch, str):
+        dec_ch = tuple(int(x.strip()) for x in dec_ch.split(","))
+    return enc_ch, dec_ch
+
+
 def make_log(parent):
     return tk.Text(parent, bg=BG_LOG, fg=FG, font=FONT_SMALL,
                    insertbackground=FG, height=10, wrap=tk.WORD,

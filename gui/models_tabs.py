@@ -262,12 +262,13 @@ class InferenceTab(tk.Frame):
             ch = config.get("image_channels", 3)
             lat = config.get("latent_channels", 32)
 
+            enc_ch, dec_ch = parse_arch_config(config)
             self.model = MiniVAE(
                 latent_channels=lat,
                 image_channels=ch,
                 output_channels=ch,
-                encoder_channels=64,
-                decoder_channels=(256, 128, 64),
+                encoder_channels=enc_ch,
+                decoder_channels=dec_ch,
                 encoder_time_downscale=(False, False, False),
                 decoder_time_upscale=(False, False, False),
             ).cuda()
@@ -281,13 +282,10 @@ class InferenceTab(tk.Frame):
         except Exception as e:
             self.status_label.config(text=f"Error: {e}")
 
-    @torch.no_grad()
     def run_inference(self):
         if self.model is None:
             self.status_label.config(text="Load a model first")
             return
-
-        import torch
 
         input_path = self.input_var.get().strip()
         if not input_path:
@@ -308,64 +306,76 @@ class InferenceTab(tk.Frame):
             self.status_label.config(text="No images found")
             return
 
-        ch = self.model.image_channels
+        self.status_label.config(text="Running inference...")
 
-        # Load and process
-        pairs = []
-        for p in img_paths:
-            img = Image.open(p).convert("RGB")
-            img = img.resize((640, 360), Image.BILINEAR)
-            arr = np.array(img, dtype=np.float32) / 255.0
-            t = torch.from_numpy(arr).permute(2, 0, 1)  # (3, H, W)
-            if ch > 3:
-                # Pad with zeros for extra channels
-                t = torch.cat([t, torch.zeros(ch - 3, 360, 640)], dim=0)
-            inp = t.unsqueeze(0).unsqueeze(0).cuda()  # (1, 1, C, H, W)
-            recon, _ = self.model(inp)
-            rc = recon[0, -1, :3].clamp(0, 1).cpu().numpy()  # take RGB
-            gt = arr.transpose(2, 0, 1)  # (3, H, W)
+        def _bg():
+            try:
+                import torch
+                model = self.model
+                ch = model.image_channels
 
-            gt_img = (gt.transpose(1, 2, 0) * 255).astype(np.uint8)
-            rc_img = (rc.transpose(1, 2, 0) * 255).astype(np.uint8)
-            pair = np.concatenate([gt_img, np.full((360, 4, 3), 14, dtype=np.uint8),
-                                   rc_img], axis=1)
-            pairs.append(pair)
+                # Load and process
+                pairs = []
+                with torch.no_grad():
+                    for p in img_paths:
+                        img = Image.open(p).convert("RGB")
+                        img = img.resize((640, 360), Image.BILINEAR)
+                        arr = np.array(img, dtype=np.float32) / 255.0
+                        t = torch.from_numpy(arr).permute(2, 0, 1)
+                        if ch > 3:
+                            t = torch.cat([t, torch.zeros(ch - 3, 360, 640)], dim=0)
+                        inp = t.unsqueeze(0).unsqueeze(0).cuda()
+                        recon, _ = model(inp)
+                        rc = recon[0, -1, :3].clamp(0, 1).cpu().numpy()
+                        gt = arr.transpose(2, 0, 1)
 
-        # Stack vertically (up to 16)
-        if len(pairs) == 1:
-            grid = pairs[0]
-        else:
-            gap = np.full((4, pairs[0].shape[1], 3), 14, dtype=np.uint8)
-            rows = []
-            for i in range(0, len(pairs), 4):
-                chunk = pairs[i:i+4]
-                row = np.concatenate(
-                    [np.concatenate([c, gap], axis=0) for c in chunk][:-1] + [chunk[-1]],
-                    axis=0)
-                rows.append(row)
-            if len(rows) > 1:
-                max_w = max(r.shape[1] for r in rows)
-                padded = []
-                for r in rows:
-                    if r.shape[1] < max_w:
-                        pad = np.full((r.shape[0], max_w - r.shape[1], 3), 14, dtype=np.uint8)
-                        r = np.concatenate([r, pad], axis=1)
-                    padded.append(r)
-                vgap = np.full((4, max_w, 3), 14, dtype=np.uint8)
-                grid = np.concatenate(
-                    sum([[r, vgap] for r in padded], [])[:-1], axis=0)
-            else:
-                grid = rows[0]
+                        gt_img = (gt.transpose(1, 2, 0) * 255).astype(np.uint8)
+                        rc_img = (rc.transpose(1, 2, 0) * 255).astype(np.uint8)
+                        pair = np.concatenate([gt_img, np.full((360, 4, 3), 14, dtype=np.uint8),
+                                               rc_img], axis=1)
+                        pairs.append(pair)
 
-        pil_full = Image.fromarray(grid)
-        # Save to inference dir
-        import time as _time
-        inf_dir = os.path.join(PROJECT_ROOT, "synthyper_logs", "inference")
-        os.makedirs(inf_dir, exist_ok=True)
-        pil_full.save(os.path.join(inf_dir,
-            f"static_inf_{int(_time.time())}.png"))
+                # Stack vertically (up to 16)
+                if len(pairs) == 1:
+                    grid = pairs[0]
+                else:
+                    gap = np.full((4, pairs[0].shape[1], 3), 14, dtype=np.uint8)
+                    rows = []
+                    for i in range(0, len(pairs), 4):
+                        chunk = pairs[i:i+4]
+                        row = np.concatenate(
+                            [np.concatenate([c, gap], axis=0) for c in chunk][:-1] + [chunk[-1]],
+                            axis=0)
+                        rows.append(row)
+                    if len(rows) > 1:
+                        max_w = max(r.shape[1] for r in rows)
+                        padded = []
+                        for r in rows:
+                            if r.shape[1] < max_w:
+                                pad = np.full((r.shape[0], max_w - r.shape[1], 3), 14, dtype=np.uint8)
+                                r = np.concatenate([r, pad], axis=1)
+                            padded.append(r)
+                        vgap = np.full((4, max_w, 3), 14, dtype=np.uint8)
+                        grid = np.concatenate(
+                            sum([[r, vgap] for r in padded], [])[:-1], axis=0)
+                    else:
+                        grid = rows[0]
 
-        # Scale to fit display
+                pil_full = Image.fromarray(grid)
+                import time as _time
+                inf_dir = os.path.join(PROJECT_ROOT, "synthyper_logs", "inference")
+                os.makedirs(inf_dir, exist_ok=True)
+                pil_full.save(os.path.join(inf_dir,
+                    f"static_inf_{int(_time.time())}.png"))
+
+                n_pairs = len(pairs)
+                self.after(0, self._show_inference_result, pil_full, n_pairs)
+            except Exception as e:
+                self.after(0, lambda: self.status_label.config(text=f"Error: {e}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _show_inference_result(self, pil_full, n_pairs):
         max_w = 1000
         max_h = 600
         scale = min(max_w / pil_full.width, max_h / pil_full.height, 1.0)
@@ -376,7 +386,7 @@ class InferenceTab(tk.Frame):
 
         self._preview_photo = ImageTk.PhotoImage(pil_full)
         self.preview_label.config(image=self._preview_photo)
-        self.status_label.config(text=f"Inference: {len(pairs)} images (saved)")
+        self.status_label.config(text=f"Inference: {n_pairs} images (saved)")
 
 
 # -- Convert Tab ---------------------------------------------------------------
@@ -476,12 +486,13 @@ class ConvertTab(tk.Frame):
         self._log(f"\nBuilding temporal model (latent_ch={lat})...")
         sys.path.insert(0, PROJECT_ROOT)
         from core.model import MiniVAE
+        enc_ch, dec_ch = parse_arch_config(config)
         temporal_model = MiniVAE(
             latent_channels=lat,
             image_channels=3,
             output_channels=3,
-            encoder_channels=64,
-            decoder_channels=(256, 128, 64),
+            encoder_channels=enc_ch,
+            decoder_channels=dec_ch,
             encoder_time_downscale=(True, True, False),
             decoder_time_upscale=(False, True, True),
         )
@@ -571,9 +582,10 @@ class ConvertTab(tk.Frame):
             sys.path.insert(0, PROJECT_ROOT)
             from core.model import MiniVAE
             lat = config.get("latent_channels", 32)
+            enc_ch, dec_ch = parse_arch_config(config)
             model = MiniVAE(
                 latent_channels=lat, image_channels=3, output_channels=3,
-                encoder_channels=64, decoder_channels=(256, 128, 64),
+                encoder_channels=enc_ch, decoder_channels=dec_ch,
                 encoder_time_downscale=(True, True, False),
                 decoder_time_upscale=(False, True, True),
             )
@@ -850,9 +862,10 @@ class VideoInferenceTab(tk.Frame):
                 etd = (False, False, False)
                 dtu = (False, False, False)
 
+            enc_ch, dec_ch = parse_arch_config(config)
             self.model = MiniVAE(
                 latent_channels=lat, image_channels=ch, output_channels=ch,
-                encoder_channels=64, decoder_channels=(256, 128, 64),
+                encoder_channels=enc_ch, decoder_channels=dec_ch,
                 encoder_time_downscale=etd, decoder_time_upscale=dtu,
             ).cuda()
 
@@ -874,39 +887,43 @@ class VideoInferenceTab(tk.Frame):
         except Exception as e:
             self.status.config(text=f"Error: {e}")
 
-    @torch.no_grad()
     def test_synthetic(self):
         if self.model is None:
             self.status.config(text="Load a model first")
             return
 
-        sys.path.insert(0, PROJECT_ROOT)
-        from core.generator import VAEppGenerator
-
         T = self.T_var.get()
         self.status.config(text=f"Generating T={T} synthetic clip...")
-        self.update()
 
-        gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
-                                  n_base_layers=64)
-        gen.build_banks()
+        def _bg():
+            try:
+                import torch
+                sys.path.insert(0, PROJECT_ROOT)
+                from core.generator import VAEppGenerator
 
-        clip = gen.generate_sequence(1, T=T)  # (1, T, 3, H, W)
-        x = clip.cuda()
+                gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
+                                          n_base_layers=64)
+                gen.build_banks()
 
-        recon, latent = chunked_vae_inference(self.model, x)
+                with torch.no_grad():
+                    clip = gen.generate_sequence(1, T=T)
+                    x = clip.cuda()
+                    recon, latent = chunked_vae_inference(self.model, x)
 
-        trim = getattr(self.model, 'frames_to_trim', 0)
-        T_out = recon.shape[1]
-        gt = x[0, trim:trim + T_out].float().cpu().numpy()
-        rc = recon[0].clamp(0, 1).float().cpu().numpy()
+                trim = getattr(self.model, 'frames_to_trim', 0)
+                T_out = recon.shape[1]
+                gt = x[0, trim:trim + T_out].float().cpu().numpy()
+                rc = recon[0].clamp(0, 1).float().cpu().numpy()
+                T_in = x.shape[1]
 
-        self.status.config(text=f"Input T={x.shape[1]}, Recon T={T_out}, "
-                           f"trim={trim}")
+                self.after(0, lambda: self.status.config(
+                    text=f"Input T={T_in}, Recon T={T_out}, trim={trim}"))
+                self.after(0, self._show_video, gt, rc, T_out)
+            except Exception as e:
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
 
-        self._show_video(gt, rc, T_out)
+        threading.Thread(target=_bg, daemon=True).start()
 
-    @torch.no_grad()
     def test_mp4(self):
         if self.model is None:
             self.status.config(text="Load a model first")
@@ -920,40 +937,47 @@ class VideoInferenceTab(tk.Frame):
 
         T = self.T_var.get()
         self.status.config(text=f"Loading {os.path.basename(path)}...")
-        self.update()
 
-        # Decode T frames
-        cmd = ["ffmpeg", "-v", "quiet", "-i", path,
-               "-frames:v", str(T),
-               "-vf", "scale=640:360",
-               "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-        raw = subprocess.run(cmd, capture_output=True).stdout
-        fs = 360 * 640 * 3
-        n = min(len(raw) // fs, T)
-        if n < 2:
-            self.status.config(text="Not enough frames")
-            return
+        def _bg():
+            try:
+                import torch
+                # Decode T frames
+                cmd = ["ffmpeg", "-v", "quiet", "-i", path,
+                       "-frames:v", str(T),
+                       "-vf", "scale=640:360",
+                       "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+                raw = subprocess.run(cmd, capture_output=True).stdout
+                fs = 360 * 640 * 3
+                n = min(len(raw) // fs, T)
+                if n < 2:
+                    self.after(0, lambda: self.status.config(text="Not enough frames"))
+                    return
 
-        frames = np.frombuffer(raw[:n*fs], dtype=np.uint8).reshape(n, 360, 640, 3)
-        clip = torch.from_numpy(frames.astype(np.float32) / 255.0
-                                ).permute(0, 3, 1, 2).unsqueeze(0).cuda()
+                frames = np.frombuffer(raw[:n*fs], dtype=np.uint8).reshape(n, 360, 640, 3)
+                clip = torch.from_numpy(frames.astype(np.float32) / 255.0
+                                        ).permute(0, 3, 1, 2).unsqueeze(0).cuda()
 
-        ch = self.model.image_channels
-        if ch > 3:
-            clip = torch.cat([clip, torch.zeros(1, n, ch - 3, 360, 640,
-                                                 device="cuda")], dim=2)
+                ch = self.model.image_channels
+                if ch > 3:
+                    clip = torch.cat([clip, torch.zeros(1, n, ch - 3, 360, 640,
+                                                         device="cuda")], dim=2)
 
-        recon, latent = chunked_vae_inference(self.model, clip)
+                with torch.no_grad():
+                    recon, latent = chunked_vae_inference(self.model, clip)
 
-        trim = getattr(self.model, 'frames_to_trim', 0)
-        T_out = recon.shape[1]
-        gt = clip[0, trim:trim + T_out, :3].float().cpu().numpy()
-        rc = recon[0, :, :3].clamp(0, 1).float().cpu().numpy()
+                trim = getattr(self.model, 'frames_to_trim', 0)
+                T_out = recon.shape[1]
+                gt = clip[0, trim:trim + T_out, :3].float().cpu().numpy()
+                rc = recon[0, :, :3].clamp(0, 1).float().cpu().numpy()
+                T_in = clip.shape[1]
 
-        self.status.config(text=f"Input T={clip.shape[1]}, Recon T={T_out}, "
-                           f"trim={trim}")
+                self.after(0, lambda: self.status.config(
+                    text=f"Input T={T_in}, Recon T={T_out}, trim={trim}"))
+                self.after(0, self._show_video, gt, rc, T_out)
+            except Exception as e:
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
 
-        self._show_video(gt, rc, T_out)
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _show_video(self, gt, rc, T_show):
         """Play GT|Recon side by side as inline video loop."""

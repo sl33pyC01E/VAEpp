@@ -103,14 +103,230 @@ class RecipesMixin:
                 T=T, **seq_kwargs)
 
     def _render_recipe(self, recipe):
-        """Render a single recipe into a (T, 3, H, W) clip on GPU."""
+        """Render a single recipe into a (T, 3, H, W) clip on GPU.
+
+        Uses stored recipe parameters for deterministic, reproducible rendering.
+        """
+        import torch.nn.functional as F
+
         T = recipe["T"]
-        # Reconstruct all the params and call generate_sequence with B=1
-        # For simplicity, just call generate_sequence which already handles everything
-        # But seed it with the recipe's parameters
-        # For now, render fresh with the stored seq_kwargs
-        clip = self.generate_sequence(1, T=T, **recipe.get("seq_kwargs", {}))
-        return clip[0]  # (T, 3, H, W)
+        H, W = self.H, self.W
+        dev = self.device
+
+        bg = torch.tensor(recipe["bg_color"], device=dev).view(1, 3, 1, 1)
+
+        layer_idx = recipe["layer_idx"]
+        n_layers = len(layer_idx)
+        pan_dx = torch.tensor(recipe["pan_dx"], device=dev)
+        pan_dy = torch.tensor(recipe["pan_dy"], device=dev)
+        pan_speed = torch.tensor(recipe["pan_speed"], device=dev)
+        opacity_start = torch.tensor(recipe["opacity_start"], device=dev)
+        opacity_end = torch.tensor(recipe["opacity_end"], device=dev)
+        color_shift = torch.tensor(recipe["color_shift"], device=dev)  # (n_layers, 3)
+        zoom_start = torch.tensor(recipe["zoom_start"], device=dev)
+        zoom_end = torch.tensor(recipe["zoom_end"], device=dev)
+
+        stamp_idx = recipe["stamp_idx"]
+        n_stamps = len(stamp_idx)
+        stamp_x = torch.tensor(recipe["stamp_x"], device=dev)
+        stamp_y = torch.tensor(recipe["stamp_y"], device=dev)
+        stamp_vx = torch.tensor(recipe["stamp_vx"], device=dev)
+        stamp_vy = torch.tensor(recipe["stamp_vy"], device=dev)
+        stamp_gravity = torch.tensor(recipe["stamp_gravity"], device=dev)
+        stamp_scale = torch.tensor(recipe["stamp_scale"], device=dev)
+        stamp_rot = torch.tensor(recipe["stamp_rot"], device=dev)
+        stamp_rot_speed = torch.tensor(recipe["stamp_rot_speed"], device=dev)
+
+        vp_pan = torch.tensor(recipe["vp_pan"], device=dev)
+        vp_zoom = recipe["vp_zoom"]
+        vp_rot = torch.tensor(recipe["vp_rot"], device=dev)
+
+        gamma = recipe.get("gamma", 1.0)
+
+        # Fine grain layer
+        use_fine = recipe.get("use_fine", False)
+        fine_layer = None
+        fine_opacity = 0
+        if use_fine and self.base_layers is not None:
+            fidx = recipe.get("fine_layer_idx", 0) % self.n_base_layers
+            tile_f = recipe.get("fine_tile", 4)
+            fine_src = self.base_layers[fidx:fidx+1]
+            sh = (H + tile_f - 1) // tile_f
+            sw = (W + tile_f - 1) // tile_f
+            small = F.interpolate(fine_src, (sh, sw),
+                                  mode="bilinear", align_corners=False)
+            fine_layer = small.repeat(1, 1, tile_f, tile_f)[:, :, :H, :W]
+            fine_opacity = recipe.get("fine_opacity", 0.2)
+
+        # Micro stamp params
+        n_micro = recipe.get("n_micro", 0)
+        micro_idx = recipe.get("micro_idx", [])
+        micro_x = torch.tensor(recipe.get("micro_x", []), device=dev)
+        micro_y = torch.tensor(recipe.get("micro_y", []), device=dev)
+        micro_dx_t = torch.tensor(recipe.get("micro_dx", []), device=dev)
+        micro_dy_t = torch.tensor(recipe.get("micro_dy", []), device=dev)
+
+        # Pre-transform stamps
+        stamp_shapes = []
+        if self.shape_bank is not None and n_stamps > 0:
+            for si in range(n_stamps):
+                sidx = stamp_idx[si] % self.shape_bank.shape[0]
+                rgba = self._transform_bank_shape(self.shape_bank[sidx].clone())
+                stamp_shapes.append(rgba)
+
+        # Pre-transform micro stamps
+        micro_shapes = []
+        if self.shape_bank is not None and n_micro > 0:
+            for mi in range(min(n_micro, len(micro_idx))):
+                midx = micro_idx[mi] % self.shape_bank.shape[0]
+                rgba = self._transform_bank_shape(self.shape_bank[midx].clone())
+                micro_shapes.append(rgba)
+
+        # Simulate stamp physics
+        sx = stamp_x.clone()
+        sy = stamp_y.clone()
+        svx = stamp_vx.clone()
+        svy = stamp_vy.clone()
+        s_rot = stamp_rot.clone()
+
+        stamp_trajectories = torch.zeros(n_stamps, T, 4, device=dev)
+        for ti in range(T):
+            stamp_trajectories[:, ti, 0] = sx
+            stamp_trajectories[:, ti, 1] = sy
+            stamp_trajectories[:, ti, 2] = stamp_scale
+            stamp_trajectories[:, ti, 3] = s_rot
+
+            svy = svy + stamp_gravity
+            sx = sx + svx
+            sy = sy + svy
+            s_rot = s_rot + stamp_rot_speed
+
+            # Bounce
+            bounce_x = (sx < 0) | (sx > W)
+            bounce_y = (sy < 0) | (sy > H)
+            svx[bounce_x] = -svx[bounce_x]
+            svy[bounce_y] = -svy[bounce_y]
+            sx.clamp_(0, W)
+            sy.clamp_(0, H)
+
+        # Render frames
+        frames = []
+        for ti in range(T):
+            t_frac = ti / max(T - 1, 1)
+            canvas = bg.expand(1, 3, H, W).clone()
+
+            # Layers
+            for li in range(n_layers):
+                if self.base_layers is None:
+                    break
+                lidx = layer_idx[li] % self.n_base_layers
+                layer = self.base_layers[lidx:lidx+1].clone()
+                cs = color_shift[li].view(1, 3, 1, 1)
+                layer = (layer + cs).clamp(0, 1)
+
+                dx = pan_dx[li] * pan_speed[li] * t_frac
+                dy = pan_dy[li] * pan_speed[li] * t_frac
+                zoom = zoom_start[li] * (1 - t_frac) + zoom_end[li] * t_frac
+
+                theta = torch.zeros(1, 2, 3, device=dev)
+                theta[0, 0, 0] = 1.0 / zoom
+                theta[0, 1, 1] = 1.0 / zoom
+                theta[0, 0, 2] = -dx / (W / 2)
+                theta[0, 1, 2] = -dy / (H / 2)
+                grid = F.affine_grid(theta, (1, 3, H, W), align_corners=False)
+                layer = F.grid_sample(layer, grid, mode="bilinear",
+                                       padding_mode="reflection", align_corners=False)
+
+                opacity = opacity_start[li] * (1 - t_frac) + opacity_end[li] * t_frac
+                canvas = canvas * (1 - opacity) + layer * opacity
+
+            # Stamps
+            for si in range(n_stamps):
+                if not stamp_shapes:
+                    break
+                rgba = stamp_shapes[si]
+                px_f = stamp_trajectories[si, ti, 0].item()
+                py_f = stamp_trajectories[si, ti, 1].item()
+                sc = stamp_trajectories[si, ti, 2].item()
+                rot_angle = stamp_trajectories[si, ti, 3].item()
+
+                if abs(rot_angle) > 0.01:
+                    import math
+                    cos_r = math.cos(rot_angle)
+                    sin_r = math.sin(rot_angle)
+                    rot_theta = torch.tensor(
+                        [[cos_r, -sin_r, 0], [sin_r, cos_r, 0]],
+                        device=dev).unsqueeze(0)
+                    rot_grid = F.affine_grid(
+                        rot_theta, (1, 4, self.shape_res, self.shape_res),
+                        align_corners=False)
+                    rgba = F.grid_sample(
+                        rgba.unsqueeze(0), rot_grid, mode="bilinear",
+                        padding_mode="zeros", align_corners=False)[0]
+
+                rgb = rgba[:3]
+                alpha_s = rgba[3:4]
+
+                th = max(3, int(self.shape_res * sc * H / 360))
+                tw = max(3, int(self.shape_res * sc * W / 640))
+                th, tw = min(th, H // 2), min(tw, W // 2)
+
+                rgb_r = F.interpolate(rgb.unsqueeze(0), (th, tw),
+                                      mode="bilinear", align_corners=False)[0]
+                a_r = F.interpolate(alpha_s.unsqueeze(0), (th, tw),
+                                    mode="bilinear", align_corners=False)[0]
+
+                px = int(px_f) - tw // 2
+                py = int(py_f) - th // 2
+
+                sx_c = max(0, -px)
+                sy_c = max(0, -py)
+                ex = min(tw, W - px)
+                ey = min(th, H - py)
+                if ex <= sx_c or ey <= sy_c:
+                    continue
+                cx, cy = max(0, px), max(0, py)
+                rh, rw = ey - sy_c, ex - sx_c
+
+                a = a_r[:, sy_c:ey, sx_c:ex]
+                canvas[0, :, cy:cy+rh, cx:cx+rw] = \
+                    canvas[0, :, cy:cy+rh, cx:cx+rw] * (1 - a) + \
+                    rgb_r[:, sy_c:ey, sx_c:ex] * a
+
+            # Fine grain
+            if fine_layer is not None:
+                canvas = canvas * (1 - fine_opacity) + fine_layer * fine_opacity
+
+            # Micro stamps
+            for mi in range(min(n_micro, len(micro_shapes))):
+                rgba = micro_shapes[mi]
+                rgb = rgba[:3]
+                alpha_m = rgba[3:4]
+                sc = 0.12
+                th = max(3, int(self.shape_res * sc * H / 360))
+                tw = max(3, int(self.shape_res * sc * W / 640))
+                th, tw = min(th, H // 3), min(tw, W // 3)
+                rgb_r = F.interpolate(rgb.unsqueeze(0), (th, tw),
+                                      mode="bilinear", align_corners=False)[0]
+                a_r = F.interpolate(alpha_m.unsqueeze(0), (th, tw),
+                                    mode="bilinear", align_corners=False)[0]
+                mpx = int(micro_x[mi].item() + micro_dx_t[mi].item() * t_frac) - tw // 2
+                mpy = int(micro_y[mi].item() + micro_dy_t[mi].item() * t_frac) - th // 2
+                if 0 <= mpx < W - tw and 0 <= mpy < H - th:
+                    canvas[0, :, mpy:mpy+th, mpx:mpx+tw] = \
+                        canvas[0, :, mpy:mpy+th, mpx:mpx+tw] * (1 - a_r) + rgb_r * a_r
+
+            # Viewport
+            canvas = self._apply_viewport(canvas, ti, T,
+                                          vp_pan.unsqueeze(0),
+                                          torch.tensor([vp_zoom], device=dev),
+                                          vp_rot.unsqueeze(0))
+
+            # Post-processing
+            canvas = canvas.clamp(1e-6, 1).pow(gamma)
+            frames.append(canvas.clamp(0, 1))
+
+        return torch.cat(frames, dim=0)  # (T, 3, H, W) — squeezed from (T, 1, 3, H, W)
 
     def generate_from_pool(self, batch_size, refresh_interval=100):
         """Render B clips from recipe pool.
@@ -150,7 +366,7 @@ class RecipesMixin:
             shift = (torch.rand(3, 1, 1, device=self.device) - 0.5) * 0.3
             clips[bi] = (clips[bi] + shift).clamp(0, 1)
             if torch.rand(1).item() < 0.3:
-                clips[bi] = clips[bi].roll(torch.randint(1, 3, (1,)).item(), dims=1)
+                clips[bi] = clips[bi].roll(torch.randint(1, 3, (1,)).item(), dims=0)
 
         return clips.clamp(0, 1)
 

@@ -402,20 +402,25 @@ class MotionMixin:
         if use_fluid:
             flow_fields = self._generate_flow_field(B, T) * fluid_strength
 
+        # Pre-render scene template once (templates use random values internally,
+        # so calling per-frame would cause flickering)
+        template_canvas = None
+        if has_template:
+            base_canvas = disco_bg.clone() if disco_bg is not None else bg.expand(B, 3, H, W).clone()
+            template_canvas = self._apply_scene_template(base_canvas, template, B)
+
         # --- Render T frames ---
         frames = []
         for ti in range(T):
             t_frac = ti / max(T - 1, 1)
 
-            # Background: disco or solid color
-            if disco_bg is not None:
+            # Background: disco or solid color, or cached template
+            if template_canvas is not None:
+                canvas = template_canvas.clone()
+            elif disco_bg is not None:
                 canvas = disco_bg.clone()
             else:
                 canvas = bg.expand(B, 3, H, W).clone()
-
-            # Apply scene template
-            if has_template:
-                canvas = self._apply_scene_template(canvas, template, B)
 
             # Tessellation overlay (consistent across frames)
             if tess_layer is not None:
@@ -648,6 +653,12 @@ class MotionMixin:
         template = self._pick_template()
         has_template = template != "random"
 
+        # Pre-render template once to avoid per-frame flickering
+        template_rgb = None
+        if has_template:
+            template_rgb = self._apply_scene_template(
+                bg_rgb.expand(B, 3, H, W).clone(), template, B)
+
         # --- Render T frames with all channels ---
         all_frames = []  # list of (B, 9, H, W)
         prev_rgb = None
@@ -656,13 +667,12 @@ class MotionMixin:
             t_frac = ti / max(T - 1, 1)
 
             # Init canvases
-            rgb = bg_rgb.expand(B, 3, H, W).clone()
+            if template_rgb is not None:
+                rgb = template_rgb.clone()
+            else:
+                rgb = bg_rgb.expand(B, 3, H, W).clone()
             depth = bg_depth.expand(B, 1, H, W).clone()
             sem = bg_sem.expand(B, 3, H, W).clone()
-
-            # Apply scene template
-            if has_template:
-                rgb = self._apply_scene_template(rgb, template, B)
 
             # --- Layer compositing ---
             for li in range(max_layers):

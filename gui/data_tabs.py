@@ -77,6 +77,37 @@ class GeneratorTab(tk.Frame):
         tk.Label(L, text="Generator Controls", bg=BG_PANEL, fg=FG,
                  font=FONT_TITLE).pack(anchor="w")
 
+        # -- Actions (top of panel) --
+        tk.Label(L, text="Actions", bg=BG_PANEL, fg=ACCENT,
+                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
+        br_top = tk.Frame(L, bg=BG_PANEL)
+        br_top.pack(fill="x", pady=2)
+        make_btn(br_top, "Disco Quadrant", self.disco_quadrant, "#dd44dd", 12).pack(side="left", padx=(0, 3))
+        make_btn(br_top, "Save Bank", self.save_bank, BLUE, 12).pack(side="left")
+        tk.Label(L, text="^^^^^^^^", bg=BG_PANEL, fg=FG_DIM,
+                 font=FONT_SMALL).pack(anchor="w")
+        tk.Label(L, text="start here", bg=BG_PANEL, fg=FG_DIM,
+                 font=FONT_SMALL).pack(anchor="w")
+        br1 = tk.Frame(L, bg=BG_PANEL)
+        br1.pack(fill="x", pady=2)
+        make_btn(br1, "Build Banks", self.build_banks, GREEN, 12).pack(side="left", padx=(0, 3))
+        make_btn(br1, "Refresh Layers", self.refresh_layers, BLUE, 12).pack(side="left")
+        br2 = tk.Frame(L, bg=BG_PANEL)
+        br2.pack(fill="x", pady=2)
+        make_btn(br2, "Generate 1", self.gen_sample, ACCENT, 12).pack(side="left", padx=(0, 3))
+        make_btn(br2, "Generate 8", self.gen_batch, ACCENT, 12).pack(side="left")
+        br3 = tk.Frame(L, bg=BG_PANEL)
+        br3.pack(fill="x", pady=2)
+        make_btn(br3, "Load Bank", self.load_bank, BLUE, 12).pack(side="left", padx=(0, 3))
+        make_btn(br3, "Accumulate", self.build_accumulate, GREEN, 12).pack(side="left")
+        br4 = tk.Frame(L, bg=BG_PANEL)
+        br4.pack(fill="x", pady=2)
+        make_btn(br4, "Browse Bank", self.browse_bank, ACCENT, 12).pack(side="left", padx=(0, 3))
+        make_btn(br4, "Disco Bank", self.disco_bank, "#dd44dd", 12).pack(side="left")
+        br5 = tk.Frame(L, bg=BG_PANEL)
+        br5.pack(fill="x", pady=2)
+        make_btn(br5, "Empty Banks", self.empty_banks, RED, 12).pack(side="left")
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -172,35 +203,6 @@ class GeneratorTab(tk.Frame):
         f, self.val_hi = make_slider(L, "Val max", 0, 1, 1.0)
         f.pack(fill="x")
 
-        # -- Buttons --
-        tk.Label(L, text="Actions", bg=BG_PANEL, fg=ACCENT,
-                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
-        br = tk.Frame(L, bg=BG_PANEL)
-        br.pack(fill="x", pady=2)
-        make_btn(br, "Build Banks", self.build_banks, GREEN, 12).pack(side="left", padx=(0, 3))
-        make_btn(br, "Refresh Layers", self.refresh_layers, BLUE, 12).pack(side="left")
-        br2 = tk.Frame(L, bg=BG_PANEL)
-        br2.pack(fill="x", pady=2)
-        make_btn(br2, "Generate 1", self.gen_sample, ACCENT, 12).pack(side="left", padx=(0, 3))
-        make_btn(br2, "Generate 8", self.gen_batch, ACCENT, 12).pack(side="left")
-        br3 = tk.Frame(L, bg=BG_PANEL)
-        br3.pack(fill="x", pady=2)
-        make_btn(br3, "Save Bank", self.save_bank, BLUE, 12).pack(side="left", padx=(0, 3))
-        make_btn(br3, "Load Bank", self.load_bank, BLUE, 12).pack(side="left")
-        br4 = tk.Frame(L, bg=BG_PANEL)
-        br4.pack(fill="x", pady=2)
-        make_btn(br4, "Accumulate", self.build_accumulate, GREEN, 12).pack(side="left", padx=(0, 3))
-        make_btn(br4, "Browse Bank", self.browse_bank, ACCENT, 12).pack(side="left")
-        br5 = tk.Frame(L, bg=BG_PANEL)
-        br5.pack(fill="x", pady=2)
-        make_btn(br5, "Empty Banks", self.empty_banks, RED, 12).pack(side="left", padx=(0, 3))
-        make_btn(br5, "Disco Bank", self.disco_bank, "#dd44dd", 12).pack(side="left", padx=(0, 3))
-        self.disco_quadrant_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(br5, text="Disco Quadrant", variable=self.disco_quadrant_var,
-                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
-                       activebackground=BG_PANEL, activeforeground=FG,
-                       font=FONT_SMALL, command=self._toggle_disco_quadrant
-                       ).pack(side="left")
 
         # Stats
         self.stats_label = tk.Label(L, text="Banks: not built", bg=BG_PANEL,
@@ -360,12 +362,19 @@ class GeneratorTab(tk.Frame):
         self.bank_canvas.delete("all")
         self.stats_label.config(text="Banks emptied")
 
-    def _toggle_disco_quadrant(self):
-        """Toggle disco quadrant mode on the generator."""
+    def disco_quadrant(self):
+        """Activate quadrant mode, build bank, deactivate quadrant mode."""
+        self.gen = None
         gen = self._get_gen()
-        gen.disco_quadrant = self.disco_quadrant_var.get()
-        state = "ON" if gen.disco_quadrant else "OFF"
-        self.stats_label.config(text=f"Disco quadrant mode: {state}")
+        gen.disco_quadrant = True
+        self.stats_label.config(text="Disco quadrant: building banks...")
+        self.update()
+        def _build():
+            gen.build_banks()
+            gen.disco_quadrant = False
+            self.after(0, self._update_stats)
+            self.after(0, self._update_bank_browser)
+        threading.Thread(target=_build, daemon=True).start()
 
     def disco_bank(self):
         """Build a bank where every shape has completely random parameters."""
