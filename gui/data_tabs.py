@@ -470,7 +470,7 @@ class GeneratorTab(tk.Frame):
             a = alpha[:, :, None]
             comp = bg * (1 - a) + rgb * a
             comp = (comp * 255).clip(0, 255).astype(np.uint8)
-            pil = Image.fromarray(comp).resize((thumb_size, thumb_size), Image.BILINEAR)
+            pil = Image.fromarray(comp).resize((thumb_size, thumb_size), BILINEAR)
             photo = ImageTk.PhotoImage(pil)
             self._bank_thumbs.append(photo)
             x = i * (thumb_size + 4) + 2
@@ -500,7 +500,7 @@ class GeneratorTab(tk.Frame):
         if scale < 1.0:
             new_w = int(pil_img.width * scale)
             new_h = int(pil_img.height * scale)
-            pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+            pil_img = pil_img.resize((new_w, new_h), BILINEAR)
 
         photo = ImageTk.PhotoImage(pil_img)
         self._preview_photos = [photo]  # keep reference
@@ -801,7 +801,7 @@ class VideoGenTab(tk.Frame):
             pil = Image.fromarray(arr)
             if scale < 1.0:
                 pil = pil.resize((int(gen.W * scale), int(gen.H * scale)),
-                                 Image.BILINEAR)
+                                 BILINEAR)
             self._video_frames.append(ImageTk.PhotoImage(pil))
 
         self._video_idx = 0
@@ -852,7 +852,7 @@ class VideoGenTab(tk.Frame):
                 frame = (clips[ci, ti].permute(1, 2, 0).cpu().numpy() * 255
                          ).clip(0, 255).astype(np.uint8)
                 small = np.array(Image.fromarray(frame).resize((sw, sh),
-                                 Image.BILINEAR))
+                                 BILINEAR))
                 r, c = ci // 4, ci % 4
                 y = r * (sh + gap)
                 x = c * (sw + gap)
@@ -862,7 +862,7 @@ class VideoGenTab(tk.Frame):
             scale = min(700 / grid_w, 400 / grid_h, 1.0)
             if scale < 1.0:
                 pil = pil.resize((int(grid_w * scale), int(grid_h * scale)),
-                                 Image.BILINEAR)
+                                 BILINEAR)
             self._video_frames.append(ImageTk.PhotoImage(pil))
 
         self._video_idx = 0

@@ -16,8 +16,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageTk
 
+# Pillow 10+ removed Image.BILINEAR; use Image.Resampling.BILINEAR instead
+BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VAEPP_ROOT = os.path.dirname(os.path.abspath(__file__))
+VAEPP_ROOT = PROJECT_ROOT  # bank/log paths should be project-relative, not gui-relative
 VENV_PYTHON = os.path.join(PROJECT_ROOT, "venv", "Scripts", "python.exe")
 if not os.path.exists(VENV_PYTHON):
     VENV_PYTHON = sys.executable

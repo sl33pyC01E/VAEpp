@@ -87,26 +87,38 @@ class MotionMixin:
         # Coarse velocity field (faster than full-res)
         ch, cw = H // 8, W // 8
 
+        # Base noise fields (persistent across frames for temporal coherence)
+        base_vx = torch.randn(B, 1, ch, cw, device=self.device)
+        base_vy = torch.randn(B, 1, ch, cw, device=self.device)
         # Random phase for temporal variation
         phase = torch.rand(B, 1, 1, 1, device=self.device) * 6.28
+
+        # Smoothing kernel
+        k = 3
+        g = torch.tensor([0.25, 0.5, 0.25], device=self.device).view(1, 1, k, 1)
 
         fields = []
         for ti in range(T):
             t_val = ti / max(T - 1, 1)
-            # Two Perlin noise fields (one per velocity component)
-            vx_noise = torch.randn(B, 1, ch, cw, device=self.device)
-            vy_noise = torch.randn(B, 1, ch, cw, device=self.device)
+            # Blend base noise with per-frame noise for smooth temporal variation
+            t_phase = phase + t_val * 6.28
+            blend = 0.7  # weight of persistent base field
+            vx_noise = base_vx * blend + torch.randn(B, 1, ch, cw, device=self.device) * (1 - blend)
+            vy_noise = base_vy * blend + torch.randn(B, 1, ch, cw, device=self.device) * (1 - blend)
+            # Rotate flow direction over time using phase
+            cos_p = torch.cos(t_phase)
+            sin_p = torch.sin(t_phase)
+            vx_rot = vx_noise * cos_p - vy_noise * sin_p
+            vy_rot = vx_noise * sin_p + vy_noise * cos_p
             # Smooth
-            k = 3
-            g = torch.tensor([0.25, 0.5, 0.25], device=self.device).view(1, 1, k, 1)
-            vx_noise = F.conv2d(vx_noise, g, padding=(1, 0))
-            vx_noise = F.conv2d(vx_noise, g.permute(0, 1, 3, 2), padding=(0, 1))
-            vy_noise = F.conv2d(vy_noise, g, padding=(1, 0))
-            vy_noise = F.conv2d(vy_noise, g.permute(0, 1, 3, 2), padding=(0, 1))
+            vx_rot = F.conv2d(vx_rot, g, padding=(1, 0))
+            vx_rot = F.conv2d(vx_rot, g.permute(0, 1, 3, 2), padding=(0, 1))
+            vy_rot = F.conv2d(vy_rot, g, padding=(1, 0))
+            vy_rot = F.conv2d(vy_rot, g.permute(0, 1, 3, 2), padding=(0, 1))
             # Upsample to full res
-            vx = F.interpolate(vx_noise, (H, W), mode="bilinear",
+            vx = F.interpolate(vx_rot, (H, W), mode="bilinear",
                                align_corners=False)
-            vy = F.interpolate(vy_noise, (H, W), mode="bilinear",
+            vy = F.interpolate(vy_rot, (H, W), mode="bilinear",
                                align_corners=False)
             # Scale displacement (pixels per frame)
             strength = 3.0
@@ -312,6 +324,7 @@ class MotionMixin:
         micro_start_y = None
         micro_dx = None
         micro_dy = None
+        micro_scales = None
         if torch.rand(1).item() < 0.5 and self.shape_bank is not None:
             n_micro = torch.randint(20, 60, (1,)).item()
             for _ in range(n_micro):
@@ -325,6 +338,8 @@ class MotionMixin:
             micro_start_y = torch.rand(B, n_micro, device=self.device) * H
             micro_dx = (torch.rand(B, n_micro, device=self.device) - 0.5) * W * 0.15
             micro_dy = (torch.rand(B, n_micro, device=self.device) - 0.5) * H * 0.15
+            # Pre-compute scales for temporal coherence (no per-frame flickering)
+            micro_scales = 0.1 + torch.rand(B, n_micro, device=self.device) * 0.15
 
         # --- Tessellation tiling (30% chance, consistent across frames) ---
         tess_layer = None
@@ -532,7 +547,7 @@ class MotionMixin:
                         rgba = shapes_m[bi]
                         rgb = rgba[:3]
                         alpha_m = rgba[3:4]
-                        sc = 0.1 + torch.rand(1).item() * 0.15
+                        sc = micro_scales[bi, mi].item()
                         th = max(3, int(self.shape_res * sc * H / 360))
                         tw = max(3, int(self.shape_res * sc * W / 640))
                         th, tw = min(th, H // 3), min(tw, W // 3)
@@ -620,9 +635,14 @@ class MotionMixin:
             self.stamps_per_image[0], self.stamps_per_image[1] + 1,
             (B,), device=dev)
         max_stamps = n_stamps.max().item()
-        stamp_idx = torch.randint(0, self.shape_bank.shape[0],
-                                   (B, max_stamps), device=dev)
-        trajectories = self._simulate_physics(B, max_stamps, T)
+
+        if self.shape_bank is None:
+            max_stamps = 0
+            n_stamps = torch.zeros(B, device=dev, dtype=torch.long)
+
+        stamp_idx = torch.randint(0, max(1, self.shape_bank.shape[0] if self.shape_bank is not None else 1),
+                                   (B, max(max_stamps, 1)), device=dev)
+        trajectories = self._simulate_physics(B, max(max_stamps, 1), T)
 
         # Pre-transform stamps
         stamp_shapes = []

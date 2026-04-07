@@ -155,7 +155,7 @@ def train(args):
         n_base_layers=args.n_layers,
         alpha=args.alpha,
     )
-    bank_dir = os.path.join(os.path.dirname(__file__), "bank")
+    bank_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bank")
     bank_files = [f for f in os.listdir(bank_dir)
                   if f.startswith("shapes_") and f.endswith(".pt")] \
         if os.path.isdir(bank_dir) else []
@@ -166,7 +166,7 @@ def train(args):
     else:
         gen.build_banks()
     # Build motion clip pool
-    pool_path = os.path.join(os.path.dirname(__file__), "bank", "motion_pool.json")
+    pool_path = os.path.join(bank_dir, "motion_pool.json")
     if os.path.exists(pool_path):
         gen.load_motion_pool(pool_path)
     else:
@@ -376,8 +376,8 @@ def train(args):
                     "latent_channels": args.latent_ch,
                     "image_channels": 3,
                     "output_channels": 3,
-                    "encoder_channels": 64,
-                    "decoder_channels": "256,128,64",
+                    "encoder_channels": enc_ch,
+                    "decoder_channels": ",".join(str(x) for x in dec_ch),
                     "temporal": True,
                     "T": args.T,
                     "synthyper_stage": 2,

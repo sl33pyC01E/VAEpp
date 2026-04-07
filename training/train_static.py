@@ -128,7 +128,7 @@ def train(args):
         alpha=args.alpha,
     )
     # Use dynamic bank if bank dir exists with saved shapes
-    bank_dir = os.path.join(os.path.dirname(__file__), "bank")
+    bank_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bank")
     bank_files = [f for f in os.listdir(bank_dir)
                   if f.startswith("shapes_") and f.endswith(".pt")] \
         if os.path.isdir(bank_dir) else []

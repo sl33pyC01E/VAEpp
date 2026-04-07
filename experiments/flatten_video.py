@@ -193,7 +193,7 @@ def train(args):
         height=args.H, width=args.W, device=str(device),
         bank_size=500, n_base_layers=64,
     )
-    bank_dir = os.path.join(os.path.dirname(__file__), "bank")
+    bank_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bank")
     if os.path.isdir(bank_dir):
         bank_files = [f for f in os.listdir(bank_dir)
                       if f.startswith("shapes_") and f.endswith(".pt")]
@@ -206,7 +206,7 @@ def train(args):
         gen.build_banks()
 
     # Motion pool for fast temporal sampling
-    pool_path = os.path.join(os.path.dirname(__file__), "bank", "motion_pool.json")
+    pool_path = os.path.join(bank_dir, "motion_pool.json")
     if os.path.exists(pool_path):
         gen.load_motion_pool(pool_path)
     else:

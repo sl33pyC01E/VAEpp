@@ -457,7 +457,7 @@ class VAEppGenerator(
                     rgb_r[:, sy:ey, sx:ex] * a
 
         # Micro-stamps (per-image decision)
-        use_micro = torch.rand(B) < 0.5
+        use_micro = torch.rand(B, device=self.device) < 0.5
         if use_micro.any():
             n_micro = torch.randint(n_micro_range[0], n_micro_range[1] + 1,
                                      (1,)).item()

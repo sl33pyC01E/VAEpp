@@ -277,7 +277,7 @@ def train(args):
         height=args.H, width=args.W, device=str(device),
         bank_size=500, n_base_layers=64,
     )
-    bank_dir = os.path.join(os.path.dirname(__file__), "bank")
+    bank_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bank")
     if os.path.isdir(bank_dir):
         bank_files = [f for f in os.listdir(bank_dir)
                       if f.startswith("shapes_") and f.endswith(".pt")]
@@ -381,7 +381,7 @@ def train(args):
 
         if step % args.log_every == 0:
             el = time.time() - t0
-            sps = step / max(el, 1)
+            sps = (step - start_step) / max(el, 1)
             eta = (args.total_steps - step) / max(sps, 1e-6)
             eta_str = f"{eta/60:.0f}m" if eta < 3600 else f"{eta/3600:.1f}h"
             print(f"[{step}/{args.total_steps}] lat={lat_loss.item():.6f} "

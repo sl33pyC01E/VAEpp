@@ -120,7 +120,7 @@ class FlattenTab(tk.Frame):
                     if scale < 1:
                         img = img.resize((int(img.width * scale),
                                           int(img.height * scale)),
-                                         Image.BILINEAR)
+                                         BILINEAR)
                     self._preview_photo = ImageTk.PhotoImage(img)
                     self.preview_label.config(image=self._preview_photo)
             except Exception:
@@ -327,7 +327,7 @@ class FlattenInferenceTab(tk.Frame):
             try:
                 import torch
                 img = Image.open(path).convert("RGB")
-                img = img.resize((640, 360), Image.BILINEAR)
+                img = img.resize((640, 360), BILINEAR)
                 arr = np.array(img, dtype=np.float32) / 255.0
                 t = torch.from_numpy(arr).permute(2, 0, 1)
 
@@ -381,7 +381,7 @@ class FlattenInferenceTab(tk.Frame):
         if scale < 1:
             pil_full = pil_full.resize(
                 (int(pil_full.width * scale), int(pil_full.height * scale)),
-                Image.BILINEAR)
+                BILINEAR)
         self._preview_photo = ImageTk.PhotoImage(pil_full)
         self.preview_label.config(image=self._preview_photo)
 
@@ -526,7 +526,7 @@ class FlattenVideoTab(tk.Frame):
                                     dtype=np.uint8).reshape(h, w, 3)
                                 pil = Image.fromarray(arr)
                                 if scale < 1:
-                                    pil = pil.resize((dw, dh), Image.BILINEAR)
+                                    pil = pil.resize((dw, dh), BILINEAR)
                                 self._video_frames.append(
                                     ImageTk.PhotoImage(pil))
                             self._video_idx = 0
@@ -829,7 +829,7 @@ class FlattenVideoInferenceTab(tk.Frame):
             proc.stdin.write(frame.tobytes())
             pil = Image.fromarray(frame)
             if scale < 1:
-                pil = pil.resize((dw, dh), Image.BILINEAR)
+                pil = pil.resize((dw, dh), BILINEAR)
             self._video_frames.append(ImageTk.PhotoImage(pil))
 
         proc.stdin.close()
@@ -950,7 +950,7 @@ class FSQConvertTab(tk.Frame):
                     if scale < 1:
                         img = img.resize((int(img.width * scale),
                                           int(img.height * scale)),
-                                         Image.BILINEAR)
+                                         BILINEAR)
                     self._preview_photo = ImageTk.PhotoImage(img)
                     self.preview_label.config(image=self._preview_photo)
             except Exception:
@@ -1095,7 +1095,7 @@ class FSQInferenceTab(tk.Frame):
         def _bg():
             try:
                 import torch
-                img = Image.open(path).convert("RGB").resize((640, 360), Image.BILINEAR)
+                img = Image.open(path).convert("RGB").resize((640, 360), BILINEAR)
                 arr = np.array(img, dtype=np.float32) / 255.0
                 t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
                 self._run_inference_bg(t)
@@ -1145,7 +1145,7 @@ class FSQInferenceTab(tk.Frame):
         scale = min(900 / pil.width, 500 / pil.height, 1.0)
         if scale < 1:
             pil = pil.resize((int(pil.width * scale), int(pil.height * scale)),
-                             Image.BILINEAR)
+                             BILINEAR)
         self._preview_photo = ImageTk.PhotoImage(pil)
         self.preview_label.config(image=self._preview_photo)
         self.status.config(text="GT | Continuous | FSQ")
@@ -1254,7 +1254,7 @@ class FlattenFSQTab(tk.Frame):
                     scale = min(900 / img.width, 400 / img.height, 1.0)
                     if scale < 1:
                         img = img.resize((int(img.width * scale),
-                                          int(img.height * scale)), Image.BILINEAR)
+                                          int(img.height * scale)), BILINEAR)
                     self._preview_photo = ImageTk.PhotoImage(img)
                     self.preview_label.config(image=self._preview_photo)
             except Exception:
@@ -1397,7 +1397,7 @@ class FlattenVideoFSQTab(tk.Frame):
                                     dtype=np.uint8).reshape(h, w, 3)
                                 pil = Image.fromarray(arr)
                                 if scale < 1:
-                                    pil = pil.resize((dw, dh), Image.BILINEAR)
+                                    pil = pil.resize((dw, dh), BILINEAR)
                                 self._video_frames.append(ImageTk.PhotoImage(pil))
                             self._video_idx = 0
                             self._play_gen += 1

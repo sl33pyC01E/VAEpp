@@ -427,5 +427,5 @@ class RecipesMixin:
         return {
             "count": len(self._recipe_pool),
             "T": self._motion_pool_T,
-            "kb": len(self._recipe_pool),  # ~1KB each
+            "approx_kb": len(self._recipe_pool),  # ~1KB each
         }
