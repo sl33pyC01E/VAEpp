@@ -233,10 +233,18 @@ def train(args):
     vae_config = ckpt.get("config", {})
     ch = vae_config.get("image_channels", 3)
     lat_ch = vae_config.get("latent_channels", 32)
+    enc_ch = vae_config.get("encoder_channels", 64)
+    dec_ch_str = vae_config.get("decoder_channels", "256,128,64")
+    if isinstance(dec_ch_str, str):
+        dec_ch = tuple(int(x) for x in dec_ch_str.split(","))
+    elif isinstance(dec_ch_str, (list, tuple)):
+        dec_ch = tuple(dec_ch_str)
+    else:
+        dec_ch = (256, 128, 64)
 
     vae = MiniVAE(
         latent_channels=lat_ch, image_channels=ch, output_channels=ch,
-        encoder_channels=64, decoder_channels=(256, 128, 64),
+        encoder_channels=enc_ch, decoder_channels=dec_ch,
         encoder_time_downscale=(False, False, False),
         decoder_time_upscale=(False, False, False),
     ).to(device)

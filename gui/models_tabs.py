@@ -801,6 +801,7 @@ class VideoInferenceTab(tk.Frame):
         self.model = None
         self._video_frames = []
         self._play_gen = 0
+        self._video_idx = 0
         self.build()
 
     def build(self):
