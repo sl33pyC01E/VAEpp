@@ -510,7 +510,12 @@ class FlattenVideoTab(tk.Frame):
                         capture_output=True, text=True)
                     parts = probe.stdout.strip().split(",")
                     if len(parts) >= 2:
-                        w, h = int(parts[0]), int(parts[1])
+                        try:
+                            w, h = int(parts[0]), int(parts[1])
+                        except (ValueError, TypeError):
+                            return
+                        if w <= 0 or h <= 0:
+                            return
                         cmd = ["ffmpeg", "-v", "quiet", "-i", preview,
                                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
                         raw = subprocess.run(cmd, capture_output=True).stdout
@@ -822,16 +827,19 @@ class FlattenVideoInferenceTab(tk.Frame):
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
         self._video_frames = []
-        for t in range(T_show):
-            g = (gt[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            v = (rc_vae[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            f = (rc_flat[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            frame = np.concatenate([g, sep, v, sep, f], axis=1)
-            proc.stdin.write(frame.tobytes())
-            pil = Image.fromarray(frame)
-            if scale < 1:
-                pil = pil.resize((dw, dh), BILINEAR)
-            self._video_frames.append(ImageTk.PhotoImage(pil))
+        try:
+            for t in range(T_show):
+                g = (gt[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                v = (rc_vae[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                f = (rc_flat[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                frame = np.concatenate([g, sep, v, sep, f], axis=1)
+                proc.stdin.write(frame.tobytes())
+                pil = Image.fromarray(frame)
+                if scale < 1:
+                    pil = pil.resize((dw, dh), BILINEAR)
+                self._video_frames.append(ImageTk.PhotoImage(pil))
+        except BrokenPipeError:
+            pass
 
         proc.stdin.close()
         proc.wait()
@@ -1381,7 +1389,12 @@ class FlattenVideoFSQTab(tk.Frame):
                         capture_output=True, text=True)
                     parts = probe.stdout.strip().split(",")
                     if len(parts) >= 2:
-                        w, h = int(parts[0]), int(parts[1])
+                        try:
+                            w, h = int(parts[0]), int(parts[1])
+                        except (ValueError, TypeError):
+                            return
+                        if w <= 0 or h <= 0:
+                            return
                         cmd = ["ffmpeg", "-v", "quiet", "-i", preview,
                                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
                         raw = subprocess.run(cmd, capture_output=True).stdout
