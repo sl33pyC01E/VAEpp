@@ -351,10 +351,18 @@ class RecipesMixin:
             self._refresh_motion_pool()
 
         # Render B recipes
+        T_expected = self._motion_pool_T
         clips = []
         for bi in range(B):
             idx = torch.randint(0, N, (1,)).item()
-            clip = self._render_recipe(self._recipe_pool[idx])
+            clip = self._render_recipe(self._recipe_pool[idx])  # (T_i, 3, H, W)
+            # Pad or trim to consistent T for stacking
+            T_i = clip.shape[0]
+            if T_i < T_expected:
+                pad = clip[-1:].expand(T_expected - T_i, -1, -1, -1)
+                clip = torch.cat([clip, pad], dim=0)
+            elif T_i > T_expected:
+                clip = clip[:T_expected]
             clips.append(clip)
         clips = torch.stack(clips)  # (B, T, 3, H, W)
 

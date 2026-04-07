@@ -224,6 +224,11 @@ def train(args):
                     opt, T_max=args.total_steps,
                     eta_min=float(args.lr) * 0.01,
                     last_epoch=start_step)
+            if rk.get("scaler") and args.precision == "fp16":
+                try:
+                    scaler.load_state_dict(rk["scaler"])
+                except Exception:
+                    pass
             print(f"  Resumed from {args.resume} at step {start_step}", flush=True)
 
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
@@ -321,6 +326,7 @@ def train(args):
                 "model": vae.state_dict(),
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict(),
+                "scaler": scaler.state_dict(),
                 "global_step": step,
                 "config": {
                     "image_channels": ch,
@@ -350,6 +356,7 @@ def train(args):
             "model": vae.state_dict(),
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
+            "scaler": scaler.state_dict(),
             "global_step": step,
             "config": {
                 "image_channels": ch,

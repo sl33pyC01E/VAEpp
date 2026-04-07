@@ -570,16 +570,16 @@ class MotionMixin:
                                 canvas[bi, :, py:py+th, px:px+tw] * (1 - a_r) + \
                                 rgb_r * a_r
 
-            # Viewport transform (pan + zoom + rotation on entire canvas)
-            if use_viewport:
-                canvas = self._apply_viewport(canvas, ti, T, vp_pan, vp_zoom, vp_rot)
-
             # Fractal layout (pre-rendered overlay for temporal coherence)
             if fractal_overlay is not None:
                 # Additive blend: fractal shapes rendered on black, so
                 # non-zero pixels are the shapes to composite
                 frac_mask = (fractal_overlay.sum(dim=1, keepdim=True) > 0.01).float()
                 canvas = canvas * (1 - frac_mask) + fractal_overlay * frac_mask
+
+            # Viewport transform (pan + zoom + rotation on entire canvas)
+            if use_viewport:
+                canvas = self._apply_viewport(canvas, ti, T, vp_pan, vp_zoom, vp_rot)
 
             # Fluid advection
             if flow_fields is not None:
