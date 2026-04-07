@@ -90,6 +90,7 @@ def save_preview(vae, fsq_layer, gen, logdir, step, device, amp_dtype):
         import traceback
         print(f"  preview failed: {e}", flush=True)
         traceback.print_exc()
+        vae.train()
 
 
 # -- Training ------------------------------------------------------------------
@@ -212,6 +213,17 @@ def train(args):
                     opt.load_state_dict(rk["optimizer"])
                 except Exception:
                     print("  Fresh optimizer (mismatch)", flush=True)
+            if rk.get("scheduler") and not args.fresh_opt:
+                try:
+                    sched.load_state_dict(rk["scheduler"])
+                except Exception:
+                    print("  Fresh scheduler (mismatch)", flush=True)
+            elif start_step > 0:
+                # Rebuild scheduler at correct position for old checkpoints
+                sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=args.total_steps,
+                    eta_min=float(args.lr) * 0.01,
+                    last_epoch=start_step)
             print(f"  Resumed from {args.resume} at step {start_step}", flush=True)
 
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
@@ -308,6 +320,7 @@ def train(args):
             d = {
                 "model": vae.state_dict(),
                 "optimizer": opt.state_dict(),
+                "scheduler": sched.state_dict(),
                 "global_step": step,
                 "config": {
                     "image_channels": ch,
@@ -336,6 +349,7 @@ def train(args):
         d = {
             "model": vae.state_dict(),
             "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
             "global_step": step,
             "config": {
                 "image_channels": ch,
