@@ -226,9 +226,10 @@ def train(args):
         if ckpt.get("scheduler"):
             sched.load_state_dict(ckpt["scheduler"])
         else:
+            # Fallback for old checkpoints: rebuild at correct position
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=args.total_steps - global_step,
-                eta_min=float(args.lr) * 0.01, last_epoch=global_step)
+                opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01,
+                last_epoch=global_step)
         if ckpt.get("scaler") and args.precision == "fp16":
             scaler.load_state_dict(ckpt["scaler"])
 

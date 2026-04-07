@@ -259,12 +259,20 @@ def chunked_flatten_inference(vae, bottleneck, x, chunk_size=CHUNK_SIZE,
             recon_flat = vae.decode_video(lat_recon)
         return recon_vae, recon_flat, lat
 
+    trim = getattr(vae, 'frames_to_trim', 0)
+    output_per_chunk = chunk_size - trim
     all_vae = []
     all_flat = []
     all_lat = []
-    for start in range(0, T, chunk_size):
-        end = min(start + chunk_size, T)
-        chunk = x[:, start:end]
+
+    chunk_start = 0
+    while chunk_start < T:
+        chunk_end = min(chunk_start + chunk_size, T)
+        chunk = x[:, chunk_start:chunk_end]
+
+        if chunk.shape[1] < getattr(vae, 't_downscale', 1):
+            break
+
         with torch.amp.autocast("cuda", dtype=amp_dtype):
             rc_vae, _ = vae(chunk)
             lat = vae.encode_video(chunk)
@@ -279,6 +287,10 @@ def chunked_flatten_inference(vae, bottleneck, x, chunk_size=CHUNK_SIZE,
         all_lat.append(lat.float().cpu())
         del rc_vae, rc_flat, lat, lat_r, lat_f
         torch.cuda.empty_cache()
+
+        if chunk_end >= T:
+            break
+        chunk_start += output_per_chunk
 
     return torch.cat(all_vae, dim=1), torch.cat(all_flat, dim=1), \
            torch.cat(all_lat, dim=1)

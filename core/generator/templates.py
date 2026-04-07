@@ -390,9 +390,11 @@ class TemplateMixin:
             canvas[bi, :, floor_y:] = floor_c
 
             # Window (rectangle on wall)
-            if torch.rand(1).item() < 0.7:
+            wall_h = floor_y - ceil_h
+            if torch.rand(1).item() < 0.7 and wall_h > H // 4:
                 ww = torch.randint(W // 8, W // 3, (1,)).item()
-                wh = torch.randint(H // 8, (floor_y - ceil_h) * 2 // 3, (1,)).item()
+                wh_max = max(H // 8 + 1, wall_h * 2 // 3)
+                wh = torch.randint(H // 8, wh_max, (1,)).item()
                 wx = torch.randint(W // 6, W - ww - W // 6, (1,)).item()
                 wy = ceil_h + (floor_y - ceil_h - wh) // 3
                 canvas[bi, :, wy:wy+wh, wx:wx+ww] = \

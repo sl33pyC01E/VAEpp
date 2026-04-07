@@ -371,19 +371,22 @@ class RecipesMixin:
         return clips.clamp(0, 1)
 
     def save_motion_pool(self, path):
-        """Save recipe pool to disk with timestamp. Accumulates, doesn't overwrite."""
+        """Save recipe pool to the given path (or timestamped file in same dir)."""
         if not hasattr(self, '_recipe_pool') or not self._recipe_pool:
             return
         import json, time as _time
-        # Timestamped filename in same directory
         d = os.path.dirname(path)
-        ts = _time.strftime("%Y%m%d_%H%M%S")
-        out = os.path.join(d, f"recipes_{ts}.json")
         os.makedirs(d, exist_ok=True)
-        with open(out, 'w') as f:
+        # Save to the requested path
+        with open(path, 'w') as f:
             json.dump(self._recipe_pool, f)
-        kb = os.path.getsize(out) / 1e3
-        print(f"Saved {len(self._recipe_pool)} recipes to {out} "
+        # Also save a timestamped backup
+        ts = _time.strftime("%Y%m%d_%H%M%S")
+        backup = os.path.join(d, f"recipes_{ts}.json")
+        with open(backup, 'w') as f:
+            json.dump(self._recipe_pool, f)
+        kb = os.path.getsize(path) / 1e3
+        print(f"Saved {len(self._recipe_pool)} recipes to {path} "
               f"({kb:.0f} KB)", flush=True)
 
     def load_motion_pool(self, path):

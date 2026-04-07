@@ -43,9 +43,14 @@ class GeneratorTab(tk.Frame):
         canvas_scroll.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         canvas_scroll.pack(side="left", fill="both", expand=True)
-        # Mouse wheel scroll
-        canvas_scroll.bind_all("<MouseWheel>",
-            lambda e: canvas_scroll.yview_scroll(-e.delta // 120, "units"))
+        # Mouse wheel scroll (bound to canvas only, not globally)
+        def _on_mousewheel(e):
+            canvas_scroll.yview_scroll(-e.delta // 120, "units")
+        canvas_scroll.bind("<MouseWheel>", _on_mousewheel)
+        self.left.bind("<MouseWheel>", _on_mousewheel)
+        # Ensure focus for scroll events
+        canvas_scroll.bind("<Enter>", lambda e: canvas_scroll.focus_set())
+        canvas_scroll.bind("<Leave>", lambda e: self.focus_set())
 
         self._build_controls()
 
@@ -384,14 +389,25 @@ class GeneratorTab(tk.Frame):
         self.update()
 
         def _disco():
+            # Save original params to restore after disco
+            orig_shape_probs = gen.shape_probs.clone()
+            orig_texture_probs = gen.texture_probs.clone()
+            orig_edge_probs = gen.edge_probs.clone()
+            orig_sat_range = gen.sat_range
+            orig_val_range = gen.val_range
+            orig_min_r_frac = gen.min_r_frac
+            orig_max_r_frac = gen.max_r_frac
+            orig_soft_range = gen.soft_range
+            orig_template_probs = gen.template_probs.clone()
+
             shapes = []
             for i in range(n):
                 # Randomize ALL generator params per shape
-                gen.shape_probs = torch.rand(len(gen.shape_probs), device=gen.device)
+                gen.shape_probs = torch.rand(len(orig_shape_probs), device=gen.device)
                 gen.shape_probs = gen.shape_probs / gen.shape_probs.sum()
-                gen.texture_probs = torch.rand(len(gen.texture_probs), device=gen.device)
+                gen.texture_probs = torch.rand(len(orig_texture_probs), device=gen.device)
                 gen.texture_probs = gen.texture_probs / gen.texture_probs.sum()
-                gen.edge_probs = torch.rand(len(gen.edge_probs), device=gen.device)
+                gen.edge_probs = torch.rand(len(orig_edge_probs), device=gen.device)
                 gen.edge_probs = gen.edge_probs / gen.edge_probs.sum()
                 gen.sat_range = (torch.rand(1).item() * 0.5,
                                   torch.rand(1).item() * 0.5 + 0.5)
@@ -401,14 +417,24 @@ class GeneratorTab(tk.Frame):
                 gen.max_r_frac = torch.rand(1).item() * 0.4 + 0.5
                 gen.soft_range = (torch.rand(1).item() * 2 + 0.5,
                                    torch.rand(1).item() * 6 + 2)
-                # Bias templates toward structured (random gets 10%, rest share 90%)
                 tw = torch.rand(len(gen.template_names), device=gen.device)
-                tw[0] = tw[0] * 0.1  # suppress "random" template
+                tw[0] = tw[0] * 0.1
                 gen.template_probs = tw / tw.sum()
 
                 shapes.append(gen._render_one_shape())
                 if (i + 1) % 100 == 0:
                     print(f"  disco [{i+1}/{n}] {gen._last_shape_log}", flush=True)
+
+            # Restore original params
+            gen.shape_probs = orig_shape_probs
+            gen.texture_probs = orig_texture_probs
+            gen.edge_probs = orig_edge_probs
+            gen.sat_range = orig_sat_range
+            gen.val_range = orig_val_range
+            gen.min_r_frac = orig_min_r_frac
+            gen.max_r_frac = orig_max_r_frac
+            gen.soft_range = orig_soft_range
+            gen.template_probs = orig_template_probs
 
             new_bank = torch.stack(shapes)
             if gen.shape_bank is not None:
@@ -689,6 +715,11 @@ class VideoGenTab(tk.Frame):
         self.update()
 
         def _disco():
+            # Save original params to restore after disco
+            orig_shape_probs = gen.shape_probs.clone()
+            orig_texture_probs = gen.texture_probs.clone()
+            orig_template_probs = gen.template_probs.clone()
+
             T = self.T_var.get()
             for i in range(n):
                 # Randomize all motion params per recipe
@@ -707,11 +738,10 @@ class VideoGenTab(tk.Frame):
                     "fluid_strength": torch.rand(1).item() * 2.0,
                 }
                 # Also randomize generator params for this recipe
-                gen.shape_probs = torch.rand(len(gen.shape_probs), device=gen.device)
+                gen.shape_probs = torch.rand(len(orig_shape_probs), device=gen.device)
                 gen.shape_probs = gen.shape_probs / gen.shape_probs.sum()
-                gen.texture_probs = torch.rand(len(gen.texture_probs), device=gen.device)
+                gen.texture_probs = torch.rand(len(orig_texture_probs), device=gen.device)
                 gen.texture_probs = gen.texture_probs / gen.texture_probs.sum()
-                # Bias templates toward structured
                 tw = torch.rand(len(gen.template_names), device=gen.device)
                 tw[0] = tw[0] * 0.1
                 gen.template_probs = tw / tw.sum()
@@ -721,6 +751,11 @@ class VideoGenTab(tk.Frame):
 
                 if (i + 1) % 50 == 0:
                     print(f"  disco recipes [{i+1}/{n}]", flush=True)
+
+            # Restore original params
+            gen.shape_probs = orig_shape_probs
+            gen.texture_probs = orig_texture_probs
+            gen.template_probs = orig_template_probs
 
             gen._motion_pool_T = T
             self.after(0, lambda: self.status.config(

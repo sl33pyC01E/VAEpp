@@ -557,20 +557,20 @@ class VAEppGenerator(
         n3 = q3_mask.sum().item()
         if n3 > 0:
             # Force a structured template
-            old_probs = self.template_probs.clone()
-            # Zero out "random" and boost structured templates
-            self.template_probs[0] = 0
-            self.template_probs = self.template_probs / (self.template_probs.sum() + 1e-8)
+            # Use local probs to avoid mutating shared state
+            q3_probs = self.template_probs.clone()
+            q3_probs[0] = 0
+            q3_probs = q3_probs / (q3_probs.sum() + 1e-8)
+            idx = torch.multinomial(q3_probs, 1).item()
+            template = self.template_names[idx]
             bg = self._sample_colors(n3)
             c3 = bg.view(n3, 3, 1, 1).expand(n3, 3, H, W).clone()
-            template = self._pick_template()
             c3 = self._apply_scene_template(c3, template, n3)
             c3 = self._overlay_shapes_on_canvas(c3, n3,
                                                  n_stamps_range=(2, 6),
                                                  n_micro_range=(10, 30))
             c3 = self._post_process(c3)
             canvas[q3_mask] = c3.clamp(0, 1)
-            self.template_probs = old_probs
 
         return canvas.clamp(0, 1)
 

@@ -207,8 +207,9 @@ class PatternBank:
 
     def _pat_diamond_gradient(self, B):
         c1, c2 = self._colors(B), self._colors(B)
-        t = (self.sx.unsqueeze(0).abs() + self.sy.unsqueeze(0).abs())
-        t = (t / (t.reshape(B, -1).max(1).values.view(B, 1, 1) + 1e-8)).clamp(0, 1)
+        t = (self.sx.abs() + self.sy.abs())  # (H, W)
+        t = (t / (t.max() + 1e-8)).clamp(0, 1)
+        t = t.unsqueeze(0).expand(B, -1, -1)  # (B, H, W)
         return self._lerp_colors(t, c1, c2)
 
     def _pat_multi_gradient(self, B):
@@ -698,29 +699,31 @@ class PatternBank:
             cs = cell_size[i].item()
             rows = self.H // cs
             cols = self.W // cs
-            # Simple binary maze via random DFS
-            maze = torch.ones(rows * 2 + 1, cols * 2 + 1, device=self.device)
-            visited = torch.zeros(rows, cols, dtype=torch.bool, device=self.device)
+            # Run DFS on CPU to avoid per-element GPU syncs
+            import random as _random
+            maze_h, maze_w = rows * 2 + 1, cols * 2 + 1
+            maze_cpu = [[1] * maze_w for _ in range(maze_h)]
+            visited_cpu = [[False] * cols for _ in range(rows)]
             stack = [(0, 0)]
-            visited[0, 0] = True
-            maze[1, 1] = 0
+            visited_cpu[0][0] = True
+            maze_cpu[1][1] = 0
             while stack:
                 cr, cc = stack[-1]
                 neighbors = []
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     nr, nc = cr + dr, cc + dc
-                    if 0 <= nr < rows and 0 <= nc < cols and not visited[nr, nc]:
+                    if 0 <= nr < rows and 0 <= nc < cols and not visited_cpu[nr][nc]:
                         neighbors.append((nr, nc, dr, dc))
                 if not neighbors:
                     stack.pop()
                     continue
-                idx = torch.randint(0, len(neighbors), (1,)).item()
-                nr, nc, dr, dc = neighbors[idx]
-                maze[1 + cr * 2 + dr, 1 + cc * 2 + dc] = 0
-                maze[1 + nr * 2, 1 + nc * 2] = 0
-                visited[nr, nc] = True
+                nr, nc, dr, dc = _random.choice(neighbors)
+                maze_cpu[1 + cr * 2 + dr][1 + cc * 2 + dc] = 0
+                maze_cpu[1 + nr * 2][1 + nc * 2] = 0
+                visited_cpu[nr][nc] = True
                 stack.append((nr, nc))
-            # Upsample maze to full res
+            # Transfer to GPU and upsample
+            maze = torch.tensor(maze_cpu, dtype=torch.float32, device=self.device)
             maze_img = F.interpolate(maze.unsqueeze(0).unsqueeze(0),
                                      size=(self.H, self.W),
                                      mode='nearest').squeeze()
@@ -795,14 +798,13 @@ class PatternBank:
 
     def _pat_ordered_dither(self, B):
         c1, c2 = self._colors(B), self._colors(B)
-        # Bayer 8×8 matrix
+        # Standard Bayer 4x4 matrix via recursive construction
         bayer2 = torch.tensor([[0, 2], [3, 1]], device=self.device, dtype=torch.float32)
         bayer4 = torch.zeros(4, 4, device=self.device)
+        inner = torch.tensor([[0, 2], [3, 1]], device=self.device, dtype=torch.float32)
         for r in range(2):
             for c in range(2):
-                bayer4[r*2:(r+1)*2, c*2:(c+1)*2] = bayer2 * 4 + \
-                    torch.tensor([[0, 2], [3, 1]], device=self.device).float() + \
-                    bayer2[r, c] * 4
+                bayer4[r*2:(r+1)*2, c*2:(c+1)*2] = 4 * bayer2[r, c] + inner
         bayer4 = bayer4 / 16.0
         # Tile to full res
         scale = torch.randint(1, 6, (B,), device=self.device)
@@ -810,8 +812,6 @@ class PatternBank:
         out = torch.zeros(B, self.H, self.W, device=self.device)
         for i in range(B):
             s = scale[i].item()
-            bayer_scaled = bayer4.repeat(1, 1)  # base
-            # Tile
             reps_h = self.H // (4 * s) + 1
             reps_w = self.W // (4 * s) + 1
             tiled = bayer4.repeat(reps_h, reps_w)

@@ -254,8 +254,8 @@ def train(args):
 
                 if lpips_fn is not None:
                     BT = rc.shape[0] * T_out
-                    rc_lp = rc.reshape(BT, 3, args.H, args.W) * 2 - 1
-                    gt_lp = gt.reshape(BT, 3, args.H, args.W) * 2 - 1
+                    rc_lp = rc[:, :, :3].reshape(BT, 3, args.H, args.W) * 2 - 1
+                    gt_lp = gt[:, :, :3].reshape(BT, 3, args.H, args.W) * 2 - 1
                     lp = lpips_fn(rc_lp, gt_lp).mean()
                     total = total + args.w_lpips * lp
                     losses["lpips"] = lp.item()
