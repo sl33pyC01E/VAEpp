@@ -1024,11 +1024,10 @@ class FSQInferenceTab(tk.Frame):
             ch = config.get("image_channels", 3)
             lat = config.get("latent_channels", 32)
 
+            enc_ch, dec_ch = parse_arch_config(config)
             self.vae = MiniVAE(
                 latent_channels=lat, image_channels=ch, output_channels=ch,
-                encoder_channels=config.get("encoder_channels", 64),
-                decoder_channels=tuple(int(x) for x in
-                    config.get("decoder_channels", "256,128,64").split(",")),
+                encoder_channels=enc_ch, decoder_channels=dec_ch,
                 encoder_time_downscale=(False, False, False),
                 decoder_time_upscale=(False, False, False),
             ).cuda()

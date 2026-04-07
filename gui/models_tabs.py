@@ -486,7 +486,7 @@ class ConvertTab(tk.Frame):
         self._log(f"\nBuilding temporal model (latent_ch={lat})...")
         sys.path.insert(0, PROJECT_ROOT)
         from core.model import MiniVAE
-        enc_ch, dec_ch = parse_arch_config(config)
+        enc_ch, dec_ch = parse_arch_config(src_config)
         temporal_model = MiniVAE(
             latent_channels=lat,
             image_channels=3,
