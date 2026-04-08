@@ -363,7 +363,7 @@ class TemplateMixin:
                 # Canopy (approximate circle via square)
                 cy = ty - trunk_h - canopy_r
                 cx = tx
-                y0, y1 = max(0, cy - canopy_r), max(0, cy + canopy_r)
+                y0, y1 = max(0, cy - canopy_r), min(H, max(0, cy + canopy_r))
                 x0, x1 = max(0, cx - canopy_r), min(W, cx + canopy_r)
                 if y1 > y0 and x1 > x0:
                     green = torch.tensor([0.15, 0.5, 0.15],

@@ -290,12 +290,11 @@ def chunked_flatten_inference(vae, bottleneck, x, chunk_size=CHUNK_SIZE,
             rc_flat = vae.decode_video(lat_r)
 
         need = target_len - collected
-        keep_vae = min(rc_vae.shape[1], need)
-        keep_flat = min(rc_flat.shape[1], need)
-        all_vae.append(rc_vae[:, :keep_vae].float().cpu())
-        all_flat.append(rc_flat[:, :keep_flat].float().cpu())
+        keep = min(rc_vae.shape[1], rc_flat.shape[1], need)
+        all_vae.append(rc_vae[:, :keep].float().cpu())
+        all_flat.append(rc_flat[:, :keep].float().cpu())
         all_lat.append(lat.float().cpu())
-        collected += keep_vae
+        collected += keep
         del rc_vae, rc_flat, lat, lat_r, lat_f
         torch.cuda.empty_cache()
 

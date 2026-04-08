@@ -126,8 +126,10 @@ def train(args):
     dec_ch_str = vae_config.get("decoder_channels", "256,128,64")
     if isinstance(dec_ch_str, str):
         dec_ch = tuple(int(x) for x in dec_ch_str.split(","))
-    else:
+    elif isinstance(dec_ch_str, (list, tuple)):
         dec_ch = tuple(dec_ch_str)
+    else:
+        dec_ch = (256, 128, 64)
 
     temporal = vae_config.get("temporal", False)
     if temporal:

@@ -1105,7 +1105,11 @@ class FSQInferenceTab(tk.Frame):
                 import torch
                 img = Image.open(path).convert("RGB").resize((640, 360), BILINEAR)
                 arr = np.array(img, dtype=np.float32) / 255.0
-                t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+                t = torch.from_numpy(arr).permute(2, 0, 1)
+                ch = self.vae.image_channels
+                if ch > 3:
+                    t = torch.cat([t, torch.zeros(ch - 3, 360, 640)], dim=0)
+                t = t.unsqueeze(0)
                 self._run_inference_bg(t)
             except Exception as e:
                 self.after(0, lambda: self.status.config(text=f"Error: {e}"))

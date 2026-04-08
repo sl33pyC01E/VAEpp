@@ -391,7 +391,7 @@ class MotionMixin:
 
         # --- Post-processing params (consistent across frames) ---
         pp_gamma = torch.rand(B, 1, 1, 1, device=self.device) * 0.7 + 0.7
-        pp_hue_shift = torch.randint(0, 3, (1,)).item() if torch.rand(1).item() < 0.4 else 0
+        pp_hue_shift = torch.randint(1, 3, (1,)).item() if torch.rand(1).item() < 0.4 else 0
         pp_wave_freq = 0
         pp_wave = None
         if torch.rand(1).item() < 0.25:

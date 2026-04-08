@@ -428,6 +428,8 @@ class RecipesMixin:
         else:
             self._motion_pool_T = 8
         self._motion_pool_call_count = 0
+        if not hasattr(self, '_motion_pool_kwargs'):
+            self._motion_pool_kwargs = {}
         print(f"Total recipes: {len(self._recipe_pool)}", flush=True)
 
     def motion_pool_stats(self):

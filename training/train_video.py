@@ -85,7 +85,10 @@ def save_preview(model, gen, logdir, step, device, amp_dtype, T=8):
                 proc.stdin.close()
                 proc.wait()
             except Exception:
-                proc.stdin.close()
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
                 proc.kill()
                 proc.wait()
                 raise
@@ -332,7 +335,7 @@ def train(args):
 
                 # MSE loss
                 mse = F.mse_loss(rc, gt)
-                losses["mse"] = mse.item()
+                losses["mse"] = losses.get("mse", 0) + mse.item() / accum
 
                 total = args.w_mse * mse
 
@@ -342,7 +345,7 @@ def train(args):
                     rc_diff = rc[:, 1:] - rc[:, :-1]
                     temp = F.l1_loss(rc_diff, gt_diff)
                     total = total + args.w_temporal * temp
-                    losses["temp"] = temp.item()
+                    losses["temp"] = losses.get("temp", 0) + temp.item() / accum
 
                 # LPIPS (per-frame, on RGB)
                 if lpips_fn is not None:
@@ -354,7 +357,7 @@ def train(args):
                         lp_chunks.append(lpips_fn(rc_lp[ci:ci+4], gt_lp[ci:ci+4]))
                     lp = torch.cat(lp_chunks, 0).mean()
                     total = total + args.w_lpips * lp
-                    losses["lpips"] = lp.item()
+                    losses["lpips"] = losses.get("lpips", 0) + lp.item() / accum
 
             if total.dim() > 0:
                 total = total.mean()

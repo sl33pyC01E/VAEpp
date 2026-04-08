@@ -278,7 +278,7 @@ def train(args):
 
                 mse = F.mse_loss(rc, gt)
                 total = args.w_mse * mse
-                losses["mse"] = mse.item()
+                losses["mse"] = losses.get("mse", 0) + mse.item() / accum
 
                 if lpips_fn is not None:
                     BT = rc.shape[0] * T_match
@@ -286,7 +286,7 @@ def train(args):
                     gt_lp = gt[:, :, :3].reshape(BT, 3, args.H, args.W) * 2 - 1
                     lp = lpips_fn(rc_lp, gt_lp).mean()
                     total = total + args.w_lpips * lp
-                    losses["lpips"] = lp.item()
+                    losses["lpips"] = losses.get("lpips", 0) + lp.item() / accum
 
             if total.dim() > 0:
                 total = total.mean()

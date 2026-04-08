@@ -32,7 +32,13 @@ class FSQ(nn.Module):
         self.n_groups = n_groups
         self.channels_per_group = channels_per_group
         self.total_channels = n_groups * channels_per_group
-        self.codebook_size = levels ** channels_per_group
+        max_index = levels ** channels_per_group
+        if max_index > 2**63 - 1:
+            raise ValueError(
+                f"levels^channels_per_group = {levels}^{channels_per_group} "
+                f"overflows int64. Increase n_groups or decrease "
+                f"levels/channels_per_group.")
+        self.codebook_size = max_index
 
         # Precompute basis for index computation
         basis = torch.tensor(
@@ -52,9 +58,10 @@ class FSQ(nn.Module):
     def _quantize(self, z_bounded):
         """Quantize bounded [-1, 1] values to discrete levels."""
         half_levels = (self.levels - 1) / 2
-        # Map [-1, 1] -> [0, levels-1], round, map back to [-1, 1]
-        quantized = torch.round(z_bounded * half_levels) / half_levels
-        return quantized
+        # Map [-1, 1] -> [0, levels-1], round, then back to [-1, 1]
+        shifted = (z_bounded + 1) / 2 * (self.levels - 1)
+        quantized = torch.round(shifted).clamp(0, self.levels - 1)
+        return quantized / half_levels - 1
 
     def forward(self, z):
         """Quantize latent tensor with straight-through estimator.
@@ -102,10 +109,9 @@ class FSQ(nn.Module):
                                    H, W)
 
         # Map [-1, 1] -> [0, levels-1] integer
-        # Use round-then-shift to avoid banker's rounding collisions
-        # when half_levels is non-integer (even levels like 12)
-        int_codes = (torch.round(z_groups * half_levels).long()
-                     + (self.levels - 1) // 2).clamp(0, self.levels - 1)
+        int_codes = torch.round(
+            (z_groups + 1) / 2 * (self.levels - 1)
+        ).long().clamp(0, self.levels - 1)
 
         # Flatten to single index per group using mixed-radix
         # basis: [1, L, L^2, L^3, ...]
@@ -137,7 +143,7 @@ class FSQ(nn.Module):
         int_codes = torch.stack(channels, dim=2)
 
         # Map [0, levels-1] -> [-1, 1]
-        z_quant = (int_codes.float() - (self.levels - 1) // 2) / half_levels
+        z_quant = int_codes.float() / half_levels - 1
 
         # Reshape to (B, C, H, W)
         return z_quant.reshape(B, self.total_channels, H, W)
