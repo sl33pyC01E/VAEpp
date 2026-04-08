@@ -93,6 +93,97 @@ def save_preview(vae, fsq_layer, gen, logdir, step, device, amp_dtype):
         vae.train()
 
 
+@torch.no_grad()
+def save_preview_video(vae, fsq_layer, gen, logdir, step, device, amp_dtype,
+                       T=8):
+    """Save GT | Continuous | FSQ side-by-side MP4 video."""
+    try:
+        vae.eval()
+        clips = gen.generate_sequence(2, T=T)  # (2, T, 3, H, W)
+        x = clips.to(device)
+
+        with torch.amp.autocast("cuda", dtype=amp_dtype):
+            # Continuous path
+            recon_cont, _ = vae(x)
+
+            # FSQ path — quantize per-frame in latent space
+            lat = vae.encode_video(x)  # (B, T', C, H, W)
+            B, Tp, C, Hl, Wl = lat.shape
+            lat_flat = lat.reshape(B * Tp, C, Hl, Wl)
+            lat_q, indices = fsq_layer(lat_flat)
+            lat_q = lat_q.reshape(B, Tp, C, Hl, Wl)
+            recon_fsq = vae.decode_video(lat_q)
+
+        T_cont = recon_cont.shape[1]
+        T_fsq = recon_fsq.shape[1]
+        T_in = x.shape[1]
+        T_show = min(T_cont, T_fsq, T_in)
+
+        gt = x[:, T_in - T_show:, :3].float().cpu().numpy()
+        rc_cont = recon_cont[:, T_cont - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+        rc_fsq = recon_fsq[:, T_fsq - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+
+        del recon_cont, recon_fsq, lat, lat_q, x
+        vae.train()
+
+        H, W = gen.H, gen.W
+        sep = np.full((H, 4, 3), 14, dtype=np.uint8)
+        hsep_w = W * 3 + 8
+        hsep = np.full((4, hsep_w, 3), 14, dtype=np.uint8)
+
+        stepped = os.path.join(logdir, f"preview_{step:06d}.mp4")
+        latest = os.path.join(logdir, "preview_latest.mp4")
+
+        for out_path in [stepped, latest]:
+            frame_w = hsep_w
+            frame_h = H * 2 + 4
+            cmd = ["ffmpeg", "-y", "-v", "quiet",
+                   "-f", "rawvideo", "-pix_fmt", "rgb24",
+                   "-s", f"{frame_w}x{frame_h}", "-r", "30",
+                   "-i", "pipe:0",
+                   "-c:v", "libx264", "-crf", "18",
+                   "-pix_fmt", "yuv420p", out_path]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            try:
+                for t in range(T_show):
+                    rows = []
+                    for b in range(min(2, B)):
+                        g = (gt[b, t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                        c = (rc_cont[b, t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                        q = (rc_fsq[b, t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                        row = np.concatenate([g, sep, c, sep, q], axis=1)
+                        rows.append(row)
+                    if len(rows) == 2:
+                        frame = np.concatenate([rows[0], hsep, rows[1]], axis=0)
+                    else:
+                        frame = rows[0]
+                    proc.stdin.write(frame.tobytes())
+                proc.stdin.close()
+                proc.wait()
+            except Exception:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                proc.kill()
+                proc.wait()
+                raise
+
+        # Codebook utilization stats
+        all_idx = indices.reshape(-1)
+        unique_codes = all_idx.unique().numel()
+        total_codes = fsq_layer.codebook_size
+        util = 100 * unique_codes / total_codes
+        print(f"  preview: {stepped} (GT | Cont | FSQ, {T_show} frames, "
+              f"codebook: {unique_codes}/{total_codes} = {util:.1f}%)",
+              flush=True)
+    except Exception as e:
+        import traceback
+        print(f"  preview failed: {e}", flush=True)
+        traceback.print_exc()
+        vae.train()
+
+
 # -- Training ------------------------------------------------------------------
 
 _stop_requested = False
@@ -273,8 +364,16 @@ def train(args):
             },
         }
 
+    # Preview T for temporal models
+    preview_T = vae_config.get("T", 8)
+
     # Initial preview
-    save_preview(vae, fsq_layer, gen, str(logdir), start_step, device, amp_dtype)
+    if temporal:
+        save_preview_video(vae, fsq_layer, gen, str(logdir), start_step,
+                           device, amp_dtype, preview_T)
+    else:
+        save_preview(vae, fsq_layer, gen, str(logdir), start_step, device,
+                     amp_dtype)
 
     # -- Loop --
     t0 = time.time()
@@ -344,8 +443,12 @@ def train(args):
                   f"({sps:.1f} step/s, {eta_str} left)", flush=True)
 
         if step % args.preview_every == 0:
-            save_preview(vae, fsq_layer, gen, str(logdir), step,
-                         device, amp_dtype)
+            if temporal:
+                save_preview_video(vae, fsq_layer, gen, str(logdir), step,
+                                   device, amp_dtype, preview_T)
+            else:
+                save_preview(vae, fsq_layer, gen, str(logdir), step,
+                             device, amp_dtype)
 
         if step % args.save_every == 0:
             d = _make_checkpoint()

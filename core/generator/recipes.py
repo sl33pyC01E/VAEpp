@@ -120,6 +120,11 @@ class RecipesMixin:
 
         bg = torch.tensor(recipe["bg_color"], device=dev).view(1, 3, 1, 1)
 
+        # Disco background (consistent across all frames in clip)
+        disco_bg = None
+        if self.disco_quadrant:
+            disco_bg = self._generate_disco(1)  # (1, 3, H, W)
+
         layer_idx = recipe["layer_idx"]
         n_layers = len(layer_idx)
         pan_dx = torch.tensor(recipe["pan_dx"], device=dev)
@@ -218,7 +223,10 @@ class RecipesMixin:
         frames = []
         for ti in range(T):
             t_frac = ti / max(T - 1, 1)
-            canvas = bg.expand(1, 3, H, W).clone()
+            if disco_bg is not None:
+                canvas = disco_bg.clone()
+            else:
+                canvas = bg.expand(1, 3, H, W).clone()
 
             # Layers
             for li in range(n_layers):
