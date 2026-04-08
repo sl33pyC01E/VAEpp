@@ -1,5 +1,6 @@
 # VAEpp0r
 Variable Auto Encoder procedural priors, zero real
+
 *No dataset? No problem.*
 
 Procedural synthetic data pretraining for causal temporal video autoencoders.
