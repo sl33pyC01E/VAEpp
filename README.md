@@ -1,10 +1,10 @@
-# VAEpp
-
+# VAEpp0r
+Variable Auto Encoder procedural priors, zero real
 *No dataset? No problem.*
 
 Procedural synthetic data pretraining for causal temporal video autoencoders.
 
-VAEpp trains a video VAE entirely on procedurally generated data -- zero real images required. The generator produces structured synthetic images and video clips with controllable shape composition, scene templates, mathematical patterns, and physics-driven motion. A VAE trained on this synthetic data achieves **pixel-perfect out-of-distribution reconstruction** on real video after temporal training, closing ~90% of the domain gap before any real data is introduced.
+VAEpp0r trains a video VAE entirely on procedurally generated data -- zero real images required. The generator produces structured synthetic images and video clips with controllable shape composition, scene templates, mathematical patterns, and physics-driven motion. A VAE trained on this synthetic data achieves **pixel-perfect out-of-distribution reconstruction** on real video after temporal training, closing ~90% of the domain gap before any real data is introduced.
 
 https://github.com/user-attachments/assets/c1cf2996-5148-4e41-bd4f-80eff7d2b278
 
