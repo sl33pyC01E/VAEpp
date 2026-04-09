@@ -247,17 +247,16 @@ def train(args):
     # -- Generator with motion pool --
     gen = VAEpp0rGenerator(
         height=args.H, width=args.W, device=str(device),
-        bank_size=500, n_base_layers=64,
+        bank_size=args.bank_size, n_base_layers=args.n_layers,
     )
     bank_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bank")
-    if os.path.isdir(bank_dir):
-        bank_files = [f for f in os.listdir(bank_dir)
-                      if f.startswith("shapes_") and f.endswith(".pt")]
-        if bank_files:
-            gen.setup_dynamic_bank(bank_dir, working_size=500)
-            gen.build_base_layers()
-        else:
-            gen.build_banks()
+    bank_files = [f for f in os.listdir(bank_dir)
+                  if f.startswith("shapes_") and f.endswith(".pt")] \
+        if os.path.isdir(bank_dir) else []
+    if bank_files:
+        gen.setup_dynamic_bank(bank_dir, working_size=args.bank_size,
+                                refresh_interval=50)
+        gen.build_base_layers()
     else:
         gen.build_banks()
 
@@ -266,8 +265,11 @@ def train(args):
     if os.path.exists(pool_path):
         gen.load_motion_pool(pool_path)
     else:
-        gen.build_motion_pool(n_clips=200, T=args.T)
-    print(f"  Generator: motion pool={gen.motion_pool_stats()}")
+        gen.build_motion_pool(n_clips=args.pool_size, T=args.T)
+    if args.disco:
+        gen.disco_quadrant = True
+    print(f"  Generator: bank={gen.bank_size}, pool={gen.motion_pool_stats()}, "
+          f"disco={getattr(gen, 'disco_quadrant', False)}")
 
     # -- Optimizer (bottleneck only) --
     opt = torch.optim.AdamW(bottleneck.parameters(), lr=float(args.lr),
@@ -474,6 +476,11 @@ def main():
     p.add_argument("--preview-every", type=int, default=100)
     p.add_argument("--resume", default=None,
                    help="Resume from bottleneck checkpoint")
+    p.add_argument("--bank-size", type=int, default=5000)
+    p.add_argument("--n-layers", type=int, default=128)
+    p.add_argument("--pool-size", type=int, default=200)
+    p.add_argument("--disco", action="store_true",
+                   help="Enable disco quadrant mode")
     p.add_argument("--fresh-opt", action="store_true",
                    help="Fresh optimizer on resume")
     args = p.parse_args()

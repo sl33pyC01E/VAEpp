@@ -67,22 +67,49 @@ class FlattenTab(tk.Frame):
 
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
+        f, self.H_var = make_spin(row3, "H", default=360)
+        f.pack(side="left", padx=(0, 10))
+        f, self.W_var = make_spin(row3, "W", default=640)
+        f.pack(side="left", padx=(0, 10))
         f, self.w_lat = make_float(row3, "w_latent", 1.0)
         f.pack(side="left", padx=(0, 10))
         f, self.w_pix = make_float(row3, "w_pixel", 0.5)
         f.pack(side="left", padx=(0, 10))
-        f, self.log_every = make_spin(row3, "Log", default=1)
-        f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row3, "Preview", default=200)
+        f, self.prec_var = make_float(row3, "Precision", "bf16")
         f.pack(side="left")
+
+        row4 = tk.Frame(top, bg=BG_PANEL)
+        row4.pack(fill="x", pady=(5, 0))
+        f, self.bank_var = make_spin(row4, "Bank size", default=5000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.layers_var = make_spin(row4, "Layers", default=128)
+        f.pack(side="left", padx=(0, 10))
+        f, self.log_every = make_spin(row4, "Log every", default=1)
+        f.pack(side="left", padx=(0, 10))
+        f, self.save_every = make_spin(row4, "Save every", default=2000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.preview_every = make_spin(row4, "Preview every", default=200)
+        f.pack(side="left")
+
+        row5 = tk.Frame(top, bg=BG_PANEL)
+        row5.pack(fill="x", pady=(5, 0))
+        self.fresh_opt_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row5, text="Fresh optimizer",
+                       variable=self.fresh_opt_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                       font=FONT).pack(side="left")
 
         btn = tk.Frame(top, bg=BG_PANEL)
         btn.pack(fill="x", pady=(10, 0))
         make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
         make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
+        make_btn(btn, "Kill", self.kill, RED).pack(side="left", padx=(0, 5))
+        self.disco_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(btn, text="Disco Quadrant", variable=self.disco_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, activeforeground=FG,
+                       font=FONT_SMALL).pack(side="left")
 
-        # Preview: GT | VAE | Flatten
         self.preview_label = tk.Label(self, bg=BG)
         self.preview_label.pack(pady=5)
 
@@ -100,13 +127,23 @@ class FlattenTab(tk.Frame):
                "--lr", self.lr_var.get(),
                "--batch-size", str(self.batch_var.get()),
                "--total-steps", str(self.steps_var.get()),
+               "--H", str(self.H_var.get()),
+               "--W", str(self.W_var.get()),
+               "--precision", self.prec_var.get(),
                "--w-latent", self.w_lat.get(),
                "--w-pixel", self.w_pix.get(),
+               "--bank-size", str(self.bank_var.get()),
+               "--n-layers", str(self.layers_var.get()),
                "--log-every", str(self.log_every.get()),
+               "--save-every", str(self.save_every.get()),
                "--preview-every", str(self.preview_every.get())]
         resume = self.resume_var.get().strip()
         if resume:
             cmd.extend(["--resume", resume])
+        if self.fresh_opt_var.get():
+            cmd.append("--fresh-opt")
+        if self.disco_var.get():
+            cmd.append("--disco")
         self.runner.run(cmd, cwd=PROJECT_ROOT)
 
     def stop(self):
@@ -453,6 +490,10 @@ class FlattenVideoTab(tk.Frame):
 
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
+        f, self.H_var = make_spin(row3, "H", default=360)
+        f.pack(side="left", padx=(0, 10))
+        f, self.W_var = make_spin(row3, "W", default=640)
+        f.pack(side="left", padx=(0, 10))
         f, self.T_var = make_spin(row3, "T", default=24)
         f.pack(side="left", padx=(0, 10))
         f, self.w_lat = make_float(row3, "w_latent", 1.0)
@@ -461,18 +502,43 @@ class FlattenVideoTab(tk.Frame):
         f.pack(side="left", padx=(0, 10))
         f, self.w_temp = make_float(row3, "w_temporal", 1.0)
         f.pack(side="left", padx=(0, 10))
-        f, self.log_every = make_spin(row3, "Log", default=1)
-        f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row3, "Preview", default=100)
+        f, self.prec_var = make_float(row3, "Precision", "bf16")
         f.pack(side="left")
+
+        row4 = tk.Frame(top, bg=BG_PANEL)
+        row4.pack(fill="x", pady=(5, 0))
+        f, self.bank_var = make_spin(row4, "Bank size", default=5000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.layers_var = make_spin(row4, "Layers", default=128)
+        f.pack(side="left", padx=(0, 10))
+        f, self.pool_var = make_spin(row4, "Pool size", default=200)
+        f.pack(side="left", padx=(0, 10))
+        f, self.log_every = make_spin(row4, "Log every", default=1)
+        f.pack(side="left", padx=(0, 10))
+        f, self.save_every = make_spin(row4, "Save every", default=2000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.preview_every = make_spin(row4, "Preview every", default=100)
+        f.pack(side="left")
+
+        row5 = tk.Frame(top, bg=BG_PANEL)
+        row5.pack(fill="x", pady=(5, 0))
+        self.fresh_opt_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row5, text="Fresh optimizer",
+                       variable=self.fresh_opt_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                       font=FONT).pack(side="left")
 
         btn = tk.Frame(top, bg=BG_PANEL)
         btn.pack(fill="x", pady=(10, 0))
         make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
         make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
+        make_btn(btn, "Kill", self.kill, RED).pack(side="left", padx=(0, 5))
+        self.disco_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(btn, text="Disco Quadrant", variable=self.disco_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, activeforeground=FG,
+                       font=FONT_SMALL).pack(side="left")
 
-        # Preview: video playback
         self.preview_label = tk.Label(self, bg=BG)
         self.preview_label.pack(pady=5)
 
@@ -490,15 +556,26 @@ class FlattenVideoTab(tk.Frame):
                "--lr", self.lr_var.get(),
                "--batch-size", str(self.batch_var.get()),
                "--total-steps", str(self.steps_var.get()),
+               "--H", str(self.H_var.get()),
+               "--W", str(self.W_var.get()),
                "--T", str(self.T_var.get()),
+               "--precision", self.prec_var.get(),
                "--w-latent", self.w_lat.get(),
                "--w-pixel", self.w_pix.get(),
                "--w-temporal", self.w_temp.get(),
+               "--bank-size", str(self.bank_var.get()),
+               "--n-layers", str(self.layers_var.get()),
+               "--pool-size", str(self.pool_var.get()),
                "--log-every", str(self.log_every.get()),
+               "--save-every", str(self.save_every.get()),
                "--preview-every", str(self.preview_every.get())]
         resume = self.resume_var.get().strip()
         if resume:
             cmd.extend(["--resume", resume])
+        if self.fresh_opt_var.get():
+            cmd.append("--fresh-opt")
+        if self.disco_var.get():
+            cmd.append("--disco")
         self.runner.run(cmd, cwd=PROJECT_ROOT)
 
     def stop(self):
@@ -1758,20 +1835,48 @@ class FlattenFSQTab(tk.Frame):
 
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
+        f, self.H_var = make_spin(row3, "H", default=360)
+        f.pack(side="left", padx=(0, 10))
+        f, self.W_var = make_spin(row3, "W", default=640)
+        f.pack(side="left", padx=(0, 10))
         f, self.w_lat = make_float(row3, "w_latent", 1.0)
         f.pack(side="left", padx=(0, 10))
         f, self.w_pix = make_float(row3, "w_pixel", 0.5)
         f.pack(side="left", padx=(0, 10))
-        f, self.log_every = make_spin(row3, "Log", default=1)
-        f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row3, "Preview", default=200)
+        f, self.prec_var = make_float(row3, "Precision", "bf16")
         f.pack(side="left")
+
+        row4 = tk.Frame(top, bg=BG_PANEL)
+        row4.pack(fill="x", pady=(5, 0))
+        f, self.bank_var = make_spin(row4, "Bank size", default=5000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.layers_var = make_spin(row4, "Layers", default=128)
+        f.pack(side="left", padx=(0, 10))
+        f, self.log_every = make_spin(row4, "Log every", default=1)
+        f.pack(side="left", padx=(0, 10))
+        f, self.save_every = make_spin(row4, "Save every", default=2000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.preview_every = make_spin(row4, "Preview every", default=200)
+        f.pack(side="left")
+
+        row5 = tk.Frame(top, bg=BG_PANEL)
+        row5.pack(fill="x", pady=(5, 0))
+        self.fresh_opt_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row5, text="Fresh optimizer",
+                       variable=self.fresh_opt_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                       font=FONT).pack(side="left")
 
         btn = tk.Frame(top, bg=BG_PANEL)
         btn.pack(fill="x", pady=(10, 0))
         make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
         make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
+        make_btn(btn, "Kill", self.kill, RED).pack(side="left", padx=(0, 5))
+        self.disco_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(btn, text="Disco Quadrant", variable=self.disco_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, activeforeground=FG,
+                       font=FONT_SMALL).pack(side="left")
 
         self.preview_label = tk.Label(self, bg=BG)
         self.preview_label.pack(pady=5)
@@ -1789,14 +1894,24 @@ class FlattenFSQTab(tk.Frame):
                "--lr", self.lr_var.get(),
                "--batch-size", str(self.batch_var.get()),
                "--total-steps", str(self.steps_var.get()),
+               "--H", str(self.H_var.get()),
+               "--W", str(self.W_var.get()),
+               "--precision", self.prec_var.get(),
                "--w-latent", self.w_lat.get(),
                "--w-pixel", self.w_pix.get(),
+               "--bank-size", str(self.bank_var.get()),
+               "--n-layers", str(self.layers_var.get()),
                "--log-every", str(self.log_every.get()),
+               "--save-every", str(self.save_every.get()),
                "--preview-every", str(self.preview_every.get()),
                "--logdir", "flatten_fsq_logs"]
         resume = self.resume_var.get().strip()
         if resume:
             cmd.extend(["--resume", resume])
+        if self.fresh_opt_var.get():
+            cmd.append("--fresh-opt")
+        if self.disco_var.get():
+            cmd.append("--disco")
         self.runner.run(cmd, cwd=PROJECT_ROOT)
 
     def stop(self):
@@ -1882,6 +1997,10 @@ class FlattenVideoFSQTab(tk.Frame):
 
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
+        f, self.H_var = make_spin(row3, "H", default=360)
+        f.pack(side="left", padx=(0, 10))
+        f, self.W_var = make_spin(row3, "W", default=640)
+        f.pack(side="left", padx=(0, 10))
         f, self.T_var = make_spin(row3, "T", default=24)
         f.pack(side="left", padx=(0, 10))
         f, self.w_lat = make_float(row3, "w_latent", 1.0)
@@ -1890,16 +2009,42 @@ class FlattenVideoFSQTab(tk.Frame):
         f.pack(side="left", padx=(0, 10))
         f, self.w_temp = make_float(row3, "w_temporal", 1.0)
         f.pack(side="left", padx=(0, 10))
-        f, self.log_every = make_spin(row3, "Log", default=1)
-        f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row3, "Preview", default=100)
+        f, self.prec_var = make_float(row3, "Precision", "bf16")
         f.pack(side="left")
+
+        row4 = tk.Frame(top, bg=BG_PANEL)
+        row4.pack(fill="x", pady=(5, 0))
+        f, self.bank_var = make_spin(row4, "Bank size", default=5000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.layers_var = make_spin(row4, "Layers", default=128)
+        f.pack(side="left", padx=(0, 10))
+        f, self.pool_var = make_spin(row4, "Pool size", default=200)
+        f.pack(side="left", padx=(0, 10))
+        f, self.log_every = make_spin(row4, "Log every", default=1)
+        f.pack(side="left", padx=(0, 10))
+        f, self.save_every = make_spin(row4, "Save every", default=2000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.preview_every = make_spin(row4, "Preview every", default=100)
+        f.pack(side="left")
+
+        row5 = tk.Frame(top, bg=BG_PANEL)
+        row5.pack(fill="x", pady=(5, 0))
+        self.fresh_opt_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row5, text="Fresh optimizer",
+                       variable=self.fresh_opt_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                       font=FONT).pack(side="left")
 
         btn = tk.Frame(top, bg=BG_PANEL)
         btn.pack(fill="x", pady=(10, 0))
         make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
         make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
+        make_btn(btn, "Kill", self.kill, RED).pack(side="left", padx=(0, 5))
+        self.disco_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(btn, text="Disco Quadrant", variable=self.disco_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, activeforeground=FG,
+                       font=FONT_SMALL).pack(side="left")
 
         self.preview_label = tk.Label(self, bg=BG)
         self.preview_label.pack(pady=5)
@@ -1917,16 +2062,27 @@ class FlattenVideoFSQTab(tk.Frame):
                "--lr", self.lr_var.get(),
                "--batch-size", str(self.batch_var.get()),
                "--total-steps", str(self.steps_var.get()),
+               "--H", str(self.H_var.get()),
+               "--W", str(self.W_var.get()),
                "--T", str(self.T_var.get()),
+               "--precision", self.prec_var.get(),
                "--w-latent", self.w_lat.get(),
                "--w-pixel", self.w_pix.get(),
                "--w-temporal", self.w_temp.get(),
+               "--bank-size", str(self.bank_var.get()),
+               "--n-layers", str(self.layers_var.get()),
+               "--pool-size", str(self.pool_var.get()),
                "--log-every", str(self.log_every.get()),
+               "--save-every", str(self.save_every.get()),
                "--preview-every", str(self.preview_every.get()),
                "--logdir", "flatten_video_fsq_logs"]
         resume = self.resume_var.get().strip()
         if resume:
             cmd.extend(["--resume", resume])
+        if self.fresh_opt_var.get():
+            cmd.append("--fresh-opt")
+        if self.disco_var.get():
+            cmd.append("--disco")
         self.runner.run(cmd, cwd=PROJECT_ROOT)
 
     def stop(self):

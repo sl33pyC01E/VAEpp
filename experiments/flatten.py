@@ -361,15 +361,21 @@ def train(args):
     # -- Generator --
     gen = VAEpp0rGenerator(
         height=args.H, width=args.W, device=str(device),
-        bank_size=500, n_base_layers=64,
+        bank_size=args.bank_size, n_base_layers=args.n_layers,
     )
     bank_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bank")
-    if os.path.isdir(bank_dir):
-        bank_files = [f for f in os.listdir(bank_dir)
-                      if f.startswith("shapes_") and f.endswith(".pt")]
-        if bank_files:
-            gen.setup_dynamic_bank(bank_dir, working_size=500)
-    gen.build_base_layers()
+    bank_files = [f for f in os.listdir(bank_dir)
+                  if f.startswith("shapes_") and f.endswith(".pt")] \
+        if os.path.isdir(bank_dir) else []
+    if bank_files:
+        gen.setup_dynamic_bank(bank_dir, working_size=args.bank_size,
+                                refresh_interval=50)
+        gen.build_base_layers()
+    else:
+        gen.build_banks()
+    if args.disco:
+        gen.disco_quadrant = True
+    print(f"  Generator: bank={gen.bank_size}, disco={getattr(gen, 'disco_quadrant', False)}")
 
     # -- Optimizer (bottleneck only) --
     opt = torch.optim.AdamW(bottleneck.parameters(), lr=float(args.lr),
@@ -544,6 +550,10 @@ def main():
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--save-every", type=int, default=2000)
     p.add_argument("--preview-every", type=int, default=200)
+    p.add_argument("--bank-size", type=int, default=5000)
+    p.add_argument("--n-layers", type=int, default=128)
+    p.add_argument("--disco", action="store_true",
+                   help="Enable disco quadrant mode")
     p.add_argument("--resume", default=None,
                    help="Resume from bottleneck checkpoint")
     p.add_argument("--fresh-opt", action="store_true",
