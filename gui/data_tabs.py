@@ -280,28 +280,52 @@ class GeneratorTab(tk.Frame):
         else:
             self.after(0, _append)
 
-    class _LogTee:
-        """Wraps stdout to tee output to a log widget in real time."""
-        def __init__(self, tab, original):
-            self.tab = tab
-            self.original = original
-        def write(self, s):
-            if self.original:
-                self.original.write(s)
-            if s.strip():
-                self.tab._log(s.rstrip())
-        def flush(self):
-            if self.original:
-                self.original.flush()
-
     def _with_log_tee(self, fn):
-        """Run fn() with stdout tee'd to the log widget."""
+        """Run fn() with stdout tee'd to the log widget via a queue."""
+        import queue as _queue
+        q = _queue.Queue()
         old = sys.stdout
-        sys.stdout = self._LogTee(self, old)
+        tab = self
+
+        class _Tee:
+            def write(self, s):
+                if old:
+                    old.write(s)
+                if s.strip():
+                    q.put(s.rstrip())
+            def flush(self):
+                if old:
+                    old.flush()
+
+        def _poll():
+            batch = []
+            try:
+                while True:
+                    batch.append(q.get_nowait())
+            except _queue.Empty:
+                pass
+            if batch:
+                tab.log.insert(tk.END, "\n".join(batch) + "\n")
+                tab.log.see(tk.END)
+            if not done[0]:
+                tab.after(50, _poll)
+
+        done = [False]
+        sys.stdout = _Tee()
+        tab.after(50, _poll)
         try:
             fn()
         finally:
             sys.stdout = old
+            done[0] = True
+            batch = []
+            try:
+                while True:
+                    batch.append(q.get_nowait())
+            except _queue.Empty:
+                pass
+            if batch:
+                tab._log("\n".join(batch))
 
     def build_banks(self):
         self.gen = None
@@ -698,26 +722,53 @@ class VideoGenTab(tk.Frame):
         else:
             self.after(0, _append)
 
-    class _LogTee:
-        def __init__(self, tab, original):
-            self.tab = tab
-            self.original = original
-        def write(self, s):
-            if self.original:
-                self.original.write(s)
-            if s.strip():
-                self.tab._log(s.rstrip())
-        def flush(self):
-            if self.original:
-                self.original.flush()
-
     def _with_log_tee(self, fn):
+        """Run fn() with stdout tee'd to the log widget via a queue."""
+        import queue as _queue
+        q = _queue.Queue()
         old = sys.stdout
-        sys.stdout = self._LogTee(self, old)
+        tab = self
+
+        class _Tee:
+            def write(self, s):
+                if old:
+                    old.write(s)
+                if s.strip():
+                    q.put(s.rstrip())
+            def flush(self):
+                if old:
+                    old.flush()
+
+        def _poll():
+            batch = []
+            try:
+                while True:
+                    batch.append(q.get_nowait())
+            except _queue.Empty:
+                pass
+            if batch:
+                tab.log.insert(tk.END, "\n".join(batch) + "\n")
+                tab.log.see(tk.END)
+            if not done[0]:
+                tab.after(50, _poll)
+
+        done = [False]
+        sys.stdout = _Tee()
+        tab.after(50, _poll)
         try:
             fn()
         finally:
             sys.stdout = old
+            done[0] = True
+            # Flush remaining
+            batch = []
+            try:
+                while True:
+                    batch.append(q.get_nowait())
+            except _queue.Empty:
+                pass
+            if batch:
+                tab._log("\n".join(batch))
 
     def build_banks(self):
         self.gen = None
