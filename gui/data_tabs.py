@@ -280,16 +280,36 @@ class GeneratorTab(tk.Frame):
         else:
             self.after(0, _append)
 
+    class _LogTee:
+        """Wraps stdout to tee output to a log widget in real time."""
+        def __init__(self, tab, original):
+            self.tab = tab
+            self.original = original
+        def write(self, s):
+            if self.original:
+                self.original.write(s)
+            if s.strip():
+                self.tab._log(s.rstrip())
+        def flush(self):
+            if self.original:
+                self.original.flush()
+
+    def _with_log_tee(self, fn):
+        """Run fn() with stdout tee'd to the log widget."""
+        old = sys.stdout
+        sys.stdout = self._LogTee(self, old)
+        try:
+            fn()
+        finally:
+            sys.stdout = old
+
     def build_banks(self):
         self.gen = None
         gen = self._get_gen()
         self.stats_label.config(text="Building banks...")
-        self._log("Building banks...")
         self.update()
         def _build():
-            gen.build_banks()
-            self._log(f"Banks built: {gen.bank_size} shapes, "
-                      f"{len(gen.base_layers) if gen.base_layers else 0} layers")
+            self._with_log_tee(gen.build_banks)
             self.after(0, self._update_stats)
             self.after(0, self._update_bank_browser)
         threading.Thread(target=_build, daemon=True).start()
@@ -300,11 +320,9 @@ class GeneratorTab(tk.Frame):
             self.stats_label.config(text="Build banks first!")
             return
         self.stats_label.config(text="Refreshing layers...")
-        self._log("Refreshing layers...")
         self.update()
         def _refresh():
-            gen.refresh_base_layers()
-            self._log(f"Layers refreshed: {len(gen.base_layers)} layers")
+            self._with_log_tee(gen.refresh_base_layers)
             self.after(0, self._update_stats)
         threading.Thread(target=_refresh, daemon=True).start()
 
@@ -356,20 +374,23 @@ class GeneratorTab(tk.Frame):
         gen = self._get_gen()
         n = self.bank_size_var.get()
         self.stats_label.config(text="Building + accumulating...")
-        self._log(f"Accumulating {n} new shapes...")
         self.update()
         def _build():
-            new_shapes = []
-            for i in range(n):
-                new_shapes.append(gen._render_one_shape())
-            new_bank = torch.stack(new_shapes)
-            if gen.shape_bank is not None:
-                gen.shape_bank = torch.cat([gen.shape_bank, new_bank], dim=0)
-            else:
-                gen.shape_bank = new_bank
-            gen.bank_size = gen.shape_bank.shape[0]
-            gen.build_base_layers()
-            self._log(f"Accumulated: now {gen.bank_size} shapes total")
+            def _do():
+                new_shapes = []
+                for i in range(n):
+                    new_shapes.append(gen._render_one_shape())
+                    if (i + 1) % 500 == 0:
+                        print(f"  [{i+1}/{n}] shapes rendered", flush=True)
+                new_bank = torch.stack(new_shapes)
+                if gen.shape_bank is not None:
+                    gen.shape_bank = torch.cat([gen.shape_bank, new_bank], dim=0)
+                else:
+                    gen.shape_bank = new_bank
+                gen.bank_size = gen.shape_bank.shape[0]
+                gen.build_base_layers()
+                print(f"Accumulated: now {gen.bank_size} shapes total", flush=True)
+            self._with_log_tee(_do)
             self.after(0, self._update_stats)
             self.after(0, self._update_bank_browser)
         threading.Thread(target=_build, daemon=True).start()
@@ -399,12 +420,10 @@ class GeneratorTab(tk.Frame):
         gen = self._get_gen()
         gen.disco_quadrant = True
         self.stats_label.config(text="Disco quadrant: building banks...")
-        self._log("Disco quadrant: building banks...")
         self.update()
         def _build():
-            gen.build_banks()
+            self._with_log_tee(gen.build_banks)
             gen.disco_quadrant = False
-            self._log(f"Disco banks built: {gen.bank_size} shapes")
             self.after(0, self._update_stats)
             self.after(0, self._update_bank_browser)
         threading.Thread(target=_build, daemon=True).start()
@@ -417,60 +436,61 @@ class GeneratorTab(tk.Frame):
         self.update()
 
         def _disco():
-            # Save original params to restore after disco
-            orig_shape_probs = gen.shape_probs.clone()
-            orig_texture_probs = gen.texture_probs.clone()
-            orig_edge_probs = gen.edge_probs.clone()
-            orig_sat_range = gen.sat_range
-            orig_val_range = gen.val_range
-            orig_min_r_frac = gen.min_r_frac
-            orig_max_r_frac = gen.max_r_frac
-            orig_soft_range = gen.soft_range
-            orig_template_probs = gen.template_probs.clone()
+            def _do():
+                # Save original params to restore after disco
+                orig_shape_probs = gen.shape_probs.clone()
+                orig_texture_probs = gen.texture_probs.clone()
+                orig_edge_probs = gen.edge_probs.clone()
+                orig_sat_range = gen.sat_range
+                orig_val_range = gen.val_range
+                orig_min_r_frac = gen.min_r_frac
+                orig_max_r_frac = gen.max_r_frac
+                orig_soft_range = gen.soft_range
+                orig_template_probs = gen.template_probs.clone()
 
-            shapes = []
-            for i in range(n):
-                # Randomize ALL generator params per shape
-                gen.shape_probs = torch.rand(len(orig_shape_probs), device=gen.device)
-                gen.shape_probs = gen.shape_probs / gen.shape_probs.sum()
-                gen.texture_probs = torch.rand(len(orig_texture_probs), device=gen.device)
-                gen.texture_probs = gen.texture_probs / gen.texture_probs.sum()
-                gen.edge_probs = torch.rand(len(orig_edge_probs), device=gen.device)
-                gen.edge_probs = gen.edge_probs / gen.edge_probs.sum()
-                gen.sat_range = (torch.rand(1).item() * 0.5,
-                                  torch.rand(1).item() * 0.5 + 0.5)
-                gen.val_range = (torch.rand(1).item() * 0.4,
-                                  torch.rand(1).item() * 0.4 + 0.6)
-                gen.min_r_frac = torch.rand(1).item() * 0.3 + 0.05
-                gen.max_r_frac = torch.rand(1).item() * 0.4 + 0.5
-                gen.soft_range = (torch.rand(1).item() * 2 + 0.5,
-                                   torch.rand(1).item() * 6 + 2)
-                tw = torch.rand(len(gen.template_names), device=gen.device)
-                tw[0] = tw[0] * 0.1
-                gen.template_probs = tw / tw.sum()
+                shapes = []
+                for i in range(n):
+                    gen.shape_probs = torch.rand(len(orig_shape_probs), device=gen.device)
+                    gen.shape_probs = gen.shape_probs / gen.shape_probs.sum()
+                    gen.texture_probs = torch.rand(len(orig_texture_probs), device=gen.device)
+                    gen.texture_probs = gen.texture_probs / gen.texture_probs.sum()
+                    gen.edge_probs = torch.rand(len(orig_edge_probs), device=gen.device)
+                    gen.edge_probs = gen.edge_probs / gen.edge_probs.sum()
+                    gen.sat_range = (torch.rand(1).item() * 0.5,
+                                      torch.rand(1).item() * 0.5 + 0.5)
+                    gen.val_range = (torch.rand(1).item() * 0.4,
+                                      torch.rand(1).item() * 0.4 + 0.6)
+                    gen.min_r_frac = torch.rand(1).item() * 0.3 + 0.05
+                    gen.max_r_frac = torch.rand(1).item() * 0.4 + 0.5
+                    gen.soft_range = (torch.rand(1).item() * 2 + 0.5,
+                                       torch.rand(1).item() * 6 + 2)
+                    tw = torch.rand(len(gen.template_names), device=gen.device)
+                    tw[0] = tw[0] * 0.1
+                    gen.template_probs = tw / tw.sum()
 
-                shapes.append(gen._render_one_shape())
-                if (i + 1) % 100 == 0:
-                    print(f"  disco [{i+1}/{n}] {gen._last_shape_log}", flush=True)
+                    shapes.append(gen._render_one_shape())
+                    if (i + 1) % 100 == 0:
+                        print(f"  disco [{i+1}/{n}] {gen._last_shape_log}", flush=True)
 
-            # Restore original params
-            gen.shape_probs = orig_shape_probs
-            gen.texture_probs = orig_texture_probs
-            gen.edge_probs = orig_edge_probs
-            gen.sat_range = orig_sat_range
-            gen.val_range = orig_val_range
-            gen.min_r_frac = orig_min_r_frac
-            gen.max_r_frac = orig_max_r_frac
-            gen.soft_range = orig_soft_range
-            gen.template_probs = orig_template_probs
+                gen.shape_probs = orig_shape_probs
+                gen.texture_probs = orig_texture_probs
+                gen.edge_probs = orig_edge_probs
+                gen.sat_range = orig_sat_range
+                gen.val_range = orig_val_range
+                gen.min_r_frac = orig_min_r_frac
+                gen.max_r_frac = orig_max_r_frac
+                gen.soft_range = orig_soft_range
+                gen.template_probs = orig_template_probs
 
-            new_bank = torch.stack(shapes)
-            if gen.shape_bank is not None:
-                gen.shape_bank = torch.cat([gen.shape_bank, new_bank], dim=0)
-            else:
-                gen.shape_bank = new_bank
-            gen.bank_size = gen.shape_bank.shape[0]
-            gen.build_base_layers()
+                new_bank = torch.stack(shapes)
+                if gen.shape_bank is not None:
+                    gen.shape_bank = torch.cat([gen.shape_bank, new_bank], dim=0)
+                else:
+                    gen.shape_bank = new_bank
+                gen.bank_size = gen.shape_bank.shape[0]
+                gen.build_base_layers()
+                print(f"Disco bank done: {gen.bank_size} shapes", flush=True)
+            self._with_log_tee(_do)
             self.after(0, self._update_stats)
             self.after(0, self._update_bank_browser)
 
@@ -678,15 +698,34 @@ class VideoGenTab(tk.Frame):
         else:
             self.after(0, _append)
 
+    class _LogTee:
+        def __init__(self, tab, original):
+            self.tab = tab
+            self.original = original
+        def write(self, s):
+            if self.original:
+                self.original.write(s)
+            if s.strip():
+                self.tab._log(s.rstrip())
+        def flush(self):
+            if self.original:
+                self.original.flush()
+
+    def _with_log_tee(self, fn):
+        old = sys.stdout
+        sys.stdout = self._LogTee(self, old)
+        try:
+            fn()
+        finally:
+            sys.stdout = old
+
     def build_banks(self):
-        self.gen = None  # force recreate with current settings
+        self.gen = None
         gen = self._get_gen()
         self.status.config(text="Building banks...")
-        self._log("Building banks...")
         self.update()
         def _build():
-            gen.build_banks()
-            self._log(f"Banks ready: {gen.bank_size} shapes")
+            self._with_log_tee(gen.build_banks)
             self.after(0, lambda: self.status.config(
                 text=f"Banks ready: {gen.bank_size} shapes"))
         threading.Thread(target=_build, daemon=True).start()
@@ -713,12 +752,11 @@ class VideoGenTab(tk.Frame):
             gen.build_base_layers()
         T = self.T_var.get()
         self.status.config(text=f"Building motion pool T={T}...")
-        self._log(f"Building motion pool T={T}...")
         self.update()
+        seq_kw = self._get_seq_kwargs()
         def _build():
-            gen.build_motion_pool(n_clips=200, T=T, **self._get_seq_kwargs())
+            self._with_log_tee(lambda: gen.build_motion_pool(n_clips=200, T=T, **seq_kw))
             stats = gen.motion_pool_stats()
-            self._log(f"Pool ready: {stats}")
             self.after(0, lambda: self.status.config(
                 text=f"Pool ready: {stats}"))
         threading.Thread(target=_build, daemon=True).start()
@@ -763,54 +801,51 @@ class VideoGenTab(tk.Frame):
 
         n = 200
         self.status.config(text=f"Disco: building {n} randomized recipes...")
-        self._log(f"Disco pool: building {n} randomized recipes...")
         self.update()
 
         def _disco():
-            # Save original params to restore after disco
-            orig_shape_probs = gen.shape_probs.clone()
-            orig_texture_probs = gen.texture_probs.clone()
-            orig_template_probs = gen.template_probs.clone()
+            def _do():
+                orig_shape_probs = gen.shape_probs.clone()
+                orig_texture_probs = gen.texture_probs.clone()
+                orig_template_probs = gen.template_probs.clone()
 
-            T = self.T_var.get()
-            for i in range(n):
-                # Randomize all motion params per recipe
-                kw = {
-                    "use_physics": torch.rand(1).item() > 0.3,
-                    "use_rotation": torch.rand(1).item() > 0.3,
-                    "use_zoom": torch.rand(1).item() > 0.3,
-                    "use_fade": torch.rand(1).item() > 0.3,
-                    "use_viewport": torch.rand(1).item() > 0.3,
-                    "use_fluid": torch.rand(1).item() > 0.7,
-                    "pan_strength": torch.rand(1).item() * 0.8,
-                    "motion_strength": torch.rand(1).item() * 0.6,
-                    "viewport_pan": torch.rand(1).item() * 0.5,
-                    "viewport_zoom": torch.rand(1).item() * 0.3,
-                    "viewport_rotation": torch.rand(1).item() * 0.4,
-                    "fluid_strength": torch.rand(1).item() * 2.0,
-                }
-                # Also randomize generator params for this recipe
-                gen.shape_probs = torch.rand(len(orig_shape_probs), device=gen.device)
-                gen.shape_probs = gen.shape_probs / gen.shape_probs.sum()
-                gen.texture_probs = torch.rand(len(orig_texture_probs), device=gen.device)
-                gen.texture_probs = gen.texture_probs / gen.texture_probs.sum()
-                tw = torch.rand(len(gen.template_names), device=gen.device)
-                tw[0] = tw[0] * 0.1
-                gen.template_probs = tw / tw.sum()
+                T = self.T_var.get()
+                for i in range(n):
+                    kw = {
+                        "use_physics": torch.rand(1).item() > 0.3,
+                        "use_rotation": torch.rand(1).item() > 0.3,
+                        "use_zoom": torch.rand(1).item() > 0.3,
+                        "use_fade": torch.rand(1).item() > 0.3,
+                        "use_viewport": torch.rand(1).item() > 0.3,
+                        "use_fluid": torch.rand(1).item() > 0.7,
+                        "pan_strength": torch.rand(1).item() * 0.8,
+                        "motion_strength": torch.rand(1).item() * 0.6,
+                        "viewport_pan": torch.rand(1).item() * 0.5,
+                        "viewport_zoom": torch.rand(1).item() * 0.3,
+                        "viewport_rotation": torch.rand(1).item() * 0.4,
+                        "fluid_strength": torch.rand(1).item() * 2.0,
+                    }
+                    gen.shape_probs = torch.rand(len(orig_shape_probs), device=gen.device)
+                    gen.shape_probs = gen.shape_probs / gen.shape_probs.sum()
+                    gen.texture_probs = torch.rand(len(orig_texture_probs), device=gen.device)
+                    gen.texture_probs = gen.texture_probs / gen.texture_probs.sum()
+                    tw = torch.rand(len(gen.template_names), device=gen.device)
+                    tw[0] = tw[0] * 0.1
+                    gen.template_probs = tw / tw.sum()
 
-                recipe = gen._generate_recipe(T=T, **kw)
-                gen._recipe_pool.append(recipe)
+                    recipe = gen._generate_recipe(T=T, **kw)
+                    gen._recipe_pool.append(recipe)
 
-                if (i + 1) % 50 == 0:
-                    print(f"  disco recipes [{i+1}/{n}]", flush=True)
+                    if (i + 1) % 50 == 0:
+                        print(f"  disco recipes [{i+1}/{n}]", flush=True)
 
-            # Restore original params
-            gen.shape_probs = orig_shape_probs
-            gen.texture_probs = orig_texture_probs
-            gen.template_probs = orig_template_probs
+                gen.shape_probs = orig_shape_probs
+                gen.texture_probs = orig_texture_probs
+                gen.template_probs = orig_template_probs
+                gen._motion_pool_T = T
+                print(f"Disco pool ready: {len(gen._recipe_pool)} recipes", flush=True)
 
-            gen._motion_pool_T = T
-            self._log(f"Disco pool ready: {len(gen._recipe_pool)} recipes")
+            self._with_log_tee(_do)
             self.after(0, lambda: self.status.config(
                 text=f"Disco pool: {len(gen._recipe_pool)} recipes"))
 
