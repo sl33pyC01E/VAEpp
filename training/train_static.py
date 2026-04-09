@@ -101,13 +101,26 @@ def train(args):
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    # -- Model --
+    # -- Model (read arch from checkpoint if resuming) --
+    enc_ch = args.enc_ch
     dec_ch = tuple(int(x) for x in args.dec_ch.split(","))
+    latent_ch = args.latent_ch
+    if args.resume:
+        _peek = torch.load(args.resume, map_location="cpu", weights_only=False)
+        _cfg = _peek.get("config", {})
+        enc_ch = _cfg.get("encoder_channels", enc_ch)
+        latent_ch = _cfg.get("latent_channels", latent_ch)
+        dec_ch_str = _cfg.get("decoder_channels", args.dec_ch)
+        if isinstance(dec_ch_str, str):
+            dec_ch = tuple(int(x) for x in dec_ch_str.split(","))
+        elif isinstance(dec_ch_str, (list, tuple)):
+            dec_ch = tuple(dec_ch_str)
+        del _peek
     model = MiniVAE(
-        latent_channels=args.latent_ch,
+        latent_channels=latent_ch,
         image_channels=args.image_ch,
         output_channels=args.image_ch,
-        encoder_channels=args.enc_ch,
+        encoder_channels=enc_ch,
         decoder_channels=dec_ch,
         encoder_time_downscale=(False, False, False),
         decoder_time_upscale=(False, False, False),
@@ -222,11 +235,11 @@ def train(args):
             "scaler": scaler.state_dict(),
             "global_step": global_step,
             "config": {
-                "latent_channels": args.latent_ch,
+                "latent_channels": latent_ch,
                 "image_channels": args.image_ch,
                 "output_channels": args.image_ch,
-                "encoder_channels": args.enc_ch,
-                "decoder_channels": args.dec_ch,
+                "encoder_channels": enc_ch,
+                "decoder_channels": ",".join(str(x) for x in dec_ch),
                 "synthyper": True,
             },
         }
