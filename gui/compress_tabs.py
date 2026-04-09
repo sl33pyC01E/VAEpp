@@ -1548,6 +1548,28 @@ class FSQVideoInferenceTab(tk.Frame):
         except Exception as e:
             self.status.config(text=f"Error: {e}")
 
+    def _run_fsq_inference(self, clip, source_label=""):
+        """Run chunked FSQ inference on a clip tensor, show VAE|FSQ video."""
+        import torch
+        with torch.no_grad():
+            recon_vae, recon_fsq = chunked_fsq_inference(
+                self.vae, self.fsq, self.pre_quant, self.post_quant, clip)
+
+        trim = getattr(self.vae, 'frames_to_trim', 0)
+        T_vae = recon_vae.shape[1]
+        T_fsq = recon_fsq.shape[1]
+        T_show = min(T_vae, T_fsq)
+
+        rc_vae = recon_vae[0, :T_show, :3].clamp(0, 1).float().cpu().numpy()
+        rc_fsq = recon_fsq[0, :T_show, :3].clamp(0, 1).float().cpu().numpy()
+        T_in = clip.shape[1]
+
+        status = f"VAE | FSQ, T_in={T_in}, T_out={T_show}, trim={trim}"
+        if source_label:
+            status += f", src={source_label}"
+        self.after(0, lambda: self.status.config(text=status))
+        self.after(0, self._show_video, rc_vae, rc_fsq, T_show)
+
     def test_synthetic(self):
         if self.vae is None or self.fsq is None:
             self.status.config(text="Load a model first")
@@ -1566,33 +1588,8 @@ class FSQVideoInferenceTab(tk.Frame):
                                           n_base_layers=64)
                 gen.build_banks()
                 gen.build_motion_pool(n_clips=50, T=T)
-
-                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    clip = gen.generate_sequence(1, T=T).cuda()
-
-                    # VAE path (no FSQ)
-                    recon_vae, _ = self.vae(clip)
-
-                    # FSQ path
-                    lat = self.vae.encode_video(clip)
-                    Bl, Tp, Cl, Hl, Wl = lat.shape
-                    lat_flat = lat.reshape(Bl * Tp, Cl, Hl, Wl)
-                    z_proj = self.pre_quant(lat_flat)
-                    z_q, indices = self.fsq(z_proj)
-                    lat_q = self.post_quant(z_q)
-                    lat_q = lat_q.reshape(Bl, Tp, Cl, Hl, Wl)
-                    recon_fsq = self.vae.decode_video(lat_q)
-
-                T_vae = recon_vae.shape[1]
-                T_fsq = recon_fsq.shape[1]
-                T_show = min(T_vae, T_fsq)
-
-                rc_vae = recon_vae[0, T_vae - T_show:, :3].clamp(0, 1).float().cpu().numpy()
-                rc_fsq = recon_fsq[0, T_fsq - T_show:, :3].clamp(0, 1).float().cpu().numpy()
-
-                self.after(0, lambda: self.status.config(
-                    text=f"VAE | FSQ, T={T_show}"))
-                self.after(0, self._show_video, rc_vae, rc_fsq, T_show)
+                clip = gen.generate_sequence(1, T=T).cuda()
+                self._run_fsq_inference(clip)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -1637,30 +1634,7 @@ class FSQVideoInferenceTab(tk.Frame):
                     clip = torch.cat([clip, torch.zeros(1, n, ch - 3, 360, 640,
                                                          device="cuda")], dim=2)
 
-                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    # VAE path (no FSQ)
-                    recon_vae, _ = self.vae(clip)
-
-                    # FSQ path
-                    lat = self.vae.encode_video(clip)
-                    Bl, Tp, Cl, Hl, Wl = lat.shape
-                    lat_flat = lat.reshape(Bl * Tp, Cl, Hl, Wl)
-                    z_proj = self.pre_quant(lat_flat)
-                    z_q, indices = self.fsq(z_proj)
-                    lat_q = self.post_quant(z_q)
-                    lat_q = lat_q.reshape(Bl, Tp, Cl, Hl, Wl)
-                    recon_fsq = self.vae.decode_video(lat_q)
-
-                T_vae = recon_vae.shape[1]
-                T_fsq = recon_fsq.shape[1]
-                T_show = min(T_vae, T_fsq)
-
-                rc_vae = recon_vae[0, T_vae - T_show:, :3].clamp(0, 1).float().cpu().numpy()
-                rc_fsq = recon_fsq[0, T_fsq - T_show:, :3].clamp(0, 1).float().cpu().numpy()
-
-                self.after(0, lambda: self.status.config(
-                    text=f"VAE | FSQ, T={T_show}, src={os.path.basename(path)}"))
-                self.after(0, self._show_video, rc_vae, rc_fsq, T_show)
+                self._run_fsq_inference(clip, os.path.basename(path))
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -1669,7 +1643,7 @@ class FSQVideoInferenceTab(tk.Frame):
         threading.Thread(target=_bg, daemon=True).start()
 
     def _show_video(self, rc_vae, rc_fsq, T_show):
-        """Play VAE|FSQ side by side as inline video loop."""
+        """Play VAE|FSQ side by side as inline video loop, save mp4."""
         H, W = 360, 640
         sep = np.full((H, 4, 3), 14, dtype=np.uint8)
         frame_w = W * 2 + 4
@@ -1677,26 +1651,45 @@ class FSQVideoInferenceTab(tk.Frame):
         dw = int(frame_w * scale) if scale < 1 else frame_w
         dh = int(H * scale) if scale < 1 else H
 
-        self._video_frames = []
-        for t in range(T_show):
-            v = (rc_vae[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            q = (rc_fsq[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            frame = np.concatenate([v, sep, q], axis=1)
-            pil = Image.fromarray(frame)
-            if scale < 1:
-                pil = pil.resize((dw, dh), BILINEAR)
-            self._video_frames.append(ImageTk.PhotoImage(pil))
+        # Save inference video
+        import time as _time
+        inf_dir = os.path.join(PROJECT_ROOT, "fsq_video_logs", "inference")
+        os.makedirs(inf_dir, exist_ok=True)
+        vid_path = os.path.join(inf_dir, f"fsq_vid_inf_{int(_time.time())}.mp4")
+        cmd = ["ffmpeg", "-y", "-v", "quiet",
+               "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "-s", f"{frame_w}x{H}", "-r", "30",
+               "-i", "pipe:0",
+               "-c:v", "libx264", "-crf", "18",
+               "-pix_fmt", "yuv420p", vid_path]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-        self._video_idx = 0
+        self._video_frames = []
+        try:
+            for t in range(T_show):
+                v = (rc_vae[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                q = (rc_fsq[t].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                frame = np.concatenate([v, sep, q], axis=1)
+                proc.stdin.write(frame.tobytes())
+                pil = Image.fromarray(frame)
+                if scale < 1:
+                    pil = pil.resize((dw, dh), BILINEAR)
+                self._video_frames.append(ImageTk.PhotoImage(pil))
+        except BrokenPipeError:
+            pass
+
+        proc.stdin.close()
+        proc.wait()
+
         self._play_gen += 1
         self._play_preview_loop(self._play_gen)
 
     def _play_preview_loop(self, gen_id=None):
         if gen_id != self._play_gen or not self._video_frames:
             return
-        self._video_idx = self._video_idx % len(self._video_frames)
-        self.preview_label.config(image=self._video_frames[self._video_idx])
-        self._video_idx += 1
+        idx = getattr(self, '_video_idx', 0) % len(self._video_frames)
+        self.preview_label.config(image=self._video_frames[idx])
+        self._video_idx = idx + 1
         self.after(33, self._play_preview_loop, self._play_gen)
 
 
