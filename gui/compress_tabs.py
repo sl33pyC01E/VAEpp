@@ -1471,6 +1471,8 @@ class FSQVideoInferenceTab(tk.Frame):
         f.pack(side="left", padx=(0, 10))
         make_btn(row2, "Test Synthetic", self.test_synthetic, ACCENT).pack(
             side="left", padx=(0, 5))
+        make_btn(row2, "Test MP4 File", self.test_mp4, BLUE).pack(
+            side="left")
 
         self.status = tk.Label(top, text="No model loaded", bg=BG_PANEL,
                                 fg=FG_DIM, font=FONT_SMALL)
@@ -1590,6 +1592,74 @@ class FSQVideoInferenceTab(tk.Frame):
 
                 self.after(0, lambda: self.status.config(
                     text=f"VAE | FSQ, T={T_show}"))
+                self.after(0, self._show_video, rc_vae, rc_fsq, T_show)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.after(0, lambda: self.status.config(text=f"Error: {e}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def test_mp4(self):
+        if self.vae is None or self.fsq is None:
+            self.status.config(text="Load a model first")
+            return
+
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            filetypes=[("Video", "*.mp4 *.mkv *.avi"), ("All", "*.*")])
+        if not path:
+            return
+
+        T = self.T_var.get()
+        self.status.config(text=f"Loading {os.path.basename(path)}...")
+
+        def _bg():
+            try:
+                import torch
+                cmd = ["ffmpeg", "-v", "quiet", "-i", path,
+                       "-frames:v", str(T),
+                       "-vf", "scale=640:360",
+                       "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+                raw = subprocess.run(cmd, capture_output=True).stdout
+                fs = 360 * 640 * 3
+                n = min(len(raw) // fs, T)
+                if n < 2:
+                    self.after(0, lambda: self.status.config(text="Not enough frames"))
+                    return
+
+                frames = np.frombuffer(raw[:n*fs], dtype=np.uint8).reshape(n, 360, 640, 3)
+                clip = torch.from_numpy(frames.astype(np.float32) / 255.0
+                                        ).permute(0, 3, 1, 2).unsqueeze(0).cuda()
+
+                ch = self.vae.image_channels
+                if ch > 3:
+                    clip = torch.cat([clip, torch.zeros(1, n, ch - 3, 360, 640,
+                                                         device="cuda")], dim=2)
+
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    # VAE path (no FSQ)
+                    recon_vae, _ = self.vae(clip)
+
+                    # FSQ path
+                    lat = self.vae.encode_video(clip)
+                    Bl, Tp, Cl, Hl, Wl = lat.shape
+                    lat_flat = lat.reshape(Bl * Tp, Cl, Hl, Wl)
+                    z_proj = self.pre_quant(lat_flat)
+                    z_q, indices = self.fsq(z_proj)
+                    lat_q = self.post_quant(z_q)
+                    lat_q = lat_q.reshape(Bl, Tp, Cl, Hl, Wl)
+                    recon_fsq = self.vae.decode_video(lat_q)
+
+                T_vae = recon_vae.shape[1]
+                T_fsq = recon_fsq.shape[1]
+                T_show = min(T_vae, T_fsq)
+
+                rc_vae = recon_vae[0, T_vae - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+                rc_fsq = recon_fsq[0, T_fsq - T_show:, :3].clamp(0, 1).float().cpu().numpy()
+
+                self.after(0, lambda: self.status.config(
+                    text=f"VAE | FSQ, T={T_show}, src={os.path.basename(path)}"))
                 self.after(0, self._show_video, rc_vae, rc_fsq, T_show)
             except Exception as e:
                 import traceback
