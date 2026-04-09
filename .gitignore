@@ -26,6 +26,9 @@ bank/
 .idea/
 *.swp
 
+# References (cloned repos)
+references/
+
 # OS
 .DS_Store
 Thumbs.db

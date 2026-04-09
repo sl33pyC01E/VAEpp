@@ -34,10 +34,10 @@ from core.generator import VAEpp0rGenerator
 
 
 class FlattenDeflatten(nn.Module):
-    """1D kernel-1 conv flatten/deflatten bottleneck.
+    """1D conv flatten/deflatten bottleneck.
 
     Takes a spatial latent (B, C, H, W), serializes to a 1D sequence
-    along a walk order, projects channels via 1x1 conv (bottleneck),
+    along a walk order, projects channels via Conv1d (bottleneck),
     then projects back and reshapes to spatial.
 
     Args:
@@ -45,10 +45,13 @@ class FlattenDeflatten(nn.Module):
         bottleneck_channels: compressed channel count (e.g. 6 for 6:1)
         spatial_h, spatial_w: latent spatial dims (e.g. 45, 80)
         walk_order: "raster" or "hilbert" (how to serialize 2D to 1D)
+        kernel_size: Conv1d kernel size (1 = per-position only,
+                     3+ = cross-position mixing along walk order)
     """
 
     def __init__(self, latent_channels=32, bottleneck_channels=6,
-                 spatial_h=45, spatial_w=80, walk_order="raster"):
+                 spatial_h=45, spatial_w=80, walk_order="raster",
+                 kernel_size=1):
         super().__init__()
         self.C = latent_channels
         self.B_ch = bottleneck_channels
@@ -56,12 +59,17 @@ class FlattenDeflatten(nn.Module):
         self.W = spatial_w
         self.n_positions = spatial_h * spatial_w
         self.walk_order = walk_order
+        self.kernel_size = kernel_size
 
-        # Flatten: per-position channel projection (1x1 conv = Linear per position)
-        self.flatten_conv = nn.Conv1d(latent_channels, bottleneck_channels, 1)
+        pad = kernel_size // 2
+
+        # Flatten: channel projection with optional cross-position mixing
+        self.flatten_conv = nn.Conv1d(latent_channels, bottleneck_channels,
+                                      kernel_size, padding=pad)
 
         # Deflatten: project back + learned spatial embedding
-        self.deflatten_conv = nn.Conv1d(bottleneck_channels, latent_channels, 1)
+        self.deflatten_conv = nn.Conv1d(bottleneck_channels, latent_channels,
+                                        kernel_size, padding=pad)
         self.spatial_embed = nn.Parameter(
             torch.randn(1, latent_channels, self.n_positions) * 0.02)
 
@@ -354,6 +362,7 @@ def train(args):
         bottleneck_channels=args.bottleneck_ch,
         spatial_h=lat_H, spatial_w=lat_W,
         walk_order=args.walk_order,
+        kernel_size=args.kernel_size,
     ).to(device)
     print(f"  Bottleneck: {bottleneck.param_count():,} params, "
           f"walk={args.walk_order}")
@@ -421,6 +430,7 @@ def train(args):
                 "spatial_h": lat_H,
                 "spatial_w": lat_W,
                 "walk_order": args.walk_order,
+                "kernel_size": args.kernel_size,
                 "vae_ckpt": args.vae_ckpt,
             },
         }
@@ -533,6 +543,8 @@ def main():
                    help="Channels after flatten (6 = ~5:1 compression)")
     p.add_argument("--walk-order", default="raster",
                    choices=["raster", "hilbert", "morton"])
+    p.add_argument("--kernel-size", type=int, default=1,
+                   help="Conv1d kernel size (1=per-position, 3+=cross-position mixing)")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", default="1e-3")
     p.add_argument("--total-steps", type=int, default=10000)
