@@ -1,5 +1,5 @@
 # VAEpp0r
-Variable Auto Encoder procedural priors, zero real
+Variable Auto Encoder: procedural priors, zero real
 
 *No dataset? No problem.*
 
