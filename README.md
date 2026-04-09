@@ -1,5 +1,7 @@
 # VAEpp0r
 Variable Auto Encoder: procedural priors, zero real
+<img width="1490" height="423" alt="training_data1" src="https://github.com/user-attachments/assets/4e4531aa-9ade-4f04-817f-de3c76127fae" />
+<img width="1488" height="422" alt="training_data2" src="https://github.com/user-attachments/assets/a9ed4dfa-8c34-4e5e-a9e0-91acb4ce3768" />
 
 *No dataset? No problem.*
 
