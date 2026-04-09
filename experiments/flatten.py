@@ -76,6 +76,9 @@ class FlattenDeflatten(nn.Module):
         elif self.walk_order == "hilbert":
             return torch.tensor(self._hilbert_curve(self.H, self.W),
                                 dtype=torch.long)
+        elif self.walk_order == "morton":
+            return torch.tensor(self._morton_curve(self.H, self.W),
+                                dtype=torch.long)
         return torch.arange(self.n_positions)
 
     def _build_unwalk_index(self):
@@ -116,6 +119,20 @@ class FlattenDeflatten(nn.Module):
             if y < h and x < w:
                 coords.append(y * w + x)
         return coords
+
+    def _morton_curve(self, h, w):
+        """Z-order (Morton code) curve for arbitrary grids.
+        Returns list of flat indices in Morton order."""
+        coords = []
+        for i in range(h):
+            for j in range(w):
+                z = 0
+                for bit in range(16):
+                    z |= ((i >> bit) & 1) << (2 * bit + 1)
+                    z |= ((j >> bit) & 1) << (2 * bit)
+                coords.append((z, i * w + j))
+        coords.sort()
+        return [c[1] for c in coords]
 
     def flatten(self, latent):
         """Flatten spatial latent to 1D sequence with channel compression.
@@ -460,7 +477,7 @@ def main():
     p.add_argument("--bottleneck-ch", type=int, default=6,
                    help="Channels after flatten (6 = ~5:1 compression)")
     p.add_argument("--walk-order", default="raster",
-                   choices=["raster", "hilbert"])
+                   choices=["raster", "hilbert", "morton"])
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", default="1e-3")
     p.add_argument("--total-steps", type=int, default=10000)

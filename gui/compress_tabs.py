@@ -52,7 +52,7 @@ class FlattenTab(tk.Frame):
         tk.Label(wf, text="Walk order", bg=BG_PANEL, fg=FG_DIM,
                  font=FONT_SMALL).pack(anchor="w")
         self.walk_var = tk.StringVar(value="raster")
-        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert")
+        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert", "morton")
         walk_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
                          activebackground=BG_PANEL, activeforeground=FG,
                          highlightthickness=0, borderwidth=0)
@@ -438,7 +438,7 @@ class FlattenVideoTab(tk.Frame):
         tk.Label(wf, text="Walk order", bg=BG_PANEL, fg=FG_DIM,
                  font=FONT_SMALL).pack(anchor="w")
         self.walk_var = tk.StringVar(value="raster")
-        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert")
+        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert", "morton")
         walk_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
                          activebackground=BG_PANEL, activeforeground=FG,
                          highlightthickness=0, borderwidth=0)
@@ -1743,7 +1743,7 @@ class FlattenFSQTab(tk.Frame):
         tk.Label(wf, text="Walk order", bg=BG_PANEL, fg=FG_DIM,
                  font=FONT_SMALL).pack(anchor="w")
         self.walk_var = tk.StringVar(value="raster")
-        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert")
+        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert", "morton")
         walk_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
                          activebackground=BG_PANEL, activeforeground=FG,
                          highlightthickness=0, borderwidth=0)
@@ -1867,7 +1867,7 @@ class FlattenVideoFSQTab(tk.Frame):
         tk.Label(wf, text="Walk order", bg=BG_PANEL, fg=FG_DIM,
                  font=FONT_SMALL).pack(anchor="w")
         self.walk_var = tk.StringVar(value="raster")
-        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert")
+        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert", "morton")
         walk_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
                          activebackground=BG_PANEL, activeforeground=FG,
                          highlightthickness=0, borderwidth=0)

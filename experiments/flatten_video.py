@@ -403,7 +403,7 @@ def main():
     p.add_argument("--bottleneck-ch", type=int, default=6,
                    help="Channels after flatten (6 = ~5:1 compression)")
     p.add_argument("--walk-order", default="raster",
-                   choices=["raster", "hilbert"])
+                   choices=["raster", "hilbert", "morton"])
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", default="1e-3")
     p.add_argument("--total-steps", type=int, default=10000)
