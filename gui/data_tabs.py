@@ -235,8 +235,8 @@ class GeneratorTab(tk.Frame):
         sw, tw, ew = self._get_slider_weights()
         if self.gen is None:
             sys.path.insert(0, PROJECT_ROOT)
-            from core.generator import VAEppGenerator
-            self.gen = VAEppGenerator(
+            from core.generator import VAEpp0rGenerator
+            self.gen = VAEpp0rGenerator(
                 360, 640, device="cuda",
                 bank_size=self.bank_size_var.get(),
                 n_base_layers=self.layer_count_var.get(),
@@ -620,8 +620,8 @@ class VideoGenTab(tk.Frame):
     def _get_gen(self):
         if self.gen is None:
             sys.path.insert(0, PROJECT_ROOT)
-            from core.generator import VAEppGenerator
-            self.gen = VAEppGenerator(
+            from core.generator import VAEpp0rGenerator
+            self.gen = VAEpp0rGenerator(
                 360, 640, device="cuda",
                 bank_size=self.bank_var.get(),
                 n_base_layers=self.layers_var.get(),

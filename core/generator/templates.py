@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scene template methods for VAEpp generator.
+"""Scene template methods for VAEpp0r generator.
 
 19 scene templates for structured image composition.
 """
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 class TemplateMixin:
-    """Mixin providing scene template methods for VAEppGenerator."""
+    """Mixin providing scene template methods for VAEpp0rGenerator."""
 
     def _pick_template(self):
         """Pick a random scene template based on weights."""

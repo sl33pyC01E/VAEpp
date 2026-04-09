@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Motion recipe pool system for VAEpp generator.
+"""Motion recipe pool system for VAEpp0r generator.
 
 Lightweight motion parameter storage and rendering for fast temporal sampling.
 """
@@ -10,7 +10,7 @@ import torch
 
 
 class RecipesMixin:
-    """Mixin providing motion recipe/pool methods for VAEppGenerator."""
+    """Mixin providing motion recipe/pool methods for VAEpp0rGenerator."""
 
     def _generate_recipe(self, T=8, **seq_kwargs):
         """Generate a single motion recipe — lightweight parameter dict.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VAEpp Stage 2 — temporal training on animated synthetic data.
+"""VAEpp0r Stage 2 — temporal training on animated synthetic data.
 
 Enables VAE temporal compression (TPool/TGrow/MemBlock).
 Generates T-frame clips with smooth motion, trains with temporal consistency loss.
@@ -25,7 +25,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.model import MiniVAE
-from core.generator import VAEppGenerator
+from core.generator import VAEpp0rGenerator
 
 
 # -- Preview -------------------------------------------------------------------
@@ -159,7 +159,7 @@ def train(args):
           f"frames_to_trim={model.frames_to_trim}")
 
     # -- Generator --
-    gen = VAEppGenerator(
+    gen = VAEpp0rGenerator(
         height=args.H, width=args.W, device=str(device),
         bank_size=args.bank_size,
         n_base_layers=args.n_layers,
@@ -418,7 +418,7 @@ def train(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="VAEpp Stage 2 — temporal")
+    p = argparse.ArgumentParser(description="VAEpp0r Stage 2 — temporal")
     p.add_argument("--H", type=int, default=360)
     p.add_argument("--W", type=int, default=640)
     p.add_argument("--T", type=int, default=24)

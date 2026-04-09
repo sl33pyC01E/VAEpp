@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bank persistence and dynamic loading for VAEpp generator.
+"""Bank persistence and dynamic loading for VAEpp0r generator.
 
 Save/load shape banks and base layers, dynamic bank streaming from disk.
 """
@@ -9,7 +9,7 @@ import torch
 
 
 class IOMixin:
-    """Mixin providing I/O and bank management methods for VAEppGenerator."""
+    """Mixin providing I/O and bank management methods for VAEpp0rGenerator."""
 
     def refresh_base_layers(self):
         """Regenerate base layers (keeps shape bank)."""

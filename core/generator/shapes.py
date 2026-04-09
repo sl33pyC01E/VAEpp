@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shape SDF definitions for VAEpp generator.
+"""Shape SDF definitions for VAEpp0r generator.
 
 Signed distance functions for 10 shape types + fractal layout renderer.
 """
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 class ShapesMixin:
-    """Mixin providing shape SDF methods for VAEppGenerator."""
+    """Mixin providing shape SDF methods for VAEpp0rGenerator."""
 
     def _sdf_circle(self, r_frac):
         return torch.sqrt(self.sx_grid ** 2 + self.sy_grid ** 2) - r_frac

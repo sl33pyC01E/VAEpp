@@ -30,7 +30,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.model import MiniVAE
-from core.generator import VAEppGenerator
+from core.generator import VAEpp0rGenerator
 
 
 class FlattenDeflatten(nn.Module):
@@ -281,7 +281,7 @@ def train(args):
           f"walk={args.walk_order}")
 
     # -- Generator --
-    gen = VAEppGenerator(
+    gen = VAEpp0rGenerator(
         height=args.H, width=args.W, device=str(device),
         bank_size=500, n_base_layers=64,
     )

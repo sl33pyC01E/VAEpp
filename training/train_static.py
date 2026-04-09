@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VAEpp training — pretrain VAE on procedural images.
+"""VAEpp0r training — pretrain VAE on procedural images.
 
 Stage 1: 2D static, 3ch RGB, single frame (T=1).
 No DataLoader — generator produces data directly on GPU.
@@ -25,7 +25,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.model import MiniVAE
-from core.generator import VAEppGenerator
+from core.generator import VAEpp0rGenerator
 
 
 # -- Preview -------------------------------------------------------------------
@@ -121,7 +121,7 @@ def train(args):
           f"{', grad-checkpoint' if args.grad_checkpoint else ''}")
 
     # -- Generator --
-    gen = VAEppGenerator(
+    gen = VAEpp0rGenerator(
         height=args.H, width=args.W, device=str(device),
         bank_size=args.bank_size,
         n_base_layers=args.n_layers,
@@ -346,7 +346,7 @@ def train(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="VAEpp training")
+    p = argparse.ArgumentParser(description="VAEpp0r training")
     p.add_argument("--H", type=int, default=360)
     p.add_argument("--W", type=int, default=640)
     p.add_argument("--image-ch", type=int, default=3,

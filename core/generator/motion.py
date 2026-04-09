@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Temporal motion and sequence generation for VAEpp generator.
+"""Temporal motion and sequence generation for VAEpp0r generator.
 
 Physics simulation, viewport transforms, fluid advection, and
 multi-frame sequence rendering (3ch and 9ch).
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 
 class MotionMixin:
-    """Mixin providing temporal/motion methods for VAEppGenerator."""
+    """Mixin providing temporal/motion methods for VAEpp0rGenerator."""
 
     # Semantic role colors (approximate C-RADIO PCA mapping)
     _SEM_BG = torch.tensor([0.3, 0.2, 0.8])      # background: blue-pink

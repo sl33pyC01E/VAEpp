@@ -23,7 +23,7 @@ class TrainingTab(tk.Frame):
         top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
         top.pack(fill="x", padx=5, pady=5)
 
-        tk.Label(top, text="VAEpp Training", bg=BG_PANEL, fg=FG,
+        tk.Label(top, text="VAEpp0r Training", bg=BG_PANEL, fg=FG,
                  font=FONT_TITLE).pack(anchor="w")
 
         # Model architecture presets
@@ -904,9 +904,9 @@ class VideoInferenceTab(tk.Frame):
             try:
                 import torch
                 sys.path.insert(0, PROJECT_ROOT)
-                from core.generator import VAEppGenerator
+                from core.generator import VAEpp0rGenerator
 
-                gen = VAEppGenerator(360, 640, device="cuda", bank_size=200,
+                gen = VAEpp0rGenerator(360, 640, device="cuda", bank_size=200,
                                           n_base_layers=64)
                 gen.build_banks()
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""PatternBank — procedural full-canvas pattern generators for VAEpp.
+"""PatternBank — procedural full-canvas pattern generators for VAEpp0r.
 
 38+ mathematical/structural pattern generators that produce clean, coherent
 spatial patterns (gradients, tilings, waves, surfaces, etc.) with NO shape
 compositing.  Each method returns (B, 3, H, W) on device in [0, 1].
 
-Used by VAEppGenerator's disco mode for the "pure pattern" and
+Used by VAEpp0rGenerator's disco mode for the "pure pattern" and
 "pattern + light noise" quadrants.
 """
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VAEpp procedural image generator.
+"""VAEpp0r procedural image generator.
 
 Three-tier architecture for fast generation:
   Tier 1: Shape Bank — 1000+ pre-rendered RGBA shape textures
@@ -25,7 +25,7 @@ from core.generator.recipes import RecipesMixin
 from core.generator.io import IOMixin
 
 
-class VAEppGenerator(
+class VAEpp0rGenerator(
     ShapesMixin,
     TemplateMixin,
     MotionMixin,
@@ -35,7 +35,7 @@ class VAEppGenerator(
     """GPU-accelerated procedural image generator.
 
     Usage:
-        gen = VAEppGenerator(360, 640, device="cuda")
+        gen = VAEpp0rGenerator(360, 640, device="cuda")
         gen.build_banks()  # one-time setup
         batch = gen.generate(4)  # (4, 3, 360, 640) on GPU, [0,1]
     """
@@ -841,7 +841,7 @@ def main():
     from PIL import Image
     import numpy as np
 
-    gen = VAEppGenerator(360, 640, device="cuda",
+    gen = VAEpp0rGenerator(360, 640, device="cuda",
                               bank_size=500, n_base_layers=128)
     gen.build_banks()
 

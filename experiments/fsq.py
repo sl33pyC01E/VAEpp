@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.model import MiniVAE
 from core.fsq import FSQ
-from core.generator import VAEppGenerator
+from core.generator import VAEpp0rGenerator
 
 
 # -- Preview -------------------------------------------------------------------
@@ -289,7 +289,7 @@ def train(args):
     print(f"  Projections: {lat_ch} -> {fsq_dims} -> {lat_ch}", flush=True)
 
     # -- Generator --
-    gen = VAEppGenerator(
+    gen = VAEpp0rGenerator(
         height=args.H, width=args.W, device=str(device),
         bank_size=args.bank_size, n_base_layers=args.n_layers,
     )
