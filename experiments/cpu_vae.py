@@ -909,6 +909,7 @@ def _make_pipeline_checkpoint(models_list, active_stage, image_size,
         })
 
     ckpt = {
+        "format_version": 2,
         "pipeline": pipeline_stages,
         "active_stage": active_stage,
         "image_size": image_size,
@@ -918,6 +919,54 @@ def _make_pipeline_checkpoint(models_list, active_stage, image_size,
         "scaler": scaler.state_dict() if scaler is not None else None,
     }
     return ckpt
+
+
+def _pipeline_name(models_list, global_step):
+    """Generate a descriptive checkpoint filename from pipeline config.
+
+    Format: {stage_descriptions}-{steps}k.pt
+    Examples:
+        ur-ps8-lc3-id4-hd32-o2-pk5-10k.pt
+        ur-ps8-lc3-id4-hd32-o2-pk5_ur-ps3-lc3-id4-hd32-o1-20k.pt
+        ur-ps8-lc3-id4-hd32-o2-pk5_ref-b4-k5-h16_10k.pt
+        ur-ps8-lc3-id4-hd32-o2-pk5_flat-b1-k10-hil_5k.pt
+    """
+    parts = []
+    for mt, m, cfg in models_list:
+        if mt in ("unrolled", "patch"):
+            tag = "ur" if mt == "unrolled" else "pv"
+            ps = cfg.get("patch_size", 8)
+            lc = cfg.get("latent_channels", 3)
+            id_ = cfg.get("inner_dim", 4)
+            hd = cfg.get("hidden_dim", 0)
+            o = cfg.get("overlap", 0)
+            pk = cfg.get("post_kernel", 0)
+            s = f"{tag}-ps{ps}-lc{lc}-id{id_}"
+            if hd > 0:
+                s += f"-hd{hd}"
+            if o > 0:
+                s += f"-o{o}"
+            if pk > 0:
+                s += f"-pk{pk}"
+            parts.append(s)
+        elif mt == "refiner":
+            nb = cfg.get("n_blocks", 4)
+            ks = cfg.get("kernel_size", 5)
+            hc = cfg.get("hidden_channels", 0)
+            s = f"ref-b{nb}-k{ks}"
+            if hc > 0:
+                s += f"-h{hc}"
+            parts.append(s)
+        elif mt == "flatten":
+            bc = cfg.get("bottleneck_channels", 6)
+            ks = cfg.get("kernel_size", 1)
+            wo = cfg.get("walk_order", "raster")
+            wo_short = {"raster": "ras", "hilbert": "hil", "morton": "mor"}.get(wo, wo[:3])
+            s = f"flat-b{bc}-k{ks}-{wo_short}"
+            parts.append(s)
+
+    steps_k = f"{global_step // 1000}k" if global_step >= 1000 else str(global_step)
+    return "_".join(parts) + f"-{steps_k}.pt"
 
 
 # =============================================================================
@@ -1417,12 +1466,15 @@ def train_s1(args):
 
         if global_step % args.save_every == 0:
             d = _make_ckpt()
-            p = logdir / f"step_{global_step:06d}.pt"
-            torch.save(d, p)
+            named = _pipeline_name(models_list, global_step)
+            torch.save(d, logdir / named)
             torch.save(d, logdir / "latest.pt")
-            print(f"  saved {p}", flush=True)
+            print(f"  saved {named}", flush=True)
 
-            ckpts = sorted(logdir.glob("step_*.pt"),
+            # Keep last 10 named checkpoints
+            ckpts = sorted([f for f in logdir.glob("*.pt")
+                           if f.name not in ("latest.pt",)
+                           and not f.name.startswith(".")],
                            key=lambda x: x.stat().st_mtime)
             while len(ckpts) > 10:
                 ckpts.pop(0).unlink()
@@ -1430,9 +1482,10 @@ def train_s1(args):
     # Save on exit
     if global_step > start_step:
         d = _make_ckpt()
-        torch.save(d, logdir / f"step_{global_step:06d}.pt")
+        named = _pipeline_name(models_list, global_step)
+        torch.save(d, logdir / named)
         torch.save(d, logdir / "latest.pt")
-        print(f"  saved step {global_step}", flush=True)
+        print(f"  saved {named}", flush=True)
 
     print(f"\nDone. {global_step - start_step} steps in "
           f"{(time.time() - t0) / 60:.1f}min", flush=True)
@@ -1722,20 +1775,24 @@ def train_refiner(args):
 
         if step % args.save_every == 0:
             d = _make_ckpt()
-            torch.save(d, logdir / f"step_{step:06d}.pt")
+            named = _pipeline_name(models_list, step)
+            torch.save(d, logdir / named)
             torch.save(d, logdir / "latest.pt")
-            print(f"  saved step {step}", flush=True)
+            print(f"  saved {named}", flush=True)
 
-            ckpts = sorted(logdir.glob("step_*.pt"),
+            ckpts = sorted([f for f in logdir.glob("*.pt")
+                           if f.name not in ("latest.pt",)
+                           and not f.name.startswith(".")],
                            key=lambda x: x.stat().st_mtime)
             while len(ckpts) > 10:
                 ckpts.pop(0).unlink()
 
     if step > 0:
         d = _make_ckpt()
-        torch.save(d, logdir / f"step_{step:06d}.pt")
+        named = _pipeline_name(models_list, step)
+        torch.save(d, logdir / named)
         torch.save(d, logdir / "latest.pt")
-        print(f"  saved step {step}", flush=True)
+        print(f"  saved {named}", flush=True)
 
     print(f"\nDone. {step} steps in {(time.time() - t0) / 60:.1f}min")
 
@@ -1992,20 +2049,24 @@ def train_s2(args):
 
         if step % args.save_every == 0:
             d = _make_ckpt()
-            torch.save(d, logdir / f"step_{step:06d}.pt")
+            named = _pipeline_name(models_list, step)
+            torch.save(d, logdir / named)
             torch.save(d, logdir / "latest.pt")
-            print(f"  saved step {step}", flush=True)
+            print(f"  saved {named}", flush=True)
 
-            ckpts = sorted(logdir.glob("step_*.pt"),
+            ckpts = sorted([f for f in logdir.glob("*.pt")
+                           if f.name not in ("latest.pt",)
+                           and not f.name.startswith(".")],
                            key=lambda x: x.stat().st_mtime)
             while len(ckpts) > 10:
                 ckpts.pop(0).unlink()
 
     if step > 0:
         d = _make_ckpt()
-        torch.save(d, logdir / f"step_{step:06d}.pt")
+        named = _pipeline_name(models_list, step)
+        torch.save(d, logdir / named)
         torch.save(d, logdir / "latest.pt")
-        print(f"  saved step {step}", flush=True)
+        print(f"  saved {named}", flush=True)
 
     print(f"\nDone. {step} steps in {(time.time() - t0) / 60:.1f}min")
 
