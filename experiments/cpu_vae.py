@@ -492,12 +492,15 @@ class LatentRefiner(nn.Module):
         latent_channels: channel count of the latent grid
         spatial_h, spatial_w: spatial dims of the latent grid
         n_blocks: number of residual Conv1d blocks
+        hidden_channels: internal channel width (0 = same as latent_channels)
         kernel_size: Conv1d kernel size per block
         walk_order: serialization order for 1D mixing
+        dropout: dropout rate between blocks (0 = off)
     """
 
     def __init__(self, latent_channels=3, spatial_h=36, spatial_w=64,
-                 n_blocks=4, kernel_size=5, walk_order="hilbert"):
+                 n_blocks=4, hidden_channels=0, kernel_size=5,
+                 walk_order="hilbert", dropout=0.0):
         super().__init__()
         self.C = latent_channels
         self.H = spatial_h
@@ -505,17 +508,28 @@ class LatentRefiner(nn.Module):
         self.n_positions = spatial_h * spatial_w
         self.n_blocks = n_blocks
         self.walk_order = walk_order
+        hc = hidden_channels if hidden_channels > 0 else latent_channels
+        self.hidden_channels = hc
+
+        # Input projection (if hidden != latent)
+        if hc != latent_channels:
+            self.proj_in = nn.Conv1d(latent_channels, hc, 1)
+            self.proj_out = nn.Conv1d(hc, latent_channels, 1)
+        else:
+            self.proj_in = None
+            self.proj_out = None
 
         # Residual Conv1d blocks
         self.blocks = nn.ModuleList()
         for _ in range(n_blocks):
-            self.blocks.append(nn.Sequential(
-                nn.Conv1d(latent_channels, latent_channels,
-                          kernel_size, padding="same"),
+            layers = [
+                nn.Conv1d(hc, hc, kernel_size, padding="same"),
                 nn.GELU(),
-                nn.Conv1d(latent_channels, latent_channels,
-                          kernel_size, padding="same"),
-            ))
+                nn.Conv1d(hc, hc, kernel_size, padding="same"),
+            ]
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            self.blocks.append(nn.Sequential(*layers))
 
         # Walk order indices
         self.register_buffer("walk_idx", self._build_walk_index())
@@ -591,9 +605,17 @@ class LatentRefiner(nn.Module):
         # Walk reorder
         seq = seq[:, :, self.walk_idx]
 
+        # Project to hidden channels
+        if self.proj_in is not None:
+            seq = self.proj_in(seq)
+
         # Residual blocks
         for block in self.blocks:
             seq = block(seq) + seq
+
+        # Project back to latent channels
+        if self.proj_out is not None:
+            seq = self.proj_out(seq)
 
         # Unwalk and reshape
         seq = seq[:, :, self.unwalk_idx]
@@ -1444,9 +1466,35 @@ def train_stage1_5(args):
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    # -- Load frozen S1 --
-    print(f"Loading S1 from {args.s1_ckpt}...")
-    s1_model, _, s1_cfg = _load_model(args.s1_ckpt, device)
+    # -- Resume: load S1 + S1.5 config from fused checkpoint --
+    start_step = 0
+    rk = None
+    if args.resume:
+        rk = torch.load(args.resume, map_location="cpu", weights_only=False)
+        # Fused checkpoint contains S1 — load from there
+        if "s1_model" in rk:
+            print(f"Loading S1 from fused checkpoint {args.resume}...")
+            s1_cfg = rk["s1_config"]
+            s1_model = _make_model(
+                model_type=s1_cfg.get("model_type", "unrolled"),
+                patch_size=s1_cfg.get("patch_size", 8),
+                overlap=s1_cfg.get("overlap", 0),
+                image_channels=s1_cfg.get("image_channels", 3),
+                latent_channels=s1_cfg.get("latent_channels", 3),
+                inner_dim=s1_cfg.get("inner_dim", 4),
+                post_kernel=s1_cfg.get("post_kernel", 0),
+                hidden_dim=s1_cfg.get("hidden_dim", 0),
+            ).to(device)
+            s1_model.load_state_dict(rk["s1_model"])
+        else:
+            # Old checkpoint without fused S1 — fall back to --s1-ckpt
+            print(f"Loading S1 from {args.s1_ckpt}...")
+            s1_model, _, s1_cfg = _load_model(args.s1_ckpt, device)
+    else:
+        # Fresh train — load S1 from --s1-ckpt
+        print(f"Loading S1 from {args.s1_ckpt}...")
+        s1_model, _, s1_cfg = _load_model(args.s1_ckpt, device)
+
     s1_model.eval()
     s1_model.requires_grad_(False)
     s1_ps = s1_cfg.get("patch_size", 8)
@@ -1458,29 +1506,43 @@ def train_stage1_5(args):
     print(f"  S1 latent: ({s1_lc}, {s1_lat_H}, {s1_lat_W}) = "
           f"{s1_lc * s1_lat_H * s1_lat_W} dims")
 
-    # -- S1.5 model --
-    s1_5_model = _make_model(
-        model_type="unrolled",
-        patch_size=args.patch_size,
-        overlap=args.overlap,
-        image_channels=s1_lc,  # S1.5 input channels = S1 latent channels
-        latent_channels=args.latent_ch,
-        inner_dim=args.inner_dim,
-        post_kernel=args.post_kernel,
-        hidden_dim=args.hidden_dim,
-    ).to(device)
+    # -- S1.5 model (from resume config or CLI args) --
+    if rk and "config" in rk:
+        # Rebuild from checkpoint config
+        s1_5_cfg = rk["config"]
+        s1_5_model = _make_model(
+            model_type="unrolled",
+            patch_size=s1_5_cfg.get("patch_size", args.patch_size),
+            overlap=s1_5_cfg.get("overlap", args.overlap),
+            image_channels=s1_lc,
+            latent_channels=s1_5_cfg.get("latent_channels", args.latent_ch),
+            inner_dim=s1_5_cfg.get("inner_dim", args.inner_dim),
+            post_kernel=s1_5_cfg.get("post_kernel", args.post_kernel),
+            hidden_dim=s1_5_cfg.get("hidden_dim", args.hidden_dim),
+        ).to(device)
+    else:
+        s1_5_model = _make_model(
+            model_type="unrolled",
+            patch_size=args.patch_size,
+            overlap=args.overlap,
+            image_channels=s1_lc,
+            latent_channels=args.latent_ch,
+            inner_dim=args.inner_dim,
+            post_kernel=args.post_kernel,
+            hidden_dim=args.hidden_dim,
+        ).to(device)
 
     s1_5_lat_H, s1_5_lat_W = s1_5_model._patch_grid_size(s1_lat_H, s1_lat_W)
     pc = s1_5_model.param_count()
-    print(f"  S1.5: patch={args.patch_size}, overlap={args.overlap}, "
-          f"latent={args.latent_ch}, inner={args.inner_dim}")
-    print(f"  S1.5 latent: ({args.latent_ch}, {s1_5_lat_H}, {s1_5_lat_W}) = "
-          f"{args.latent_ch * s1_5_lat_H * s1_5_lat_W} dims")
+    print(f"  S1.5: patch={s1_5_model.patch_size}, overlap={s1_5_model.overlap}, "
+          f"latent={s1_5_model.latent_channels}, inner={s1_5_model.inner_dim}")
+    print(f"  S1.5 latent: ({s1_5_model.latent_channels}, {s1_5_lat_H}, {s1_5_lat_W}) = "
+          f"{s1_5_model.latent_channels * s1_5_lat_H * s1_5_lat_W} dims")
     print(f"  S1.5 params: {pc['total']:,}")
     print(f"  Total compression: {args.H}x{args.W}x3 -> "
-          f"{args.latent_ch}x{s1_5_lat_H}x{s1_5_lat_W} = "
-          f"{args.latent_ch * s1_5_lat_H * s1_5_lat_W} dims "
-          f"({(args.H * args.W * 3) / (args.latent_ch * s1_5_lat_H * s1_5_lat_W):.0f}:1)")
+          f"{s1_5_model.latent_channels}x{s1_5_lat_H}x{s1_5_lat_W} = "
+          f"{s1_5_model.latent_channels * s1_5_lat_H * s1_5_lat_W} dims "
+          f"({(args.H * args.W * 3) / (s1_5_model.latent_channels * s1_5_lat_H * s1_5_lat_W):.0f}:1)")
 
     # -- Generator --
     gen = VAEpp0rGenerator(
@@ -1497,29 +1559,26 @@ def train_stage1_5(args):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01)
 
-    # -- Resume --
-    start_step = 0
-    if args.resume:
-        rk = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if "model" in rk:
-            strict = not args.loose_load
-            missing, unexpected = s1_5_model.load_state_dict(rk["model"],
-                                                              strict=strict)
-            if missing:
-                print(f"  New layers (random init): {missing}")
-            start_step = rk.get("global_step", 0)
-            if not args.fresh_opt and rk.get("optimizer"):
-                try:
-                    opt.load_state_dict(rk["optimizer"])
-                except Exception:
-                    print("  Fresh optimizer (mismatch)")
-            if rk.get("scheduler") and not args.fresh_opt:
-                sched.load_state_dict(rk["scheduler"])
-            else:
-                sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01,
-                    last_epoch=start_step)
-            print(f"  Resumed S1.5 from {args.resume} at step {start_step}")
+    # -- Resume weights --
+    if rk and "model" in rk:
+        strict = not getattr(args, 'loose_load', False)
+        missing, unexpected = s1_5_model.load_state_dict(rk["model"],
+                                                          strict=strict)
+        if missing:
+            print(f"  New layers (random init): {missing}")
+        start_step = rk.get("global_step", 0)
+        if not args.fresh_opt and rk.get("optimizer"):
+            try:
+                opt.load_state_dict(rk["optimizer"])
+            except Exception:
+                print("  Fresh optimizer (mismatch)")
+        if rk.get("scheduler") and not args.fresh_opt:
+            sched.load_state_dict(rk["scheduler"])
+        else:
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01,
+                last_epoch=start_step)
+        print(f"  Resumed S1.5 at step {start_step}")
 
     if args.fresh_opt and start_step > 0:
         opt = torch.optim.AdamW(s1_5_model.parameters(), lr=float(args.lr),
@@ -1543,19 +1602,21 @@ def train_stage1_5(args):
     def _make_checkpoint():
         return {
             "model": s1_5_model.state_dict(),
+            "s1_model": s1_model.state_dict(),
+            "s1_config": s1_cfg,
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
             "scaler": scaler.state_dict(),
             "global_step": global_step,
             "config": {
                 "model_type": "unrolled",
-                "patch_size": args.patch_size,
-                "overlap": args.overlap,
-                "latent_channels": args.latent_ch,
-                "inner_dim": args.inner_dim,
-                "post_kernel": args.post_kernel,
+                "patch_size": s1_5_model.patch_size,
+                "overlap": s1_5_model.overlap,
+                "latent_channels": s1_5_model.latent_channels,
+                "inner_dim": s1_5_model.inner_dim,
+                "hidden_dim": s1_5_model.hidden_dim,
+                "post_kernel": s1_5_model.post_kernel,
                 "image_channels": s1_lc,
-                "s1_ckpt": args.s1_ckpt,
                 "s1_lat_H": s1_lat_H,
                 "s1_lat_W": s1_lat_W,
                 "H": args.H,
@@ -1669,20 +1730,66 @@ def train_stage1_5(args):
 # =============================================================================
 
 @torch.no_grad()
+def _load_fused_s1_5(ckpt_path, device):
+    """Load S1 + S1.5 from a fused checkpoint (or separate files).
+
+    If the checkpoint contains 's1_model', both are loaded from one file.
+    Otherwise falls back to loading S1 from the path in the config.
+
+    Returns (s1_model, s1_5_model, s1_5_cfg).
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    s1_5_cfg = ckpt.get("config", {})
+
+    # Load S1.5
+    s1_5_model = _make_model(
+        model_type=s1_5_cfg.get("model_type", "unrolled"),
+        patch_size=s1_5_cfg.get("patch_size", 4),
+        overlap=s1_5_cfg.get("overlap", 0),
+        image_channels=s1_5_cfg.get("image_channels", 3),
+        latent_channels=s1_5_cfg.get("latent_channels", 3),
+        inner_dim=s1_5_cfg.get("inner_dim", 4),
+        post_kernel=s1_5_cfg.get("post_kernel", 0),
+        hidden_dim=s1_5_cfg.get("hidden_dim", 0),
+    ).to(device)
+    s1_5_model.load_state_dict(ckpt["model"])
+
+    # Load S1 (fused or from path)
+    if "s1_model" in ckpt:
+        s1_cfg = ckpt["s1_config"]
+        s1_model = _make_model(
+            model_type=s1_cfg.get("model_type", "unrolled"),
+            patch_size=s1_cfg.get("patch_size", 8),
+            overlap=s1_cfg.get("overlap", 0),
+            image_channels=s1_cfg.get("image_channels", 3),
+            latent_channels=s1_cfg.get("latent_channels", 3),
+            inner_dim=s1_cfg.get("inner_dim", 4),
+            post_kernel=s1_cfg.get("post_kernel", 0),
+            hidden_dim=s1_cfg.get("hidden_dim", 0),
+        ).to(device)
+        s1_model.load_state_dict(ckpt["s1_model"])
+    else:
+        s1_ckpt_path = s1_5_cfg.get("s1_ckpt")
+        if s1_ckpt_path:
+            s1_model, _, _ = _load_model(s1_ckpt_path, device)
+        else:
+            raise ValueError("No S1 model found in checkpoint or config")
+
+    return s1_model, s1_5_model, s1_5_cfg
+
+
 def infer_stage1_5(args):
     """Stage 1.5 inference: S1 + S1.5, show GT | S1 | S1.5."""
     device = torch.device(args.device)
 
-    print(f"Loading S1 from {args.s1_ckpt}...")
-    s1_model, _, s1_cfg = _load_model(args.s1_ckpt, device)
+    print(f"Loading S1 + S1.5 from {args.s1_5_ckpt}...")
+    s1_model, s1_5_model, s1_5_cfg = _load_fused_s1_5(args.s1_5_ckpt, device)
     s1_model.eval()
-
-    print(f"Loading S1.5 from {args.s1_5_ckpt}...")
-    s1_5_model, _, s1_5_cfg = _load_model(args.s1_5_ckpt, device)
     s1_5_model.eval()
 
-    s1_5_lat_H, s1_5_lat_W = s1_5_model._patch_grid_size(
-        s1_5_cfg.get("s1_lat_H", 60), s1_5_cfg.get("s1_lat_W", 107))
+    s1_lat_H = s1_5_cfg.get("s1_lat_H", 60)
+    s1_lat_W = s1_5_cfg.get("s1_lat_W", 107)
+    s1_5_lat_H, s1_5_lat_W = s1_5_model._patch_grid_size(s1_lat_H, s1_lat_W)
     lc = s1_5_cfg.get("latent_channels", 3)
     print(f"  S1.5 latent: ({lc}, {s1_5_lat_H}, {s1_5_lat_W}) = "
           f"{lc * s1_5_lat_H * s1_5_lat_W} dims")
@@ -1709,35 +1816,92 @@ def infer_stage1_5(args):
 # Refiner: latent smoothing via residual Conv1d
 # =============================================================================
 
-def _load_upstream(args, device):
-    """Load the upstream pipeline (S1, optionally S1.5) for refiner training.
+def _load_upstream(args, device, from_ckpt=None):
+    """Load the upstream pipeline (S1, optionally S1.5) for refiner.
 
-    Returns (encode_fn, decode_fn, lat_C, lat_H, lat_W) where
-    encode_fn maps images -> latent and decode_fn maps latent -> pixels.
+    If from_ckpt is provided (a loaded checkpoint dict), loads upstream
+    models from the fused checkpoint. Otherwise loads from args paths.
+
+    Returns (encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state)
+    where upstream_state is a dict to embed in the refiner checkpoint.
     """
-    # Load S1
-    s1_model, _, s1_cfg = _load_model(args.s1_ckpt, device)
+    upstream_state = {}
+
+    if from_ckpt and "s1_model" in from_ckpt:
+        # Load from fused refiner checkpoint
+        s1_cfg = from_ckpt["s1_config"]
+        s1_model = _make_model(
+            model_type=s1_cfg.get("model_type", "unrolled"),
+            patch_size=s1_cfg.get("patch_size", 8),
+            overlap=s1_cfg.get("overlap", 0),
+            image_channels=s1_cfg.get("image_channels", 3),
+            latent_channels=s1_cfg.get("latent_channels", 3),
+            inner_dim=s1_cfg.get("inner_dim", 4),
+            post_kernel=s1_cfg.get("post_kernel", 0),
+            hidden_dim=s1_cfg.get("hidden_dim", 0),
+        ).to(device)
+        s1_model.load_state_dict(from_ckpt["s1_model"])
+        upstream_state["s1_model"] = from_ckpt["s1_model"]
+        upstream_state["s1_config"] = s1_cfg
+
+        s1_5_model = None
+        if "s1_5_model" in from_ckpt:
+            s1_5_cfg = from_ckpt["s1_5_config"]
+            s1_5_model = _make_model(
+                model_type=s1_5_cfg.get("model_type", "unrolled"),
+                patch_size=s1_5_cfg.get("patch_size", 4),
+                overlap=s1_5_cfg.get("overlap", 0),
+                image_channels=s1_5_cfg.get("image_channels", 3),
+                latent_channels=s1_5_cfg.get("latent_channels", 3),
+                inner_dim=s1_5_cfg.get("inner_dim", 4),
+                post_kernel=s1_5_cfg.get("post_kernel", 0),
+                hidden_dim=s1_5_cfg.get("hidden_dim", 0),
+            ).to(device)
+            s1_5_model.load_state_dict(from_ckpt["s1_5_model"])
+            upstream_state["s1_5_model"] = from_ckpt["s1_5_model"]
+            upstream_state["s1_5_config"] = s1_5_cfg
+    else:
+        # Load S1 from file
+        s1_ckpt_path = getattr(args, 's1_ckpt', None)
+        s1_5_ckpt_path = getattr(args, 's1_5_ckpt', None)
+
+        if s1_5_ckpt_path and os.path.exists(s1_5_ckpt_path):
+            # S1.5 fused checkpoint contains S1
+            s1_model, s1_5_model, s1_5_cfg = _load_fused_s1_5(
+                s1_5_ckpt_path, device)
+            # Get S1 config from the fused checkpoint
+            fused = torch.load(s1_5_ckpt_path, map_location="cpu",
+                               weights_only=False)
+            upstream_state["s1_model"] = fused.get("s1_model",
+                                                    s1_model.state_dict())
+            upstream_state["s1_config"] = fused.get("s1_config", {})
+            upstream_state["s1_5_model"] = s1_5_model.state_dict()
+            upstream_state["s1_5_config"] = s1_5_cfg
+        elif s1_ckpt_path:
+            s1_model, _, s1_cfg = _load_model(s1_ckpt_path, device)
+            upstream_state["s1_model"] = s1_model.state_dict()
+            upstream_state["s1_config"] = s1_cfg
+            s1_5_model = None
+        else:
+            raise ValueError("Need --s1-ckpt or --s1-5-ckpt")
+
     s1_model.eval()
     s1_model.requires_grad_(False)
     s1_H, s1_W = s1_model._patch_grid_size(args.H, args.W)
 
-    s1_5_model = None
-    if getattr(args, 's1_5_ckpt', None):
-        s1_5_model, _, s1_5_cfg = _load_model(args.s1_5_ckpt, device)
+    if s1_5_model is not None:
         s1_5_model.eval()
         s1_5_model.requires_grad_(False)
-
-    if s1_5_model is not None:
         lat_H, lat_W = s1_5_model._patch_grid_size(s1_H, s1_W)
         lat_C = s1_5_model.latent_channels
 
         def encode_fn(x):
-            s1_lat = s1_model.encode(x)
-            return s1_5_model.encode(s1_lat)
+            return s1_5_model.encode(s1_model.encode(x))
 
         def decode_fn(lat):
-            s1_lat = s1_5_model.decode(lat, original_size=(s1_H, s1_W))
-            return s1_model.decode(s1_lat, original_size=(args.H, args.W))
+            return s1_model.decode(
+                s1_5_model.decode(lat, original_size=(s1_H, s1_W)),
+                original_size=(args.H, args.W))
     else:
         lat_H, lat_W = s1_H, s1_W
         lat_C = s1_model.latent_channels
@@ -1750,7 +1914,7 @@ def _load_upstream(args, device):
 
     print(f"  Upstream latent: ({lat_C}, {lat_H}, {lat_W}) = "
           f"{lat_C * lat_H * lat_W} dims")
-    return encode_fn, decode_fn, lat_C, lat_H, lat_W
+    return encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state
 
 
 @torch.no_grad()
@@ -1835,18 +1999,34 @@ def train_refiner(args):
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    # -- Load upstream --
-    encode_fn, decode_fn, lat_C, lat_H, lat_W = _load_upstream(args, device)
+    # -- Load upstream (from resume checkpoint if fused, else from args) --
+    rk_refiner = None
+    if args.resume:
+        rk_refiner = torch.load(args.resume, map_location="cpu",
+                                weights_only=False)
+
+    encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state = \
+        _load_upstream(args, device, from_ckpt=rk_refiner)
 
     # -- Refiner --
+    if rk_refiner and "config" in rk_refiner:
+        rcfg = rk_refiner["config"]
+        args.n_blocks = rcfg.get("n_blocks", args.n_blocks)
+        args.hidden_channels = rcfg.get("hidden_channels", args.hidden_channels)
+        args.kernel_size = rcfg.get("kernel_size", args.kernel_size)
+        args.walk_order = rcfg.get("walk_order", args.walk_order)
+
     refiner = LatentRefiner(
         latent_channels=lat_C,
         spatial_h=lat_H, spatial_w=lat_W,
         n_blocks=args.n_blocks,
+        hidden_channels=args.hidden_channels,
         kernel_size=args.kernel_size,
         walk_order=args.walk_order,
+        dropout=args.dropout,
     ).to(device)
-    print(f"  Refiner: {args.n_blocks} blocks, kernel={args.kernel_size}, "
+    hc_str = f", hidden={args.hidden_channels}" if args.hidden_channels > 0 else ""
+    print(f"  Refiner: {args.n_blocks} blocks, kernel={args.kernel_size}{hc_str}, "
           f"walk={args.walk_order}, {refiner.param_count():,} params")
 
     # -- Generator --
@@ -1901,7 +2081,7 @@ def train_refiner(args):
     print(flush=True)
 
     def _make_checkpoint():
-        return {
+        ckpt = {
             "refiner": refiner.state_dict(),
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
@@ -1911,12 +2091,15 @@ def train_refiner(args):
                 "spatial_h": lat_H,
                 "spatial_w": lat_W,
                 "n_blocks": args.n_blocks,
+                "hidden_channels": args.hidden_channels,
                 "kernel_size": args.kernel_size,
                 "walk_order": args.walk_order,
-                "s1_ckpt": args.s1_ckpt,
-                "s1_5_ckpt": getattr(args, 's1_5_ckpt', None),
+                "dropout": args.dropout,
             },
         }
+        # Fuse upstream models into checkpoint
+        ckpt.update(upstream_state)
+        return ckpt
 
     preview_image = getattr(args, 'preview_image', None)
 
@@ -1947,20 +2130,26 @@ def train_refiner(args):
             with torch.amp.autocast(device.type, dtype=amp_dtype):
                 with torch.no_grad():
                     lat = encode_fn(x)
-                    pixel_gt = decode_fn(lat)
 
-                lat_refined = refiner(lat)
+                # Optional blur to give refiner a denoising signal
+                if args.blur_sigma > 0:
+                    noise = torch.randn_like(lat) * args.blur_sigma
+                    lat_input = lat + noise
+                else:
+                    lat_input = lat
+
+                lat_refined = refiner(lat_input)
                 pixel_refined = decode_fn(lat_refined)
 
                 # Pixel loss: refined decode should match original image
                 pixel_loss = F.mse_loss(pixel_refined, x)
-                # Latent smoothness: refined latent shouldn't deviate too far
+                # Latent reg: keep refined close to clean (not blurred) latent
                 lat_reg = F.mse_loss(lat_refined, lat)
 
                 total = args.w_pixel * pixel_loss + args.w_reg * lat_reg
 
             scaler.scale(total / accum).backward()
-            del lat, lat_refined, pixel_gt, pixel_refined, images, x
+            del lat, lat_refined, pixel_refined, images, x
 
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(refiner.parameters(), 1.0)
@@ -2005,22 +2194,25 @@ def train_refiner(args):
 
 @torch.no_grad()
 def infer_refiner(args):
-    """Refiner inference."""
+    """Refiner inference — loads everything from one fused checkpoint."""
     device = torch.device(args.device)
-
-    encode_fn, decode_fn, lat_C, lat_H, lat_W = _load_upstream(args, device)
 
     print(f"Loading refiner from {args.refiner_ckpt}...")
     rk = torch.load(args.refiner_ckpt, map_location="cpu", weights_only=False)
     rcfg = rk.get("config", {})
+
+    encode_fn, decode_fn, lat_C, lat_H, lat_W, _ = \
+        _load_upstream(args, device, from_ckpt=rk)
 
     refiner = LatentRefiner(
         latent_channels=rcfg.get("latent_channels", lat_C),
         spatial_h=rcfg.get("spatial_h", lat_H),
         spatial_w=rcfg.get("spatial_w", lat_W),
         n_blocks=rcfg.get("n_blocks", 4),
+        hidden_channels=rcfg.get("hidden_channels", 0),
         kernel_size=rcfg.get("kernel_size", 5),
         walk_order=rcfg.get("walk_order", "hilbert"),
+        dropout=rcfg.get("dropout", 0.0),
     ).to(device)
     refiner.load_state_dict(rk["refiner"])
     refiner.eval()
@@ -2240,9 +2432,9 @@ def main():
     s15.add_argument("--preview-image", default=None)
 
     # -- Stage 1.5 inference --
-    i15 = sub.add_parser("infer1_5", help="S1 + S1.5 inference")
-    i15.add_argument("--s1-ckpt", required=True)
-    i15.add_argument("--s1-5-ckpt", required=True)
+    i15 = sub.add_parser("infer1_5", help="S1 + S1.5 inference (fused checkpoint)")
+    i15.add_argument("--s1-5-ckpt", required=True,
+                     help="Fused S1.5 checkpoint (contains S1 weights)")
     i15.add_argument("--H", type=int, default=360)
     i15.add_argument("--W", type=int, default=640)
     i15.add_argument("--precision", default="bf16")
@@ -2257,15 +2449,21 @@ def main():
     sr.add_argument("--H", type=int, default=360)
     sr.add_argument("--W", type=int, default=640)
     sr.add_argument("--n-blocks", type=int, default=4)
+    sr.add_argument("--hidden-channels", type=int, default=0,
+                    help="Internal channel width (0=same as latent channels)")
     sr.add_argument("--kernel-size", type=int, default=5)
     sr.add_argument("--walk-order", default="hilbert",
                     choices=["raster", "hilbert", "morton"])
+    sr.add_argument("--dropout", type=float, default=0.0)
     sr.add_argument("--batch-size", type=int, default=4)
     sr.add_argument("--lr", default="1e-3")
     sr.add_argument("--total-steps", type=int, default=10000)
     sr.add_argument("--w-pixel", type=float, default=1.0)
-    sr.add_argument("--w-reg", type=float, default=0.1,
-                    help="Latent regularization weight (keep refined close to original)")
+    sr.add_argument("--w-reg", type=float, default=0.01,
+                    help="Latent regularization weight (keep refined close to clean)")
+    sr.add_argument("--blur-sigma", type=float, default=0.0,
+                    help="Gaussian noise sigma added to input latent (0=off, "
+                         "0.05-0.2 recommended for denoising signal)")
     sr.add_argument("--precision", default="bf16",
                     choices=["fp16", "bf16", "fp32"])
     sr.add_argument("--grad-accum", type=int, default=1)
@@ -2280,10 +2478,10 @@ def main():
     sr.add_argument("--preview-image", default=None)
 
     # -- Refiner: inference --
-    ir = sub.add_parser("infer_refiner", help="Refiner inference")
-    ir.add_argument("--s1-ckpt", required=True)
-    ir.add_argument("--s1-5-ckpt", default=None)
-    ir.add_argument("--refiner-ckpt", required=True)
+    ir = sub.add_parser("infer_refiner",
+                        help="Refiner inference (fused checkpoint)")
+    ir.add_argument("--refiner-ckpt", required=True,
+                    help="Fused refiner checkpoint (contains all upstream)")
     ir.add_argument("--H", type=int, default=360)
     ir.add_argument("--W", type=int, default=640)
     ir.add_argument("--precision", default="bf16")

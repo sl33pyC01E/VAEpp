@@ -1157,21 +1157,14 @@ class Stage15InferTab(tk.Frame, PreviewWatcher):
 
         tk.Label(top, text="Stage 1.5: Inference", bg=BG_PANEL, fg=FG,
                  font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="S1 + S1.5 cascaded. "
+        tk.Label(top, text="Fused S1+S1.5 checkpoint. "
                  "Shows GT | S1 Recon | S1.5 Recon.",
                  bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
                                                                  pady=(5, 10))
 
         row1 = tk.Frame(top, bg=BG_PANEL)
         row1.pack(fill="x", pady=(5, 0))
-        f, self.s1_ckpt = make_float(row1, "S1 checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row2 = tk.Frame(top, bg=BG_PANEL)
-        row2.pack(fill="x", pady=(5, 0))
-        f, self.s1_5_ckpt = make_float(row2, "S1.5 checkpoint",
+        f, self.s1_5_ckpt = make_float(row1, "S1.5 checkpoint (fused)",
             os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs", "latest.pt"),
             width=50)
         f.pack(side="left", fill="x", expand=True)
@@ -1235,7 +1228,6 @@ class Stage15InferTab(tk.Frame, PreviewWatcher):
             self._run_real_infer()
         else:
             cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer1_5",
-                   "--s1-ckpt", self.s1_ckpt.get(),
                    "--s1-5-ckpt", self.s1_5_ckpt.get(),
                    "--H", str(self.H_var.get()),
                    "--W", str(self.W_var.get()),
@@ -1244,10 +1236,9 @@ class Stage15InferTab(tk.Frame, PreviewWatcher):
 
     def _run_real_infer(self):
         import torch
-        from experiments.cpu_vae import (_load_model, load_real_images,
+        from experiments.cpu_vae import (_load_fused_s1_5, load_real_images,
                                          save_preview_stage1_5)
 
-        s1_path = self.s1_ckpt.get()
         s1_5_path = self.s1_5_ckpt.get()
         H, W = self.H_var.get(), self.W_var.get()
         prec = self.prec_var.get()
@@ -1261,9 +1252,8 @@ class Stage15InferTab(tk.Frame, PreviewWatcher):
                          "fp32": torch.float32}[prec]
             device = torch.device("cuda:0" if torch.cuda.is_available()
                                   else "cpu")
-            s1, _, _ = _load_model(s1_path, device)
+            s1, s1_5, _ = _load_fused_s1_5(s1_5_path, device)
             s1.eval()
-            s1_5, _, _ = _load_model(s1_5_path, device)
             s1_5.eval()
 
             # Build a minimal gen-like object for preview
@@ -1329,7 +1319,11 @@ class RefinerTrainTab(tk.Frame, PreviewWatcher):
         row2.pack(fill="x", pady=(5, 0))
         f, self.n_blocks = make_spin(row2, "Blocks", default=4)
         f.pack(side="left", padx=(0, 10))
+        f, self.hidden_ch = make_spin(row2, "Hidden ch", default=0)
+        f.pack(side="left", padx=(0, 10))
         f, self.kernel_var = make_spin(row2, "Kernel", default=5)
+        f.pack(side="left", padx=(0, 10))
+        f, self.dropout_var = make_float(row2, "Dropout", "0.0")
         f.pack(side="left", padx=(0, 10))
 
         wf = tk.Frame(row2, bg=BG_PANEL)
@@ -1360,7 +1354,9 @@ class RefinerTrainTab(tk.Frame, PreviewWatcher):
         f.pack(side="left", padx=(0, 10))
         f, self.w_pix = make_float(row3, "w_pixel", "1.0")
         f.pack(side="left", padx=(0, 10))
-        f, self.w_reg = make_float(row3, "w_reg", "0.1")
+        f, self.w_reg = make_float(row3, "w_reg", "0.01")
+        f.pack(side="left", padx=(0, 10))
+        f, self.blur_sigma = make_float(row3, "Blur sigma", "0.0")
         f.pack(side="left", padx=(0, 10))
         f, self.prec_var = make_float(row3, "Precision", "bf16")
         f.pack(side="left")
@@ -1433,8 +1429,10 @@ class RefinerTrainTab(tk.Frame, PreviewWatcher):
         cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "refiner",
                "--s1-ckpt", self.s1_ckpt.get(),
                "--n-blocks", str(self.n_blocks.get()),
+               "--hidden-channels", str(self.hidden_ch.get()),
                "--kernel-size", str(self.kernel_var.get()),
                "--walk-order", self.walk_var.get(),
+               "--dropout", self.dropout_var.get(),
                "--H", str(self.H_var.get()),
                "--W", str(self.W_var.get()),
                "--lr", self.lr_var.get(),
@@ -1442,6 +1440,7 @@ class RefinerTrainTab(tk.Frame, PreviewWatcher):
                "--total-steps", str(self.steps_var.get()),
                "--w-pixel", self.w_pix.get(),
                "--w-reg", self.w_reg.get(),
+               "--blur-sigma", self.blur_sigma.get(),
                "--precision", self.prec_var.get(),
                "--save-every", str(self.save_every.get()),
                "--preview-every", str(self.preview_every.get()),
@@ -1490,21 +1489,7 @@ class RefinerInferTab(tk.Frame, PreviewWatcher):
 
         row1 = tk.Frame(top, bg=BG_PANEL)
         row1.pack(fill="x", pady=(5, 0))
-        f, self.s1_ckpt = make_float(row1, "S1 checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row1b = tk.Frame(top, bg=BG_PANEL)
-        row1b.pack(fill="x", pady=(5, 0))
-        f, self.s1_5_ckpt = make_float(row1b, "S1.5 checkpoint (optional)",
-            os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row2 = tk.Frame(top, bg=BG_PANEL)
-        row2.pack(fill="x", pady=(5, 0))
-        f, self.refiner_ckpt = make_float(row2, "Refiner checkpoint",
+        f, self.refiner_ckpt = make_float(row1, "Refiner checkpoint (fused)",
             os.path.join(PROJECT_ROOT, "cpu_vae_refiner_logs", "latest.pt"),
             width=50)
         f.pack(side="left", fill="x", expand=True)
@@ -1565,14 +1550,10 @@ class RefinerInferTab(tk.Frame, PreviewWatcher):
 
     def run_infer(self):
         cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer_refiner",
-               "--s1-ckpt", self.s1_ckpt.get(),
                "--refiner-ckpt", self.refiner_ckpt.get(),
                "--H", str(self.H_var.get()),
                "--W", str(self.W_var.get()),
                "--precision", self.prec_var.get()]
-        s1_5 = self.s1_5_ckpt.get().strip()
-        if s1_5 and os.path.exists(s1_5):
-            cmd.extend(["--s1-5-ckpt", s1_5])
         self.runner.run(cmd, cwd=PROJECT_ROOT)
 
 
