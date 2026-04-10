@@ -1381,6 +1381,12 @@ class RefinerTrainTab(tk.Frame, PreviewWatcher):
                        bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
                        activebackground=BG_PANEL, font=FONT_SMALL
                        ).pack(side="left", padx=(10, 0))
+        self.finetune_dec_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row5, text="Finetune decoder",
+                       variable=self.finetune_dec_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, font=FONT_SMALL
+                       ).pack(side="left", padx=(10, 0))
 
         # Row 6: preview image
         row6 = tk.Frame(top, bg=BG_PANEL)
@@ -1456,6 +1462,8 @@ class RefinerTrainTab(tk.Frame, PreviewWatcher):
             cmd.extend(["--resume", resume])
         if self.fresh_opt_var.get():
             cmd.append("--fresh-opt")
+        if self.finetune_dec_var.get():
+            cmd.append("--finetune-decoder")
         self.runner.run(cmd, cwd=PROJECT_ROOT)
 
     def stop(self):
@@ -1577,10 +1585,8 @@ def main():
     nb = ttk.Notebook(root, style="Dark.TNotebook")
     nb.pack(fill="both", expand=True, padx=5, pady=5)
 
-    nb.add(Stage1TrainTab(nb), text="S1 Train")
-    nb.add(Stage1InferTab(nb), text="S1 Infer")
-    nb.add(UnrolledTrainTab(nb), text="Unrolled Train")
-    nb.add(UnrolledInferTab(nb), text="Unrolled Infer")
+    nb.add(UnrolledTrainTab(nb), text="S1 Train")
+    nb.add(UnrolledInferTab(nb), text="S1 Infer")
     nb.add(Stage15TrainTab(nb), text="S1.5 Train")
     nb.add(Stage15InferTab(nb), text="S1.5 Infer")
     nb.add(RefinerTrainTab(nb), text="Refiner Train")

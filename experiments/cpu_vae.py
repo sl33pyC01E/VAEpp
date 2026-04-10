@@ -1822,8 +1822,9 @@ def _load_upstream(args, device, from_ckpt=None):
     If from_ckpt is provided (a loaded checkpoint dict), loads upstream
     models from the fused checkpoint. Otherwise loads from args paths.
 
-    Returns (encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state)
-    where upstream_state is a dict to embed in the refiner checkpoint.
+    Returns (encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state, models)
+    where upstream_state is a dict to embed in the refiner checkpoint,
+    and models is a dict of {'s1': model, 's1_5': model_or_None}.
     """
     upstream_state = {}
 
@@ -1912,9 +1913,11 @@ def _load_upstream(args, device, from_ckpt=None):
         def decode_fn(lat):
             return s1_model.decode(lat, original_size=(args.H, args.W))
 
+    models = {"s1": s1_model, "s1_5": s1_5_model}
+
     print(f"  Upstream latent: ({lat_C}, {lat_H}, {lat_W}) = "
           f"{lat_C * lat_H * lat_W} dims")
-    return encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state
+    return encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state, models
 
 
 @torch.no_grad()
@@ -2005,7 +2008,7 @@ def train_refiner(args):
         rk_refiner = torch.load(args.resume, map_location="cpu",
                                 weights_only=False)
 
-    encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state = \
+    encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state, models = \
         _load_upstream(args, device, from_ckpt=rk_refiner)
 
     # -- Refiner --
@@ -2029,6 +2032,25 @@ def train_refiner(args):
     print(f"  Refiner: {args.n_blocks} blocks, kernel={args.kernel_size}{hc_str}, "
           f"walk={args.walk_order}, {refiner.param_count():,} params")
 
+    # -- Finetune decoder --
+    finetune_decoder = getattr(args, 'finetune_decoder', False)
+    if finetune_decoder:
+        # Unfreeze the last-stage decoder in the upstream pipeline
+        # S1.5 decoder if present, else S1 decoder
+        decoder_model = models["s1_5"] if models["s1_5"] is not None else models["s1"]
+        decoder_model.requires_grad_(True)
+        decoder_model.train()
+        # Keep encoder frozen
+        encoder_model = models["s1"]
+        encoder_model.requires_grad_(False)
+        encoder_model.eval()
+        if models["s1_5"] is not None and decoder_model is not models["s1"]:
+            # S1.5 is the decoder being finetuned — keep S1 encoder frozen
+            pass
+        dec_params = sum(p.numel() for p in decoder_model.parameters()
+                        if p.requires_grad)
+        print(f"  Finetuning decoder: {dec_params:,} trainable params")
+
     # -- Generator --
     gen = VAEpp0rGenerator(
         height=args.H, width=args.W, device=str(device),
@@ -2037,8 +2059,11 @@ def train_refiner(args):
     gen.build_banks()
     gen.disco_quadrant = True
 
-    # -- Optimizer --
-    opt = torch.optim.AdamW(refiner.parameters(), lr=float(args.lr),
+    # -- Optimizer (refiner + optionally decoder) --
+    train_params = list(refiner.parameters())
+    if finetune_decoder:
+        train_params += [p for p in decoder_model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(train_params, lr=float(args.lr),
                             weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01)
@@ -2097,7 +2122,12 @@ def train_refiner(args):
                 "dropout": args.dropout,
             },
         }
-        # Fuse upstream models into checkpoint
+        # Fuse upstream models into checkpoint (with current weights)
+        if finetune_decoder:
+            # Update upstream state with finetuned decoder weights
+            if models["s1_5"] is not None:
+                upstream_state["s1_5_model"] = models["s1_5"].state_dict()
+            upstream_state["s1_model"] = models["s1"].state_dict()
         ckpt.update(upstream_state)
         return ckpt
 
@@ -2201,7 +2231,7 @@ def infer_refiner(args):
     rk = torch.load(args.refiner_ckpt, map_location="cpu", weights_only=False)
     rcfg = rk.get("config", {})
 
-    encode_fn, decode_fn, lat_C, lat_H, lat_W, _ = \
+    encode_fn, decode_fn, lat_C, lat_H, lat_W, _, _ = \
         _load_upstream(args, device, from_ckpt=rk)
 
     refiner = LatentRefiner(
@@ -2464,6 +2494,8 @@ def main():
     sr.add_argument("--blur-sigma", type=float, default=0.0,
                     help="Gaussian noise sigma added to input latent (0=off, "
                          "0.05-0.2 recommended for denoising signal)")
+    sr.add_argument("--finetune-decoder", action="store_true",
+                    help="Jointly finetune the upstream decoder with the refiner")
     sr.add_argument("--precision", default="bf16",
                     choices=["fp16", "bf16", "fp32"])
     sr.add_argument("--grad-accum", type=int, default=1)
