@@ -706,6 +706,8 @@ class UnrolledTrainTab(tk.Frame, PreviewWatcher):
         f.pack(side="left", padx=(0, 10))
         f, self.inner_dim = make_spin(row1, "Inner dim", default=8)
         f.pack(side="left", padx=(0, 10))
+        f, self.hidden_dim_var = make_spin(row1, "Hidden dim", default=0)
+        f.pack(side="left", padx=(0, 10))
         f, self.overlap_var = make_spin(row1, "Overlap", default=0)
         f.pack(side="left", padx=(0, 10))
         f, self.post_kernel = make_spin(row1, "Post kernel", default=0)
@@ -806,6 +808,7 @@ class UnrolledTrainTab(tk.Frame, PreviewWatcher):
                "--patch-size", str(self.patch_size.get()),
                "--latent-ch", str(self.latent_ch.get()),
                "--inner-dim", str(self.inner_dim.get()),
+               "--hidden-dim", str(self.hidden_dim_var.get()),
                "--overlap", str(self.overlap_var.get()),
                "--post-kernel", str(self.post_kernel.get()),
                "--H", str(self.H_var.get()),
@@ -1001,6 +1004,8 @@ class Stage15TrainTab(tk.Frame, PreviewWatcher):
         f.pack(side="left", padx=(0, 10))
         f, self.inner_dim = make_spin(row2, "Inner dim", default=4)
         f.pack(side="left", padx=(0, 10))
+        f, self.hidden_dim_var = make_spin(row2, "Hidden dim", default=0)
+        f.pack(side="left", padx=(0, 10))
         f, self.overlap_var = make_spin(row2, "Overlap", default=0)
         f.pack(side="left", padx=(0, 10))
         f, self.post_kernel = make_spin(row2, "Post kernel", default=0)
@@ -1101,6 +1106,7 @@ class Stage15TrainTab(tk.Frame, PreviewWatcher):
                "--patch-size", str(self.patch_size.get()),
                "--latent-ch", str(self.latent_ch.get()),
                "--inner-dim", str(self.inner_dim.get()),
+               "--hidden-dim", str(self.hidden_dim_var.get()),
                "--overlap", str(self.overlap_var.get()),
                "--post-kernel", str(self.post_kernel.get()),
                "--H", str(self.H_var.get()),

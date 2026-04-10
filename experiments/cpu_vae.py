@@ -228,7 +228,8 @@ class UnrolledPatchVAE(nn.Module):
     """
 
     def __init__(self, patch_size=8, overlap=0, image_channels=3,
-                 latent_channels=32, inner_dim=64, post_kernel=0):
+                 latent_channels=32, inner_dim=64, post_kernel=0,
+                 hidden_dim=0):
         super().__init__()
         self.patch_size = patch_size
         self.overlap = overlap
@@ -249,16 +250,26 @@ class UnrolledPatchVAE(nn.Module):
         self.channel_embed = nn.Parameter(
             torch.randn(1, inner_dim, image_channels) * 0.02)
 
+        self.hidden_dim = hidden_dim
+
         # Encoder: scalar values -> position-aware features -> latent
         # Step 1: project each scalar pixel value to inner_dim
         self.value_proj = nn.Linear(1, inner_dim, bias=False)
-        # Step 2: mix position-aware features across the 192 positions
-        # Using Linear (equivalent to Conv1d(k=1)) but on the position dim
-        self.enc_mix = nn.Sequential(
-            nn.Linear(self.n_positions, self.n_positions),
-            nn.GELU(),
-            nn.Linear(self.n_positions, latent_channels),
-        )
+        # Step 2: mix position-aware features across the n_positions
+        if hidden_dim > 0:
+            self.enc_mix = nn.Sequential(
+                nn.Linear(self.n_positions, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, latent_channels),
+            )
+        else:
+            self.enc_mix = nn.Sequential(
+                nn.Linear(self.n_positions, self.n_positions),
+                nn.GELU(),
+                nn.Linear(self.n_positions, latent_channels),
+            )
 
         # Optional post-encode cross-patch mixing (Conv1d over flattened grid)
         if post_kernel > 0:
@@ -281,11 +292,20 @@ class UnrolledPatchVAE(nn.Module):
             self.pre_dec_mix = None
 
         # Decoder: latent -> position features -> scalar pixel values
-        self.dec_mix = nn.Sequential(
-            nn.Linear(latent_channels, self.n_positions),
-            nn.GELU(),
-            nn.Linear(self.n_positions, self.n_positions),
-        )
+        if hidden_dim > 0:
+            self.dec_mix = nn.Sequential(
+                nn.Linear(latent_channels, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.n_positions),
+            )
+        else:
+            self.dec_mix = nn.Sequential(
+                nn.Linear(latent_channels, self.n_positions),
+                nn.GELU(),
+                nn.Linear(self.n_positions, self.n_positions),
+            )
         # Decoder position embeddings
         self.dec_spatial_embed = nn.Parameter(
             torch.randn(1, inner_dim, self.n_pixels) * 0.02)
@@ -471,6 +491,7 @@ def _make_model(model_type, patch_size=8, overlap=0, image_channels=3,
             latent_channels=latent_channels,
             inner_dim=inner_dim,
             post_kernel=post_kernel,
+            hidden_dim=hidden_dim,
         )
     else:
         return PatchVAE(
@@ -1322,6 +1343,7 @@ def train_stage1_5(args):
         latent_channels=args.latent_ch,
         inner_dim=args.inner_dim,
         post_kernel=args.post_kernel,
+        hidden_dim=args.hidden_dim,
     ).to(device)
 
     s1_5_lat_H, s1_5_lat_W = s1_5_model._patch_grid_size(s1_lat_H, s1_lat_W)
@@ -1728,6 +1750,8 @@ def main():
     s15.add_argument("--overlap", type=int, default=0)
     s15.add_argument("--latent-ch", type=int, default=3)
     s15.add_argument("--inner-dim", type=int, default=4)
+    s15.add_argument("--hidden-dim", type=int, default=0,
+                     help="Hidden layer width in enc/dec mix (0=direct)")
     s15.add_argument("--post-kernel", type=int, default=0)
     s15.add_argument("--batch-size", type=int, default=4)
     s15.add_argument("--lr", default="2e-4")
