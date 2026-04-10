@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Standalone GUI for CPU VAE experiment.
+"""Standalone GUI for CPU VAE experiment.  4 tabs.
 
-4 tabs:
-  - Stage 1 Train: train PatchVAE end-to-end
-  - Stage 1 Infer: load PatchVAE checkpoint, show GT | Recon
-  - Stage 2 Train: train FlattenDeflatten on frozen PatchVAE
-  - Stage 2 Infer: show GT | PatchVAE | Flatten
+Tabs:
+  - S1 Train:   train UnrolledPatchVAE (fresh / resume / extend)
+  - Refiner:    latent smoothing refiner training
+  - S2 Train:   flatten bottleneck training
+  - Inference:  load any pipeline checkpoint, GT | Recon
 
 Usage:
     python -m experiments.cpu_vae_gui
@@ -86,10 +86,98 @@ class PreviewWatcher:
 
 
 # =============================================================================
-# Stage 1 Train Tab
+# Helper: file browse entry row
 # =============================================================================
 
-class Stage1TrainTab(tk.Frame, PreviewWatcher):
+def _make_file_row(parent, label_text, default="", width=50):
+    """Create a labelled entry + Browse button for file paths.
+    Returns (frame, StringVar)."""
+    row = tk.Frame(parent, bg=BG_PANEL)
+    f = tk.Frame(row, bg=BG_PANEL)
+    tk.Label(f, text=label_text, bg=BG_PANEL, fg=FG_DIM,
+             font=FONT_SMALL).pack(anchor="w")
+    var = tk.StringVar(value=default)
+    ef = tk.Frame(f, bg=BG_PANEL)
+    tk.Entry(ef, textvariable=var, bg=BG_INPUT, fg=FG, font=FONT,
+             width=width, borderwidth=0, insertbackground=FG
+             ).pack(side="left", fill="x", expand=True)
+
+    def _browse():
+        path = filedialog.askopenfilename(
+            title=f"Select {label_text}",
+            filetypes=[("Checkpoint / Image",
+                        "*.pt *.pth *.png *.jpg *.jpeg *.bmp *.webp"),
+                       ("All files", "*.*")])
+        if path:
+            var.set(path)
+
+    make_btn(ef, "Browse", _browse, ACCENT, width=7
+             ).pack(side="left", padx=(5, 0))
+    ef.pack(fill="x")
+    f.pack(side="left", fill="x", expand=True)
+    return row, var
+
+
+def _make_preview_row(parent):
+    """Preview image entry + Browse.  Returns (frame, StringVar)."""
+    row = tk.Frame(parent, bg=BG_PANEL)
+    var = tk.StringVar(value="")
+    f = tk.Frame(row, bg=BG_PANEL)
+    tk.Label(f, text="Preview image", bg=BG_PANEL, fg=FG_DIM,
+             font=FONT_SMALL).pack(anchor="w")
+    ef = tk.Frame(f, bg=BG_PANEL)
+    tk.Entry(ef, textvariable=var, bg=BG_INPUT, fg=FG, font=FONT,
+             width=45, borderwidth=0, insertbackground=FG
+             ).pack(side="left", fill="x", expand=True)
+
+    def _browse():
+        path = filedialog.askopenfilename(
+            title="Select preview image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                       ("All files", "*.*")])
+        if path:
+            var.set(path)
+
+    make_btn(ef, "Browse", _browse, ACCENT, width=7
+             ).pack(side="left", padx=(5, 0))
+    ef.pack(fill="x")
+    f.pack(side="left", fill="x", expand=True)
+    return row, var
+
+
+def _make_walk_dropdown(parent, default="hilbert"):
+    """Walk order dropdown.  Returns (frame, StringVar)."""
+    wf = tk.Frame(parent, bg=BG_PANEL)
+    tk.Label(wf, text="Walk order", bg=BG_PANEL, fg=FG_DIM,
+             font=FONT_SMALL).pack(anchor="w")
+    var = tk.StringVar(value=default)
+    menu = tk.OptionMenu(wf, var, "raster", "hilbert", "morton")
+    menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
+                activebackground=BG_PANEL, activeforeground=FG,
+                highlightthickness=0, borderwidth=0)
+    menu.pack(anchor="w")
+    return wf, var
+
+
+def _make_mode_dropdown(parent, default="fresh"):
+    """Mode dropdown for S1 (fresh / resume / extend).  Returns (frame, StringVar)."""
+    mf = tk.Frame(parent, bg=BG_PANEL)
+    tk.Label(mf, text="Mode", bg=BG_PANEL, fg=FG_DIM,
+             font=FONT_SMALL).pack(anchor="w")
+    var = tk.StringVar(value=default)
+    menu = tk.OptionMenu(mf, var, "fresh", "resume", "extend")
+    menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
+                activebackground=BG_PANEL, activeforeground=FG,
+                highlightthickness=0, borderwidth=0)
+    menu.pack(anchor="w")
+    return mf, var
+
+
+# =============================================================================
+# Tab 1: S1TrainTab
+# =============================================================================
+
+class S1TrainTab(tk.Frame, PreviewWatcher):
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
         self.build()
@@ -98,30 +186,38 @@ class Stage1TrainTab(tk.Frame, PreviewWatcher):
         top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
         top.pack(fill="x", padx=5, pady=5)
 
-        tk.Label(top, text="Stage 1: Train PatchVAE", bg=BG_PANEL, fg=FG,
+        tk.Label(top, text="S1: Train UnrolledPatchVAE", bg=BG_PANEL, fg=FG,
                  font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Unfold+Linear encoder, Linear+Fold decoder. "
-                 "No Conv2d. End-to-end training on synthetic data.",
+        tk.Label(top, text="Train encoder/decoder. Fresh start, resume "
+                 "training, or extend with new stage.",
                  bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
                                                                  pady=(5, 10))
 
-        # Row 1: architecture
+        # Mode + input checkpoint
+        row0 = tk.Frame(top, bg=BG_PANEL)
+        row0.pack(fill="x", pady=(5, 0))
+        f, self.mode_var = _make_mode_dropdown(row0)
+        f.pack(side="left", padx=(0, 10))
+        fr, self.input_ckpt_var = _make_file_row(row0, "Input checkpoint")
+        fr.pack(side="left", fill="x", expand=True)
+
+        # Architecture row
         row1 = tk.Frame(top, bg=BG_PANEL)
         row1.pack(fill="x", pady=(5, 0))
         f, self.patch_size = make_spin(row1, "Patch size", default=8)
         f.pack(side="left", padx=(0, 10))
-        f, self.latent_ch = make_spin(row1, "Latent ch", default=32)
+        f, self.latent_ch = make_spin(row1, "Latent ch", default=3)
         f.pack(side="left", padx=(0, 10))
-        f, self.hidden_dim = make_spin(row1, "Hidden dim", default=0)
+        f, self.inner_dim = make_spin(row1, "Inner dim", default=4)
         f.pack(side="left", padx=(0, 10))
-        f, self.overlap_var = make_spin(row1, "Overlap", default=0)
+        f, self.hidden_dim_var = make_spin(row1, "Hidden dim", default=0)
         f.pack(side="left", padx=(0, 10))
-        f, self.H_var = make_spin(row1, "H", default=360)
+        f, self.overlap_var = make_spin(row1, "Overlap", default=2)
         f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row1, "W", default=640)
+        f, self.post_kernel = make_spin(row1, "Post kernel", default=5)
         f.pack(side="left")
 
-        # Row 2: training params
+        # Training row
         row2 = tk.Frame(top, bg=BG_PANEL)
         row2.pack(fill="x", pady=(5, 0))
         f, self.lr_var = make_float(row2, "LR", "2e-4")
@@ -137,7 +233,7 @@ class Stage1TrainTab(tk.Frame, PreviewWatcher):
         f, self.prec_var = make_float(row2, "Precision", "bf16")
         f.pack(side="left")
 
-        # Row 3: save/log
+        # Save row
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
         f, self.save_every = make_spin(row3, "Save every", default=5000)
@@ -147,32 +243,23 @@ class Stage1TrainTab(tk.Frame, PreviewWatcher):
         f, self.grad_accum = make_spin(row3, "Grad accum", default=1)
         f.pack(side="left")
 
-        # Row 4: resume
+        # Options row
         row4 = tk.Frame(top, bg=BG_PANEL)
         row4.pack(fill="x", pady=(5, 0))
-        f, self.resume_var = make_float(row4, "Resume checkpoint", "", width=50)
-        f.pack(side="left", fill="x", expand=True)
         self.fresh_opt_var = tk.BooleanVar(value=False)
         tk.Checkbutton(row4, text="Fresh opt", variable=self.fresh_opt_var,
                        bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
                        activebackground=BG_PANEL, font=FONT_SMALL
-                       ).pack(side="left", padx=(10, 0))
+                       ).pack(side="left", padx=(0, 10))
+        self.loose_load_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row4, text="Loose load", variable=self.loose_load_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, font=FONT_SMALL
+                       ).pack(side="left")
 
-        # Row 5: preview target image
-        row5 = tk.Frame(top, bg=BG_PANEL)
+        # Preview image
+        row5, self.preview_img_var = _make_preview_row(top)
         row5.pack(fill="x", pady=(5, 0))
-        self.preview_img_var = tk.StringVar(value="")
-        f = tk.Frame(row5, bg=BG_PANEL)
-        tk.Label(f, text="Preview image", bg=BG_PANEL, fg=FG_DIM,
-                 font=FONT_SMALL).pack(anchor="w")
-        ef = tk.Frame(f, bg=BG_PANEL)
-        tk.Entry(ef, textvariable=self.preview_img_var, bg=BG_INPUT, fg=FG,
-                 font=FONT, width=45, borderwidth=0,
-                 insertbackground=FG).pack(side="left", fill="x", expand=True)
-        make_btn(ef, "Browse", self._browse_preview, ACCENT, width=7
-                 ).pack(side="left", padx=(5, 0))
-        ef.pack(fill="x")
-        f.pack(side="left", fill="x", expand=True)
 
         # Buttons
         btn = tk.Frame(top, bg=BG_PANEL)
@@ -181,11 +268,13 @@ class Stage1TrainTab(tk.Frame, PreviewWatcher):
         make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
         make_btn(btn, "Kill", self.kill, RED).pack(side="left")
 
+        # Log at bottom
         self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
                            insertbackground=FG, height=6, wrap=tk.WORD,
                            borderwidth=0, highlightthickness=0)
         self.log.pack(fill="x", side="bottom", padx=5, pady=5)
 
+        # Preview fills remaining
         self.preview_label = tk.Label(self, bg=BG)
         self.preview_label.pack(fill="both", expand=True, pady=5)
         self.runner = ProcRunner(self.log)
@@ -193,22 +282,16 @@ class Stage1TrainTab(tk.Frame, PreviewWatcher):
         self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_logs"),
                           self.preview_label)
 
-    def _browse_preview(self):
-        path = filedialog.askopenfilename(
-            title="Select preview image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if path:
-            self.preview_img_var.set(path)
-
     def start(self):
-        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "stage1",
+        mode = self.mode_var.get()
+        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "s1",
+               "--mode", mode,
                "--patch-size", str(self.patch_size.get()),
                "--latent-ch", str(self.latent_ch.get()),
-               "--hidden-dim", str(self.hidden_dim.get()),
+               "--inner-dim", str(self.inner_dim.get()),
+               "--hidden-dim", str(self.hidden_dim_var.get()),
                "--overlap", str(self.overlap_var.get()),
-               "--H", str(self.H_var.get()),
-               "--W", str(self.W_var.get()),
+               "--post-kernel", str(self.post_kernel.get()),
                "--lr", self.lr_var.get(),
                "--batch-size", str(self.batch_var.get()),
                "--total-steps", str(self.steps_var.get()),
@@ -218,14 +301,16 @@ class Stage1TrainTab(tk.Frame, PreviewWatcher):
                "--save-every", str(self.save_every.get()),
                "--preview-every", str(self.preview_every.get()),
                "--grad-accum", str(self.grad_accum.get())]
+        input_ckpt = self.input_ckpt_var.get().strip()
+        if input_ckpt:
+            cmd.extend(["--input-ckpt", input_ckpt])
         preview_img = self.preview_img_var.get().strip()
         if preview_img:
             cmd.extend(["--preview-image", preview_img])
-        resume = self.resume_var.get().strip()
-        if resume:
-            cmd.extend(["--resume", resume])
         if self.fresh_opt_var.get():
             cmd.append("--fresh-opt")
+        if self.loose_load_var.get():
+            cmd.append("--loose-load")
         self.runner.run(cmd, cwd=PROJECT_ROOT)
 
     def stop(self):
@@ -238,233 +323,95 @@ class Stage1TrainTab(tk.Frame, PreviewWatcher):
 
 
 # =============================================================================
-# Stage 1 Inference Tab
+# Tab 2: RefinerTrainTab
 # =============================================================================
 
-class Stage1InferTab(tk.Frame, PreviewWatcher):
+class RefinerTrainTab(tk.Frame, PreviewWatcher):
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
-        self._image_paths = []
         self.build()
 
     def build(self):
         top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
         top.pack(fill="x", padx=5, pady=5)
 
-        tk.Label(top, text="Stage 1: PatchVAE Inference", bg=BG_PANEL, fg=FG,
+        tk.Label(top, text="Refiner: Latent Smoothing", bg=BG_PANEL, fg=FG,
                  font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Load trained PatchVAE. Run on synthetic data or "
-                 "browse real images for GT | Reconstruction.",
+        tk.Label(top, text="Residual Conv1d blocks on latent grid. "
+                 "Smooths patch boundary artifacts.",
                  bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
                                                                  pady=(5, 10))
 
+        # Input checkpoint
+        row0 = tk.Frame(top, bg=BG_PANEL)
+        row0.pack(fill="x", pady=(5, 0))
+        fr, self.input_ckpt_var = _make_file_row(
+            row0, "Input checkpoint",
+            os.path.join(PROJECT_ROOT, "cpu_vae_logs", "latest.pt"))
+        fr.pack(side="left", fill="x", expand=True)
+
+        # Config row
         row1 = tk.Frame(top, bg=BG_PANEL)
         row1.pack(fill="x", pady=(5, 0))
-        f, self.ckpt_var = make_float(row1, "PatchVAE checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_logs", "latest.pt"), width=50)
-        f.pack(side="left", fill="x", expand=True)
+        f, self.n_blocks = make_spin(row1, "Blocks", default=4)
+        f.pack(side="left", padx=(0, 10))
+        f, self.hidden_ch = make_spin(row1, "Hidden ch", default=0)
+        f.pack(side="left", padx=(0, 10))
+        f, self.kernel_var = make_spin(row1, "Kernel", default=5)
+        f.pack(side="left", padx=(0, 10))
+        f, self.dropout_var = make_float(row1, "Dropout", "0.0")
+        f.pack(side="left", padx=(0, 10))
+        wf, self.walk_var = _make_walk_dropdown(row1)
+        wf.pack(side="left")
 
+        # Training row
         row2 = tk.Frame(top, bg=BG_PANEL)
         row2.pack(fill="x", pady=(5, 0))
-        f, self.H_var = make_spin(row2, "H", default=360)
-        f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row2, "W", default=640)
-        f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row2, "Precision", "bf16")
-        f.pack(side="left")
-
-        # Image browse
-        row3 = tk.Frame(top, bg=BG_PANEL)
-        row3.pack(fill="x", pady=(5, 0))
-        self.files_label = tk.Label(row3, text="Images: (none — will use synthetic)",
-                                    bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL)
-        self.files_label.pack(side="left", fill="x", expand=True)
-
-        btn = tk.Frame(top, bg=BG_PANEL)
-        btn.pack(fill="x", pady=(10, 0))
-        make_btn(btn, "Browse", self.browse_images, ACCENT).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Clear", self.clear_images, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Run", self.run_infer, GREEN).pack(side="left")
-
-        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
-                           insertbackground=FG, height=6, wrap=tk.WORD,
-                           borderwidth=0, highlightthickness=0)
-        self.log.pack(fill="x", side="bottom", padx=5, pady=5)
-
-        self.preview_label = tk.Label(self, bg=BG)
-        self.preview_label.pack(fill="both", expand=True, pady=5)
-        self.runner = ProcRunner(self.log)
-
-        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_logs"),
-                          self.preview_label)
-
-    def browse_images(self):
-        paths = filedialog.askopenfilenames(
-            title="Select images",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if paths:
-            self._image_paths = list(paths)
-            names = [os.path.basename(p) for p in self._image_paths]
-            display = ", ".join(names[:4])
-            if len(names) > 4:
-                display += f" (+{len(names)-4} more)"
-            self.files_label.config(text=f"Images: {display}")
-
-    def clear_images(self):
-        self._image_paths = []
-        self.files_label.config(text="Images: (none — will use synthetic)")
-
-    def run_infer(self):
-        if self._image_paths:
-            self._run_real_infer()
-        else:
-            cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer1",
-                   "--patch-ckpt", self.ckpt_var.get(),
-                   "--H", str(self.H_var.get()),
-                   "--W", str(self.W_var.get()),
-                   "--precision", self.prec_var.get()]
-            self.runner.run(cmd, cwd=PROJECT_ROOT)
-
-    def _run_real_infer(self):
-        """Run inference on browsed real images in a background thread."""
-        import torch
-        from experiments.cpu_vae import _load_model, save_real_preview_stage1
-
-        ckpt_path = self.ckpt_var.get()
-        H, W = self.H_var.get(), self.W_var.get()
-        prec = self.prec_var.get()
-        paths = list(self._image_paths)
-
-        self.log.delete("1.0", tk.END)
-        self.log.insert(tk.END, f"Loading {ckpt_path}...\n")
-
-        def _work():
-            amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
-                         "fp32": torch.float32}[prec]
-            device = torch.device("cuda:0" if torch.cuda.is_available()
-                                  else "cpu")
-            model, _, cfg = _load_model(ckpt_path, device)
-            model.eval()
-            logdir = os.path.dirname(ckpt_path) or "cpu_vae_logs"
-            os.makedirs(logdir, exist_ok=True)
-            print(f"Running on {len(paths)} real image(s)...", flush=True)
-            out = save_real_preview_stage1(model, paths, H, W, logdir,
-                                           device, amp_dtype)
-            if out:
-                self._preview_mtime = 0  # force refresh
-                self._preview_dir = logdir
-
-        from gui.common import run_with_log
-        run_with_log(self, _work)
-
-
-# =============================================================================
-# Stage 2 Train Tab
-# =============================================================================
-
-class Stage2TrainTab(tk.Frame, PreviewWatcher):
-    def __init__(self, parent):
-        super().__init__(parent, bg=BG)
-        self.build()
-
-    def build(self):
-        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
-        top.pack(fill="x", padx=5, pady=5)
-
-        tk.Label(top, text="Stage 2: Train Flatten Bottleneck", bg=BG_PANEL,
-                 fg=FG, font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Freeze PatchVAE. Train Conv1d flatten/deflatten "
-                 "bottleneck in latent space.",
-                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
-                                                                 pady=(5, 10))
-
-        # Row 1: checkpoints
-        row1 = tk.Frame(top, bg=BG_PANEL)
-        row1.pack(fill="x", pady=(5, 0))
-        f, self.patch_ckpt = make_float(row1, "Encoder checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"), width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row1b = tk.Frame(top, bg=BG_PANEL)
-        row1b.pack(fill="x", pady=(5, 0))
-        f, self.resume_var = make_float(row1b, "Resume flatten checkpoint",
-                                        "", width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        # Row 2: bottleneck config
-        row2 = tk.Frame(top, bg=BG_PANEL)
-        row2.pack(fill="x", pady=(5, 0))
-        f, self.bottleneck_ch = make_spin(row2, "Bottleneck ch", default=1)
-        f.pack(side="left", padx=(0, 10))
-
-        wf = tk.Frame(row2, bg=BG_PANEL)
-        tk.Label(wf, text="Walk order", bg=BG_PANEL, fg=FG_DIM,
-                 font=FONT_SMALL).pack(anchor="w")
-        self.walk_var = tk.StringVar(value="hilbert")
-        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert",
-                                  "morton")
-        walk_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
-                         activebackground=BG_PANEL, activeforeground=FG,
-                         highlightthickness=0, borderwidth=0)
-        walk_menu.pack(anchor="w")
-        wf.pack(side="left", padx=(0, 10))
-
-        f, self.kernel_var = make_spin(row2, "Kernel", default=10)
-        f.pack(side="left", padx=(0, 10))
-        f, self.deflatten_hidden = make_spin(row2, "Defl hidden", default=0)
-        f.pack(side="left", padx=(0, 10))
         f, self.lr_var = make_float(row2, "LR", "1e-3")
         f.pack(side="left", padx=(0, 10))
         f, self.batch_var = make_spin(row2, "Batch", default=4)
         f.pack(side="left", padx=(0, 10))
         f, self.steps_var = make_spin(row2, "Steps", default=10000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.w_pix = make_float(row2, "w_pixel", "1.0")
+        f.pack(side="left", padx=(0, 10))
+        f, self.w_reg = make_float(row2, "w_reg", "0.01")
+        f.pack(side="left", padx=(0, 10))
+        f, self.blur_sigma = make_float(row2, "Blur sigma", "0.0")
+        f.pack(side="left", padx=(0, 10))
+        f, self.prec_var = make_float(row2, "Precision", "bf16")
         f.pack(side="left")
 
-        # Row 3: loss weights, resolution, precision
+        # Save row
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
-        f, self.H_var = make_spin(row3, "H", default=360)
+        f, self.save_every = make_spin(row3, "Save every", default=2000)
         f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row3, "W", default=640)
+        f, self.preview_every = make_spin(row3, "Preview every", default=100)
         f.pack(side="left", padx=(0, 10))
-        f, self.w_lat = make_float(row3, "w_latent", "1.0")
-        f.pack(side="left", padx=(0, 10))
-        f, self.w_pix = make_float(row3, "w_pixel", "0.5")
-        f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row3, "Precision", "bf16")
+        f, self.grad_accum = make_spin(row3, "Grad accum", default=1)
         f.pack(side="left")
 
-        # Row 4: save/log
+        # Options row
         row4 = tk.Frame(top, bg=BG_PANEL)
         row4.pack(fill="x", pady=(5, 0))
-        f, self.save_every = make_spin(row4, "Save every", default=2000)
+        f, self.resume_var = make_float(row4, "Resume checkpoint", "", width=40)
         f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row4, "Preview every", default=100)
-        f.pack(side="left", padx=(0, 10))
-        f, self.grad_accum = make_spin(row4, "Grad accum", default=1)
-        f.pack(side="left")
         self.fresh_opt_var = tk.BooleanVar(value=False)
         tk.Checkbutton(row4, text="Fresh opt", variable=self.fresh_opt_var,
                        bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
                        activebackground=BG_PANEL, font=FONT_SMALL
-                       ).pack(side="left", padx=(10, 0))
+                       ).pack(side="left", padx=(0, 10))
+        self.finetune_dec_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row4, text="Finetune decoder",
+                       variable=self.finetune_dec_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, font=FONT_SMALL
+                       ).pack(side="left")
 
-        # Row 5: preview target image
-        row5 = tk.Frame(top, bg=BG_PANEL)
+        # Preview image
+        row5, self.preview_img_var = _make_preview_row(top)
         row5.pack(fill="x", pady=(5, 0))
-        self.preview_img_var = tk.StringVar(value="")
-        f = tk.Frame(row5, bg=BG_PANEL)
-        tk.Label(f, text="Preview image", bg=BG_PANEL, fg=FG_DIM,
-                 font=FONT_SMALL).pack(anchor="w")
-        ef = tk.Frame(f, bg=BG_PANEL)
-        tk.Entry(ef, textvariable=self.preview_img_var, bg=BG_INPUT, fg=FG,
-                 font=FONT, width=45, borderwidth=0,
-                 insertbackground=FG).pack(side="left", fill="x", expand=True)
-        make_btn(ef, "Browse", self._browse_preview, ACCENT, width=7
-                 ).pack(side="left", padx=(5, 0))
-        ef.pack(fill="x")
-        f.pack(side="left", fill="x", expand=True)
 
         # Buttons
         btn = tk.Frame(top, bg=BG_PANEL)
@@ -473,11 +420,161 @@ class Stage2TrainTab(tk.Frame, PreviewWatcher):
         make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
         make_btn(btn, "Kill", self.kill, RED).pack(side="left")
 
+        # Log at bottom
         self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
                            insertbackground=FG, height=6, wrap=tk.WORD,
                            borderwidth=0, highlightthickness=0)
         self.log.pack(fill="x", side="bottom", padx=5, pady=5)
 
+        # Preview fills remaining
+        self.preview_label = tk.Label(self, bg=BG)
+        self.preview_label.pack(fill="both", expand=True, pady=5)
+        self.runner = ProcRunner(self.log)
+
+        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_refiner_logs"),
+                          self.preview_label)
+
+    def start(self):
+        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "refiner",
+               "--input-ckpt", self.input_ckpt_var.get(),
+               "--n-blocks", str(self.n_blocks.get()),
+               "--hidden-channels", str(self.hidden_ch.get()),
+               "--kernel-size", str(self.kernel_var.get()),
+               "--walk-order", self.walk_var.get(),
+               "--dropout", self.dropout_var.get(),
+               "--lr", self.lr_var.get(),
+               "--batch-size", str(self.batch_var.get()),
+               "--total-steps", str(self.steps_var.get()),
+               "--w-pixel", self.w_pix.get(),
+               "--w-reg", self.w_reg.get(),
+               "--blur-sigma", self.blur_sigma.get(),
+               "--precision", self.prec_var.get(),
+               "--save-every", str(self.save_every.get()),
+               "--preview-every", str(self.preview_every.get()),
+               "--grad-accum", str(self.grad_accum.get())]
+        preview_img = self.preview_img_var.get().strip()
+        if preview_img:
+            cmd.extend(["--preview-image", preview_img])
+        resume = self.resume_var.get().strip()
+        if resume:
+            cmd.extend(["--resume", resume])
+        if self.fresh_opt_var.get():
+            cmd.append("--fresh-opt")
+        if self.finetune_dec_var.get():
+            cmd.append("--finetune-decoder")
+        self.runner.run(cmd, cwd=PROJECT_ROOT)
+
+    def stop(self):
+        stop_file = os.path.join(PROJECT_ROOT, "cpu_vae_refiner_logs", ".stop")
+        Path(stop_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(stop_file).touch()
+
+    def kill(self):
+        self.runner.kill()
+
+
+# =============================================================================
+# Tab 3: S2TrainTab
+# =============================================================================
+
+class S2TrainTab(tk.Frame, PreviewWatcher):
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self.build()
+
+    def build(self):
+        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
+        top.pack(fill="x", padx=5, pady=5)
+
+        tk.Label(top, text="S2: Flatten Bottleneck", bg=BG_PANEL, fg=FG,
+                 font=FONT_TITLE).pack(anchor="w")
+        tk.Label(top, text="Conv1d flatten/deflatten for 1D serialization.",
+                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
+                                                                 pady=(5, 10))
+
+        # Input checkpoint
+        row0 = tk.Frame(top, bg=BG_PANEL)
+        row0.pack(fill="x", pady=(5, 0))
+        fr, self.input_ckpt_var = _make_file_row(
+            row0, "Input checkpoint",
+            os.path.join(PROJECT_ROOT, "cpu_vae_logs", "latest.pt"))
+        fr.pack(side="left", fill="x", expand=True)
+
+        # Config row
+        row1 = tk.Frame(top, bg=BG_PANEL)
+        row1.pack(fill="x", pady=(5, 0))
+        f, self.bottleneck_ch = make_spin(row1, "Bottleneck ch", default=1)
+        f.pack(side="left", padx=(0, 10))
+        wf, self.walk_var = _make_walk_dropdown(row1)
+        wf.pack(side="left", padx=(0, 10))
+        f, self.kernel_var = make_spin(row1, "Kernel", default=10)
+        f.pack(side="left", padx=(0, 10))
+        f, self.deflatten_hidden = make_spin(row1, "Defl hidden", default=0)
+        f.pack(side="left")
+
+        # Training row
+        row2 = tk.Frame(top, bg=BG_PANEL)
+        row2.pack(fill="x", pady=(5, 0))
+        f, self.lr_var = make_float(row2, "LR", "1e-3")
+        f.pack(side="left", padx=(0, 10))
+        f, self.batch_var = make_spin(row2, "Batch", default=4)
+        f.pack(side="left", padx=(0, 10))
+        f, self.steps_var = make_spin(row2, "Steps", default=10000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.w_lat = make_float(row2, "w_latent", "1.0")
+        f.pack(side="left", padx=(0, 10))
+        f, self.w_pix = make_float(row2, "w_pixel", "0.5")
+        f.pack(side="left", padx=(0, 10))
+        f, self.prec_var = make_float(row2, "Precision", "bf16")
+        f.pack(side="left")
+
+        # Resolution row
+        row2b = tk.Frame(top, bg=BG_PANEL)
+        row2b.pack(fill="x", pady=(5, 0))
+        f, self.H_var = make_spin(row2b, "H", default=360)
+        f.pack(side="left", padx=(0, 10))
+        f, self.W_var = make_spin(row2b, "W", default=640)
+        f.pack(side="left")
+
+        # Save row
+        row3 = tk.Frame(top, bg=BG_PANEL)
+        row3.pack(fill="x", pady=(5, 0))
+        f, self.save_every = make_spin(row3, "Save every", default=2000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.preview_every = make_spin(row3, "Preview every", default=100)
+        f.pack(side="left", padx=(0, 10))
+        f, self.grad_accum = make_spin(row3, "Grad accum", default=1)
+        f.pack(side="left")
+
+        # Options row
+        row4 = tk.Frame(top, bg=BG_PANEL)
+        row4.pack(fill="x", pady=(5, 0))
+        f, self.resume_var = make_float(row4, "Resume checkpoint", "", width=40)
+        f.pack(side="left", padx=(0, 10))
+        self.fresh_opt_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row4, text="Fresh opt", variable=self.fresh_opt_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, font=FONT_SMALL
+                       ).pack(side="left")
+
+        # Preview image
+        row5, self.preview_img_var = _make_preview_row(top)
+        row5.pack(fill="x", pady=(5, 0))
+
+        # Buttons
+        btn = tk.Frame(top, bg=BG_PANEL)
+        btn.pack(fill="x", pady=(10, 0))
+        make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
+        make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
+        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
+
+        # Log at bottom
+        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
+                           insertbackground=FG, height=6, wrap=tk.WORD,
+                           borderwidth=0, highlightthickness=0)
+        self.log.pack(fill="x", side="bottom", padx=5, pady=5)
+
+        # Preview fills remaining
         self.preview_label = tk.Label(self, bg=BG)
         self.preview_label.pack(fill="both", expand=True, pady=5)
         self.runner = ProcRunner(self.log)
@@ -485,17 +582,9 @@ class Stage2TrainTab(tk.Frame, PreviewWatcher):
         self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_flatten_logs"),
                           self.preview_label)
 
-    def _browse_preview(self):
-        path = filedialog.askopenfilename(
-            title="Select preview image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if path:
-            self.preview_img_var.set(path)
-
     def start(self):
-        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "stage2",
-               "--patch-ckpt", self.patch_ckpt.get(),
+        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "s2",
+               "--input-ckpt", self.input_ckpt_var.get(),
                "--bottleneck-ch", str(self.bottleneck_ch.get()),
                "--walk-order", self.walk_var.get(),
                "--kernel-size", str(self.kernel_var.get()),
@@ -531,10 +620,10 @@ class Stage2TrainTab(tk.Frame, PreviewWatcher):
 
 
 # =============================================================================
-# Stage 2 Inference Tab
+# Tab 4: InferenceTab
 # =============================================================================
 
-class Stage2InferTab(tk.Frame, PreviewWatcher):
+class InferenceTab(tk.Frame, PreviewWatcher):
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
         self._image_paths = []
@@ -544,58 +633,60 @@ class Stage2InferTab(tk.Frame, PreviewWatcher):
         top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
         top.pack(fill="x", padx=5, pady=5)
 
-        tk.Label(top, text="Stage 2: Flatten Inference", bg=BG_PANEL, fg=FG,
+        tk.Label(top, text="Inference", bg=BG_PANEL, fg=FG,
                  font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Encoder + FlattenDeflatten. Run on synthetic "
-                 "or browse real images for GT | Encoder | Flatten.",
+        tk.Label(top, text="Load any pipeline checkpoint. Shows GT | "
+                 "Reconstruction with per-stage latency.",
                  bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
                                                                  pady=(5, 10))
 
+        # Checkpoint
+        row0 = tk.Frame(top, bg=BG_PANEL)
+        row0.pack(fill="x", pady=(5, 0))
+        fr, self.ckpt_var = _make_file_row(
+            row0, "Checkpoint",
+            os.path.join(PROJECT_ROOT, "cpu_vae_logs", "latest.pt"))
+        fr.pack(side="left", fill="x", expand=True)
+
+        # Resolution
         row1 = tk.Frame(top, bg=BG_PANEL)
         row1.pack(fill="x", pady=(5, 0))
-        f, self.patch_ckpt = make_float(row1, "Encoder checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_logs", "latest.pt"), width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row2 = tk.Frame(top, bg=BG_PANEL)
-        row2.pack(fill="x", pady=(5, 0))
-        f, self.flatten_ckpt = make_float(row2, "Flatten checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_flatten_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row3 = tk.Frame(top, bg=BG_PANEL)
-        row3.pack(fill="x", pady=(5, 0))
-        f, self.H_var = make_spin(row3, "H", default=360)
+        f, self.H_var = make_spin(row1, "H", default=360)
         f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row3, "W", default=640)
+        f, self.W_var = make_spin(row1, "W", default=640)
         f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row3, "Precision", "bf16")
+        f, self.prec_var = make_float(row1, "Precision", "bf16")
         f.pack(side="left")
 
-        # Image browse
-        row4 = tk.Frame(top, bg=BG_PANEL)
-        row4.pack(fill="x", pady=(5, 0))
-        self.files_label = tk.Label(row4, text="Images: (none — will use synthetic)",
-                                    bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL)
+        # Image browse label
+        row2 = tk.Frame(top, bg=BG_PANEL)
+        row2.pack(fill="x", pady=(5, 0))
+        self.files_label = tk.Label(
+            row2, text="Images: (none — will use synthetic)",
+            bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL)
         self.files_label.pack(side="left", fill="x", expand=True)
 
+        # Buttons
         btn = tk.Frame(top, bg=BG_PANEL)
         btn.pack(fill="x", pady=(10, 0))
-        make_btn(btn, "Browse", self.browse_images, ACCENT).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Clear", self.clear_images, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Run", self.run_infer, GREEN).pack(side="left")
+        make_btn(btn, "Run", self.run_infer, GREEN).pack(
+            side="left", padx=(0, 5))
+        make_btn(btn, "Browse", self.browse_images, ACCENT).pack(
+            side="left", padx=(0, 5))
+        make_btn(btn, "Clear", self.clear_images, BLUE).pack(side="left")
 
+        # Log at bottom
         self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
                            insertbackground=FG, height=6, wrap=tk.WORD,
                            borderwidth=0, highlightthickness=0)
         self.log.pack(fill="x", side="bottom", padx=5, pady=5)
 
+        # Preview fills remaining
         self.preview_label = tk.Label(self, bg=BG)
         self.preview_label.pack(fill="both", expand=True, pady=5)
         self.runner = ProcRunner(self.log)
 
-        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_flatten_logs"),
+        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_logs"),
                           self.preview_label)
 
     def browse_images(self):
@@ -619,325 +710,19 @@ class Stage2InferTab(tk.Frame, PreviewWatcher):
         if self._image_paths:
             self._run_real_infer()
         else:
-            cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer2",
-                   "--patch-ckpt", self.patch_ckpt.get(),
-                   "--flatten-ckpt", self.flatten_ckpt.get(),
+            # Synthetic: run via subprocess
+            cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer",
+                   "--ckpt", self.ckpt_var.get(),
                    "--H", str(self.H_var.get()),
                    "--W", str(self.W_var.get()),
                    "--precision", self.prec_var.get()]
             self.runner.run(cmd, cwd=PROJECT_ROOT)
 
     def _run_real_infer(self):
+        """Run inference on browsed real images in-process."""
         import torch
-        from experiments.cpu_vae import _load_model, save_real_preview_stage2
-        from experiments.flatten import FlattenDeflatten
-
-        patch_ckpt = self.patch_ckpt.get()
-        flatten_ckpt = self.flatten_ckpt.get()
-        H, W = self.H_var.get(), self.W_var.get()
-        prec = self.prec_var.get()
-        paths = list(self._image_paths)
-
-        self.log.delete("1.0", tk.END)
-        self.log.insert(tk.END, f"Loading encoder + flatten...\n")
-
-        def _work():
-            amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
-                         "fp32": torch.float32}[prec]
-            device = torch.device("cuda:0" if torch.cuda.is_available()
-                                  else "cpu")
-            patch_vae, _, cfg = _load_model(patch_ckpt, device)
-            patch_vae.eval()
-
-            fk = torch.load(flatten_ckpt, map_location="cpu",
-                            weights_only=False)
-            fcfg = fk.get("config", {})
-            bottleneck = FlattenDeflatten(
-                latent_channels=fcfg.get("latent_channels", 32),
-                bottleneck_channels=fcfg.get("bottleneck_channels", 6),
-                spatial_h=fcfg.get("spatial_h", H // 8),
-                spatial_w=fcfg.get("spatial_w", W // 8),
-                walk_order=fcfg.get("walk_order", "raster"),
-                kernel_size=fcfg.get("kernel_size", 1),
-                deflatten_hidden=fcfg.get("deflatten_hidden", 0),
-            ).to(device)
-            bottleneck.load_state_dict(fk["bottleneck"])
-            bottleneck.eval()
-
-            logdir = os.path.dirname(flatten_ckpt) or "cpu_vae_flatten_logs"
-            os.makedirs(logdir, exist_ok=True)
-            print(f"Running on {len(paths)} real image(s)...", flush=True)
-            out = save_real_preview_stage2(patch_vae, bottleneck, paths,
-                                            H, W, logdir, device, amp_dtype)
-            if out:
-                self._preview_mtime = 0
-                self._preview_dir = logdir
-
-        from gui.common import run_with_log
-        run_with_log(self, _work)
-
-
-# =============================================================================
-# Unrolled Stage 1 Train Tab
-# =============================================================================
-
-class UnrolledTrainTab(tk.Frame, PreviewWatcher):
-    def __init__(self, parent):
-        super().__init__(parent, bg=BG)
-        self.build()
-
-    def build(self):
-        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
-        top.pack(fill="x", padx=5, pady=5)
-
-        tk.Label(top, text="Stage 1: Train UnrolledPatchVAE", bg=BG_PANEL,
-                 fg=FG, font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Unroll patches to pixel lines with positional "
-                 "embeddings + channel IDs. Per-patch Conv1d compression.",
-                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
-                                                                 pady=(5, 10))
-
-        # Row 1: architecture
-        row1 = tk.Frame(top, bg=BG_PANEL)
-        row1.pack(fill="x", pady=(5, 0))
-        f, self.patch_size = make_spin(row1, "Patch size", default=8)
-        f.pack(side="left", padx=(0, 10))
-        f, self.latent_ch = make_spin(row1, "Latent ch", default=32)
-        f.pack(side="left", padx=(0, 10))
-        f, self.inner_dim = make_spin(row1, "Inner dim", default=8)
-        f.pack(side="left", padx=(0, 10))
-        f, self.hidden_dim_var = make_spin(row1, "Hidden dim", default=0)
-        f.pack(side="left", padx=(0, 10))
-        f, self.overlap_var = make_spin(row1, "Overlap", default=0)
-        f.pack(side="left", padx=(0, 10))
-        f, self.post_kernel = make_spin(row1, "Post kernel", default=0)
-        f.pack(side="left", padx=(0, 10))
-        f, self.H_var = make_spin(row1, "H", default=360)
-        f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row1, "W", default=640)
-        f.pack(side="left")
-
-        # Row 2: training params
-        row2 = tk.Frame(top, bg=BG_PANEL)
-        row2.pack(fill="x", pady=(5, 0))
-        f, self.lr_var = make_float(row2, "LR", "2e-4")
-        f.pack(side="left", padx=(0, 10))
-        f, self.batch_var = make_spin(row2, "Batch", default=4)
-        f.pack(side="left", padx=(0, 10))
-        f, self.steps_var = make_spin(row2, "Steps", default=30000)
-        f.pack(side="left", padx=(0, 10))
-        f, self.w_mse = make_float(row2, "w_mse", "1.0")
-        f.pack(side="left", padx=(0, 10))
-        f, self.w_lpips = make_float(row2, "w_lpips", "0.5")
-        f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row2, "Precision", "bf16")
-        f.pack(side="left")
-
-        # Row 3: save/log
-        row3 = tk.Frame(top, bg=BG_PANEL)
-        row3.pack(fill="x", pady=(5, 0))
-        f, self.save_every = make_spin(row3, "Save every", default=5000)
-        f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row3, "Preview every", default=100)
-        f.pack(side="left", padx=(0, 10))
-        f, self.grad_accum = make_spin(row3, "Grad accum", default=1)
-        f.pack(side="left")
-
-        # Row 4: resume
-        row4 = tk.Frame(top, bg=BG_PANEL)
-        row4.pack(fill="x", pady=(5, 0))
-        f, self.resume_var = make_float(row4, "Resume checkpoint", "", width=50)
-        f.pack(side="left", fill="x", expand=True)
-        self.fresh_opt_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(row4, text="Fresh opt", variable=self.fresh_opt_var,
-                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
-                       activebackground=BG_PANEL, font=FONT_SMALL
-                       ).pack(side="left", padx=(10, 0))
-        self.loose_load_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(row4, text="Loose load", variable=self.loose_load_var,
-                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
-                       activebackground=BG_PANEL, font=FONT_SMALL
-                       ).pack(side="left", padx=(10, 0))
-
-        # Row 5: preview target image
-        row5 = tk.Frame(top, bg=BG_PANEL)
-        row5.pack(fill="x", pady=(5, 0))
-        self.preview_img_var = tk.StringVar(value="")
-        f = tk.Frame(row5, bg=BG_PANEL)
-        tk.Label(f, text="Preview image", bg=BG_PANEL, fg=FG_DIM,
-                 font=FONT_SMALL).pack(anchor="w")
-        ef = tk.Frame(f, bg=BG_PANEL)
-        tk.Entry(ef, textvariable=self.preview_img_var, bg=BG_INPUT, fg=FG,
-                 font=FONT, width=45, borderwidth=0,
-                 insertbackground=FG).pack(side="left", fill="x", expand=True)
-        make_btn(ef, "Browse", self._browse_preview, ACCENT, width=7
-                 ).pack(side="left", padx=(5, 0))
-        ef.pack(fill="x")
-        f.pack(side="left", fill="x", expand=True)
-
-        # Buttons
-        btn = tk.Frame(top, bg=BG_PANEL)
-        btn.pack(fill="x", pady=(10, 0))
-        make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
-
-        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
-                           insertbackground=FG, height=6, wrap=tk.WORD,
-                           borderwidth=0, highlightthickness=0)
-        self.log.pack(fill="x", side="bottom", padx=5, pady=5)
-
-        self.preview_label = tk.Label(self, bg=BG)
-        self.preview_label.pack(fill="both", expand=True, pady=5)
-        self.runner = ProcRunner(self.log)
-
-        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs"),
-                          self.preview_label)
-
-    def _browse_preview(self):
-        path = filedialog.askopenfilename(
-            title="Select preview image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if path:
-            self.preview_img_var.set(path)
-
-    def start(self):
-        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "stage1",
-               "--model-type", "unrolled",
-               "--patch-size", str(self.patch_size.get()),
-               "--latent-ch", str(self.latent_ch.get()),
-               "--inner-dim", str(self.inner_dim.get()),
-               "--hidden-dim", str(self.hidden_dim_var.get()),
-               "--overlap", str(self.overlap_var.get()),
-               "--post-kernel", str(self.post_kernel.get()),
-               "--H", str(self.H_var.get()),
-               "--W", str(self.W_var.get()),
-               "--lr", self.lr_var.get(),
-               "--batch-size", str(self.batch_var.get()),
-               "--total-steps", str(self.steps_var.get()),
-               "--w-mse", self.w_mse.get(),
-               "--w-lpips", self.w_lpips.get(),
-               "--precision", self.prec_var.get(),
-               "--save-every", str(self.save_every.get()),
-               "--preview-every", str(self.preview_every.get()),
-               "--grad-accum", str(self.grad_accum.get()),
-               "--logdir", "cpu_vae_unrolled_logs"]
-        preview_img = self.preview_img_var.get().strip()
-        if preview_img:
-            cmd.extend(["--preview-image", preview_img])
-        resume = self.resume_var.get().strip()
-        if resume:
-            cmd.extend(["--resume", resume])
-        if self.fresh_opt_var.get():
-            cmd.append("--fresh-opt")
-        if self.loose_load_var.get():
-            cmd.append("--loose-load")
-        self.runner.run(cmd, cwd=PROJECT_ROOT)
-
-    def stop(self):
-        stop_file = os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", ".stop")
-        Path(stop_file).parent.mkdir(parents=True, exist_ok=True)
-        Path(stop_file).touch()
-
-    def kill(self):
-        self.runner.kill()
-
-
-# =============================================================================
-# Unrolled Stage 1 Inference Tab
-# =============================================================================
-
-class UnrolledInferTab(tk.Frame, PreviewWatcher):
-    def __init__(self, parent):
-        super().__init__(parent, bg=BG)
-        self._image_paths = []
-        self.build()
-
-    def build(self):
-        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
-        top.pack(fill="x", padx=5, pady=5)
-
-        tk.Label(top, text="Unrolled: Inference", bg=BG_PANEL, fg=FG,
-                 font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Load trained UnrolledPatchVAE. Run on synthetic "
-                 "data or browse real images.",
-                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
-                                                                 pady=(5, 10))
-
-        row1 = tk.Frame(top, bg=BG_PANEL)
-        row1.pack(fill="x", pady=(5, 0))
-        f, self.ckpt_var = make_float(row1, "Checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row2 = tk.Frame(top, bg=BG_PANEL)
-        row2.pack(fill="x", pady=(5, 0))
-        f, self.H_var = make_spin(row2, "H", default=360)
-        f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row2, "W", default=640)
-        f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row2, "Precision", "bf16")
-        f.pack(side="left")
-
-        # Image browse
-        row3 = tk.Frame(top, bg=BG_PANEL)
-        row3.pack(fill="x", pady=(5, 0))
-        self.files_label = tk.Label(row3, text="Images: (none — will use synthetic)",
-                                    bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL)
-        self.files_label.pack(side="left", fill="x", expand=True)
-
-        btn = tk.Frame(top, bg=BG_PANEL)
-        btn.pack(fill="x", pady=(10, 0))
-        make_btn(btn, "Browse", self.browse_images, ACCENT).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Clear", self.clear_images, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Run", self.run_infer, GREEN).pack(side="left")
-
-        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
-                           insertbackground=FG, height=6, wrap=tk.WORD,
-                           borderwidth=0, highlightthickness=0)
-        self.log.pack(fill="x", side="bottom", padx=5, pady=5)
-
-        self.preview_label = tk.Label(self, bg=BG)
-        self.preview_label.pack(fill="both", expand=True, pady=5)
-        self.runner = ProcRunner(self.log)
-
-        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs"),
-                          self.preview_label)
-
-    def browse_images(self):
-        paths = filedialog.askopenfilenames(
-            title="Select images",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if paths:
-            self._image_paths = list(paths)
-            names = [os.path.basename(p) for p in self._image_paths]
-            display = ", ".join(names[:4])
-            if len(names) > 4:
-                display += f" (+{len(names)-4} more)"
-            self.files_label.config(text=f"Images: {display}")
-
-    def clear_images(self):
-        self._image_paths = []
-        self.files_label.config(text="Images: (none — will use synthetic)")
-
-    def run_infer(self):
-        if self._image_paths:
-            self._run_real_infer()
-        else:
-            cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer1",
-                   "--patch-ckpt", self.ckpt_var.get(),
-                   "--H", str(self.H_var.get()),
-                   "--W", str(self.W_var.get()),
-                   "--precision", self.prec_var.get(),
-                   "--logdir", "cpu_vae_unrolled_logs"]
-            self.runner.run(cmd, cwd=PROJECT_ROOT)
-
-    def _run_real_infer(self):
-        import torch
-        from experiments.cpu_vae import _load_model, save_real_preview_stage1
+        import numpy as np
+        from experiments.cpu_vae import _load_pipeline
 
         ckpt_path = self.ckpt_var.get()
         H, W = self.H_var.get(), self.W_var.get()
@@ -952,323 +737,43 @@ class UnrolledInferTab(tk.Frame, PreviewWatcher):
                          "fp32": torch.float32}[prec]
             device = torch.device("cuda:0" if torch.cuda.is_available()
                                   else "cpu")
-            model, _, cfg = _load_model(ckpt_path, device)
-            model.eval()
-            logdir = os.path.dirname(ckpt_path) or "cpu_vae_unrolled_logs"
-            os.makedirs(logdir, exist_ok=True)
+            pipeline = _load_pipeline(ckpt_path, device)
             print(f"Running on {len(paths)} real image(s)...", flush=True)
-            out = save_real_preview_stage1(model, paths, H, W, logdir,
-                                           device, amp_dtype)
-            if out:
-                self._preview_mtime = 0
-                self._preview_dir = logdir
 
-        from gui.common import run_with_log
-        run_with_log(self, _work)
+            from torchvision import transforms as T
+            to_tensor = T.Compose([
+                T.Resize((H, W)),
+                T.ToTensor(),
+            ])
 
-
-# =============================================================================
-# Stage 1.5 Train Tab
-# =============================================================================
-
-class Stage15TrainTab(tk.Frame, PreviewWatcher):
-    def __init__(self, parent):
-        super().__init__(parent, bg=BG)
-        self.build()
-
-    def build(self):
-        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
-        top.pack(fill="x", padx=5, pady=5)
-
-        tk.Label(top, text="Stage 1.5: Cascaded Spatial Compression",
-                 bg=BG_PANEL, fg=FG, font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Freeze S1. Train second UnrolledPatchVAE on "
-                 "S1 latent grid for spatial compression.",
-                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
-                                                                 pady=(5, 10))
-
-        # Row 1: S1 checkpoint
-        row1 = tk.Frame(top, bg=BG_PANEL)
-        row1.pack(fill="x", pady=(5, 0))
-        f, self.s1_ckpt = make_float(row1, "S1 checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        # Row 2: S1.5 architecture
-        row2 = tk.Frame(top, bg=BG_PANEL)
-        row2.pack(fill="x", pady=(5, 0))
-        f, self.patch_size = make_spin(row2, "Patch size", default=4)
-        f.pack(side="left", padx=(0, 10))
-        f, self.latent_ch = make_spin(row2, "Latent ch", default=3)
-        f.pack(side="left", padx=(0, 10))
-        f, self.inner_dim = make_spin(row2, "Inner dim", default=4)
-        f.pack(side="left", padx=(0, 10))
-        f, self.hidden_dim_var = make_spin(row2, "Hidden dim", default=0)
-        f.pack(side="left", padx=(0, 10))
-        f, self.overlap_var = make_spin(row2, "Overlap", default=0)
-        f.pack(side="left", padx=(0, 10))
-        f, self.post_kernel = make_spin(row2, "Post kernel", default=0)
-        f.pack(side="left", padx=(0, 10))
-        f, self.H_var = make_spin(row2, "H", default=360)
-        f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row2, "W", default=640)
-        f.pack(side="left")
-
-        # Row 3: training params
-        row3 = tk.Frame(top, bg=BG_PANEL)
-        row3.pack(fill="x", pady=(5, 0))
-        f, self.lr_var = make_float(row3, "LR", "2e-4")
-        f.pack(side="left", padx=(0, 10))
-        f, self.batch_var = make_spin(row3, "Batch", default=4)
-        f.pack(side="left", padx=(0, 10))
-        f, self.steps_var = make_spin(row3, "Steps", default=20000)
-        f.pack(side="left", padx=(0, 10))
-        f, self.w_lat = make_float(row3, "w_latent", "1.0")
-        f.pack(side="left", padx=(0, 10))
-        f, self.w_pix = make_float(row3, "w_pixel", "0.5")
-        f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row3, "Precision", "bf16")
-        f.pack(side="left")
-
-        # Row 4: save/log
-        row4 = tk.Frame(top, bg=BG_PANEL)
-        row4.pack(fill="x", pady=(5, 0))
-        f, self.save_every = make_spin(row4, "Save every", default=5000)
-        f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row4, "Preview every", default=100)
-        f.pack(side="left", padx=(0, 10))
-        f, self.grad_accum = make_spin(row4, "Grad accum", default=1)
-        f.pack(side="left")
-
-        # Row 5: resume
-        row5 = tk.Frame(top, bg=BG_PANEL)
-        row5.pack(fill="x", pady=(5, 0))
-        f, self.resume_var = make_float(row5, "Resume checkpoint", "", width=50)
-        f.pack(side="left", fill="x", expand=True)
-        self.fresh_opt_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(row5, text="Fresh opt", variable=self.fresh_opt_var,
-                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
-                       activebackground=BG_PANEL, font=FONT_SMALL
-                       ).pack(side="left", padx=(10, 0))
-        self.loose_load_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(row5, text="Loose load", variable=self.loose_load_var,
-                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
-                       activebackground=BG_PANEL, font=FONT_SMALL
-                       ).pack(side="left", padx=(10, 0))
-
-        # Row 6: preview image
-        row6 = tk.Frame(top, bg=BG_PANEL)
-        row6.pack(fill="x", pady=(5, 0))
-        self.preview_img_var = tk.StringVar(value="")
-        f = tk.Frame(row6, bg=BG_PANEL)
-        tk.Label(f, text="Preview image", bg=BG_PANEL, fg=FG_DIM,
-                 font=FONT_SMALL).pack(anchor="w")
-        ef = tk.Frame(f, bg=BG_PANEL)
-        tk.Entry(ef, textvariable=self.preview_img_var, bg=BG_INPUT, fg=FG,
-                 font=FONT, width=45, borderwidth=0,
-                 insertbackground=FG).pack(side="left", fill="x", expand=True)
-        make_btn(ef, "Browse", self._browse_preview, ACCENT, width=7
-                 ).pack(side="left", padx=(5, 0))
-        ef.pack(fill="x")
-        f.pack(side="left", fill="x", expand=True)
-
-        # Buttons
-        btn = tk.Frame(top, bg=BG_PANEL)
-        btn.pack(fill="x", pady=(10, 0))
-        make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
-
-        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
-                           insertbackground=FG, height=6, wrap=tk.WORD,
-                           borderwidth=0, highlightthickness=0)
-        self.log.pack(fill="x", side="bottom", padx=5, pady=5)
-
-        self.preview_label = tk.Label(self, bg=BG)
-        self.preview_label.pack(fill="both", expand=True, pady=5)
-        self.runner = ProcRunner(self.log)
-
-        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs"),
-                          self.preview_label)
-
-    def _browse_preview(self):
-        path = filedialog.askopenfilename(
-            title="Select preview image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if path:
-            self.preview_img_var.set(path)
-
-    def start(self):
-        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "stage1_5",
-               "--s1-ckpt", self.s1_ckpt.get(),
-               "--patch-size", str(self.patch_size.get()),
-               "--latent-ch", str(self.latent_ch.get()),
-               "--inner-dim", str(self.inner_dim.get()),
-               "--hidden-dim", str(self.hidden_dim_var.get()),
-               "--overlap", str(self.overlap_var.get()),
-               "--post-kernel", str(self.post_kernel.get()),
-               "--H", str(self.H_var.get()),
-               "--W", str(self.W_var.get()),
-               "--lr", self.lr_var.get(),
-               "--batch-size", str(self.batch_var.get()),
-               "--total-steps", str(self.steps_var.get()),
-               "--w-latent", self.w_lat.get(),
-               "--w-pixel", self.w_pix.get(),
-               "--precision", self.prec_var.get(),
-               "--save-every", str(self.save_every.get()),
-               "--preview-every", str(self.preview_every.get()),
-               "--grad-accum", str(self.grad_accum.get())]
-        preview_img = self.preview_img_var.get().strip()
-        if preview_img:
-            cmd.extend(["--preview-image", preview_img])
-        resume = self.resume_var.get().strip()
-        if resume:
-            cmd.extend(["--resume", resume])
-        if self.fresh_opt_var.get():
-            cmd.append("--fresh-opt")
-        if self.loose_load_var.get():
-            cmd.append("--loose-load")
-        self.runner.run(cmd, cwd=PROJECT_ROOT)
-
-    def stop(self):
-        stop_file = os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs", ".stop")
-        Path(stop_file).parent.mkdir(parents=True, exist_ok=True)
-        Path(stop_file).touch()
-
-    def kill(self):
-        self.runner.kill()
-
-
-# =============================================================================
-# Stage 1.5 Inference Tab
-# =============================================================================
-
-class Stage15InferTab(tk.Frame, PreviewWatcher):
-    def __init__(self, parent):
-        super().__init__(parent, bg=BG)
-        self._image_paths = []
-        self.build()
-
-    def build(self):
-        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
-        top.pack(fill="x", padx=5, pady=5)
-
-        tk.Label(top, text="Stage 1.5: Inference", bg=BG_PANEL, fg=FG,
-                 font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Fused S1+S1.5 checkpoint. "
-                 "Shows GT | S1 Recon | S1.5 Recon.",
-                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
-                                                                 pady=(5, 10))
-
-        row1 = tk.Frame(top, bg=BG_PANEL)
-        row1.pack(fill="x", pady=(5, 0))
-        f, self.s1_5_ckpt = make_float(row1, "S1.5 checkpoint (fused)",
-            os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row3 = tk.Frame(top, bg=BG_PANEL)
-        row3.pack(fill="x", pady=(5, 0))
-        f, self.H_var = make_spin(row3, "H", default=360)
-        f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row3, "W", default=640)
-        f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row3, "Precision", "bf16")
-        f.pack(side="left")
-
-        # Image browse
-        row4 = tk.Frame(top, bg=BG_PANEL)
-        row4.pack(fill="x", pady=(5, 0))
-        self.files_label = tk.Label(row4,
-            text="Images: (none — will use synthetic)",
-            bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL)
-        self.files_label.pack(side="left", fill="x", expand=True)
-
-        btn = tk.Frame(top, bg=BG_PANEL)
-        btn.pack(fill="x", pady=(10, 0))
-        make_btn(btn, "Browse", self.browse_images, ACCENT).pack(
-            side="left", padx=(0, 5))
-        make_btn(btn, "Clear", self.clear_images, BLUE).pack(
-            side="left", padx=(0, 5))
-        make_btn(btn, "Run", self.run_infer, GREEN).pack(side="left")
-
-        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
-                           insertbackground=FG, height=6, wrap=tk.WORD,
-                           borderwidth=0, highlightthickness=0)
-        self.log.pack(fill="x", side="bottom", padx=5, pady=5)
-
-        self.preview_label = tk.Label(self, bg=BG)
-        self.preview_label.pack(fill="both", expand=True, pady=5)
-        self.runner = ProcRunner(self.log)
-
-        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs"),
-                          self.preview_label)
-
-    def browse_images(self):
-        paths = filedialog.askopenfilenames(
-            title="Select images",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if paths:
-            self._image_paths = list(paths)
-            names = [os.path.basename(p) for p in self._image_paths]
-            display = ", ".join(names[:4])
-            if len(names) > 4:
-                display += f" (+{len(names)-4} more)"
-            self.files_label.config(text=f"Images: {display}")
-
-    def clear_images(self):
-        self._image_paths = []
-        self.files_label.config(text="Images: (none — will use synthetic)")
-
-    def run_infer(self):
-        if self._image_paths:
-            self._run_real_infer()
-        else:
-            cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer1_5",
-                   "--s1-5-ckpt", self.s1_5_ckpt.get(),
-                   "--H", str(self.H_var.get()),
-                   "--W", str(self.W_var.get()),
-                   "--precision", self.prec_var.get()]
-            self.runner.run(cmd, cwd=PROJECT_ROOT)
-
-    def _run_real_infer(self):
-        import torch
-        from experiments.cpu_vae import (_load_fused_s1_5, load_real_images,
-                                         save_preview_stage1_5)
-
-        s1_5_path = self.s1_5_ckpt.get()
-        H, W = self.H_var.get(), self.W_var.get()
-        prec = self.prec_var.get()
-        paths = list(self._image_paths)
-
-        self.log.delete("1.0", tk.END)
-        self.log.insert(tk.END, f"Loading S1 + S1.5...\n")
-
-        def _work():
-            amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
-                         "fp32": torch.float32}[prec]
-            device = torch.device("cuda:0" if torch.cuda.is_available()
-                                  else "cpu")
-            s1, s1_5, _ = _load_fused_s1_5(s1_5_path, device)
-            s1.eval()
-            s1_5.eval()
-
-            # Build a minimal gen-like object for preview
-            class _FakeGen:
-                pass
-            fg = _FakeGen()
-            fg.H, fg.W = H, W
-            fg.generate = lambda n: load_real_images(paths[:n], H, W, device)
-
-            logdir = os.path.dirname(s1_5_path) or "cpu_vae_s1_5_logs"
+            logdir = os.path.dirname(ckpt_path) or "cpu_vae_logs"
             os.makedirs(logdir, exist_ok=True)
-            print(f"Running on {len(paths)} real image(s)...", flush=True)
-            save_preview_stage1_5(s1, s1_5, fg, logdir, 0,
-                                   device, amp_dtype)
-            self._preview_mtime = 0
+
+            for img_path in paths:
+                pil = Image.open(img_path).convert("RGB")
+                x = to_tensor(pil).unsqueeze(0).to(device)  # [1,3,H,W]
+
+                import time as _time
+                t0 = _time.perf_counter()
+                with torch.no_grad(), torch.amp.autocast(
+                        device.type, dtype=amp_dtype):
+                    z = pipeline.encode(x)
+                    recon = pipeline.decode(z)
+                dt = _time.perf_counter() - t0
+                print(f"  {os.path.basename(img_path)}: "
+                      f"{dt*1000:.1f}ms  latent {list(z.shape)}", flush=True)
+
+                # Save GT | Recon side by side
+                gt_np = x[0].cpu().float().clamp(0, 1).permute(1, 2, 0).numpy()
+                rc_np = recon[0].cpu().float().clamp(0, 1).permute(
+                    1, 2, 0).numpy()
+                combo = np.concatenate([gt_np, rc_np], axis=1)
+                combo = (combo * 255).astype(np.uint8)
+                out_pil = Image.fromarray(combo)
+                out_path = os.path.join(logdir, "real_preview_latest.png")
+                out_pil.save(out_path)
+
+            self._preview_mtime = 0  # force refresh
             self._preview_dir = logdir
 
         from gui.common import run_with_log
@@ -1276,294 +781,8 @@ class Stage15InferTab(tk.Frame, PreviewWatcher):
 
 
 # =============================================================================
-# Main window
+# Main
 # =============================================================================
-
-# =============================================================================
-# Refiner Train Tab
-# =============================================================================
-
-class RefinerTrainTab(tk.Frame, PreviewWatcher):
-    def __init__(self, parent):
-        super().__init__(parent, bg=BG)
-        self.build()
-
-    def build(self):
-        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
-        top.pack(fill="x", padx=5, pady=5)
-
-        tk.Label(top, text="Refiner: Latent Smoothing", bg=BG_PANEL, fg=FG,
-                 font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Residual Conv1d blocks on latent grid. "
-                 "Smooths patch boundary artifacts without changing dims.",
-                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
-                                                                 pady=(5, 10))
-
-        # Row 1: upstream checkpoints
-        row1 = tk.Frame(top, bg=BG_PANEL)
-        row1.pack(fill="x", pady=(5, 0))
-        f, self.s1_ckpt = make_float(row1, "S1 checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row1b = tk.Frame(top, bg=BG_PANEL)
-        row1b.pack(fill="x", pady=(5, 0))
-        f, self.s1_5_ckpt = make_float(row1b, "S1.5 checkpoint (optional)",
-            os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        # Row 2: refiner config
-        row2 = tk.Frame(top, bg=BG_PANEL)
-        row2.pack(fill="x", pady=(5, 0))
-        f, self.n_blocks = make_spin(row2, "Blocks", default=4)
-        f.pack(side="left", padx=(0, 10))
-        f, self.hidden_ch = make_spin(row2, "Hidden ch", default=0)
-        f.pack(side="left", padx=(0, 10))
-        f, self.kernel_var = make_spin(row2, "Kernel", default=5)
-        f.pack(side="left", padx=(0, 10))
-        f, self.dropout_var = make_float(row2, "Dropout", "0.0")
-        f.pack(side="left", padx=(0, 10))
-
-        wf = tk.Frame(row2, bg=BG_PANEL)
-        tk.Label(wf, text="Walk order", bg=BG_PANEL, fg=FG_DIM,
-                 font=FONT_SMALL).pack(anchor="w")
-        self.walk_var = tk.StringVar(value="hilbert")
-        walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert",
-                                  "morton")
-        walk_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
-                         activebackground=BG_PANEL, activeforeground=FG,
-                         highlightthickness=0, borderwidth=0)
-        walk_menu.pack(anchor="w")
-        wf.pack(side="left", padx=(0, 10))
-
-        f, self.H_var = make_spin(row2, "H", default=360)
-        f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row2, "W", default=640)
-        f.pack(side="left")
-
-        # Row 3: training params
-        row3 = tk.Frame(top, bg=BG_PANEL)
-        row3.pack(fill="x", pady=(5, 0))
-        f, self.lr_var = make_float(row3, "LR", "1e-3")
-        f.pack(side="left", padx=(0, 10))
-        f, self.batch_var = make_spin(row3, "Batch", default=4)
-        f.pack(side="left", padx=(0, 10))
-        f, self.steps_var = make_spin(row3, "Steps", default=10000)
-        f.pack(side="left", padx=(0, 10))
-        f, self.w_pix = make_float(row3, "w_pixel", "1.0")
-        f.pack(side="left", padx=(0, 10))
-        f, self.w_reg = make_float(row3, "w_reg", "0.01")
-        f.pack(side="left", padx=(0, 10))
-        f, self.blur_sigma = make_float(row3, "Blur sigma", "0.0")
-        f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row3, "Precision", "bf16")
-        f.pack(side="left")
-
-        # Row 4: save/log
-        row4 = tk.Frame(top, bg=BG_PANEL)
-        row4.pack(fill="x", pady=(5, 0))
-        f, self.save_every = make_spin(row4, "Save every", default=2000)
-        f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row4, "Preview every", default=100)
-        f.pack(side="left", padx=(0, 10))
-        f, self.grad_accum = make_spin(row4, "Grad accum", default=1)
-        f.pack(side="left")
-
-        # Row 5: resume
-        row5 = tk.Frame(top, bg=BG_PANEL)
-        row5.pack(fill="x", pady=(5, 0))
-        f, self.resume_var = make_float(row5, "Resume checkpoint", "", width=50)
-        f.pack(side="left", fill="x", expand=True)
-        self.fresh_opt_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(row5, text="Fresh opt", variable=self.fresh_opt_var,
-                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
-                       activebackground=BG_PANEL, font=FONT_SMALL
-                       ).pack(side="left", padx=(10, 0))
-        self.finetune_dec_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(row5, text="Finetune decoder",
-                       variable=self.finetune_dec_var,
-                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
-                       activebackground=BG_PANEL, font=FONT_SMALL
-                       ).pack(side="left", padx=(10, 0))
-
-        # Row 6: preview image
-        row6 = tk.Frame(top, bg=BG_PANEL)
-        row6.pack(fill="x", pady=(5, 0))
-        self.preview_img_var = tk.StringVar(value="")
-        f = tk.Frame(row6, bg=BG_PANEL)
-        tk.Label(f, text="Preview image", bg=BG_PANEL, fg=FG_DIM,
-                 font=FONT_SMALL).pack(anchor="w")
-        ef = tk.Frame(f, bg=BG_PANEL)
-        tk.Entry(ef, textvariable=self.preview_img_var, bg=BG_INPUT, fg=FG,
-                 font=FONT, width=45, borderwidth=0,
-                 insertbackground=FG).pack(side="left", fill="x", expand=True)
-        make_btn(ef, "Browse", self._browse_preview, ACCENT, width=7
-                 ).pack(side="left", padx=(5, 0))
-        ef.pack(fill="x")
-        f.pack(side="left", fill="x", expand=True)
-
-        # Buttons
-        btn = tk.Frame(top, bg=BG_PANEL)
-        btn.pack(fill="x", pady=(10, 0))
-        make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
-        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
-
-        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
-                           insertbackground=FG, height=6, wrap=tk.WORD,
-                           borderwidth=0, highlightthickness=0)
-        self.log.pack(fill="x", side="bottom", padx=5, pady=5)
-
-        self.preview_label = tk.Label(self, bg=BG)
-        self.preview_label.pack(fill="both", expand=True, pady=5)
-
-        self.runner = ProcRunner(self.log)
-        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_refiner_logs"),
-                          self.preview_label)
-
-    def _browse_preview(self):
-        path = filedialog.askopenfilename(
-            title="Select preview image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if path:
-            self.preview_img_var.set(path)
-
-    def start(self):
-        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "refiner",
-               "--s1-ckpt", self.s1_ckpt.get(),
-               "--n-blocks", str(self.n_blocks.get()),
-               "--hidden-channels", str(self.hidden_ch.get()),
-               "--kernel-size", str(self.kernel_var.get()),
-               "--walk-order", self.walk_var.get(),
-               "--dropout", self.dropout_var.get(),
-               "--H", str(self.H_var.get()),
-               "--W", str(self.W_var.get()),
-               "--lr", self.lr_var.get(),
-               "--batch-size", str(self.batch_var.get()),
-               "--total-steps", str(self.steps_var.get()),
-               "--w-pixel", self.w_pix.get(),
-               "--w-reg", self.w_reg.get(),
-               "--blur-sigma", self.blur_sigma.get(),
-               "--precision", self.prec_var.get(),
-               "--save-every", str(self.save_every.get()),
-               "--preview-every", str(self.preview_every.get()),
-               "--grad-accum", str(self.grad_accum.get())]
-        s1_5 = self.s1_5_ckpt.get().strip()
-        if s1_5 and os.path.exists(s1_5):
-            cmd.extend(["--s1-5-ckpt", s1_5])
-        preview_img = self.preview_img_var.get().strip()
-        if preview_img:
-            cmd.extend(["--preview-image", preview_img])
-        resume = self.resume_var.get().strip()
-        if resume:
-            cmd.extend(["--resume", resume])
-        if self.fresh_opt_var.get():
-            cmd.append("--fresh-opt")
-        if self.finetune_dec_var.get():
-            cmd.append("--finetune-decoder")
-        self.runner.run(cmd, cwd=PROJECT_ROOT)
-
-    def stop(self):
-        stop_file = os.path.join(PROJECT_ROOT, "cpu_vae_refiner_logs", ".stop")
-        Path(stop_file).parent.mkdir(parents=True, exist_ok=True)
-        Path(stop_file).touch()
-
-    def kill(self):
-        self.runner.kill()
-
-
-# =============================================================================
-# Refiner Inference Tab
-# =============================================================================
-
-class RefinerInferTab(tk.Frame, PreviewWatcher):
-    def __init__(self, parent):
-        super().__init__(parent, bg=BG)
-        self._image_paths = []
-        self.build()
-
-    def build(self):
-        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
-        top.pack(fill="x", padx=5, pady=5)
-
-        tk.Label(top, text="Refiner: Inference", bg=BG_PANEL, fg=FG,
-                 font=FONT_TITLE).pack(anchor="w")
-        tk.Label(top, text="Shows GT | Raw decode | Refined decode.",
-                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
-                                                                 pady=(5, 10))
-
-        row1 = tk.Frame(top, bg=BG_PANEL)
-        row1.pack(fill="x", pady=(5, 0))
-        f, self.refiner_ckpt = make_float(row1, "Refiner checkpoint (fused)",
-            os.path.join(PROJECT_ROOT, "cpu_vae_refiner_logs", "latest.pt"),
-            width=50)
-        f.pack(side="left", fill="x", expand=True)
-
-        row3 = tk.Frame(top, bg=BG_PANEL)
-        row3.pack(fill="x", pady=(5, 0))
-        f, self.H_var = make_spin(row3, "H", default=360)
-        f.pack(side="left", padx=(0, 10))
-        f, self.W_var = make_spin(row3, "W", default=640)
-        f.pack(side="left", padx=(0, 10))
-        f, self.prec_var = make_float(row3, "Precision", "bf16")
-        f.pack(side="left")
-
-        # Image browse
-        row4 = tk.Frame(top, bg=BG_PANEL)
-        row4.pack(fill="x", pady=(5, 0))
-        self.files_label = tk.Label(row4,
-            text="Images: (none — will use synthetic)",
-            bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL)
-        self.files_label.pack(side="left", fill="x", expand=True)
-
-        btn = tk.Frame(top, bg=BG_PANEL)
-        btn.pack(fill="x", pady=(10, 0))
-        make_btn(btn, "Browse", self.browse_images, ACCENT).pack(
-            side="left", padx=(0, 5))
-        make_btn(btn, "Clear", self.clear_images, BLUE).pack(
-            side="left", padx=(0, 5))
-        make_btn(btn, "Run", self.run_infer, GREEN).pack(side="left")
-
-        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
-                           insertbackground=FG, height=6, wrap=tk.WORD,
-                           borderwidth=0, highlightthickness=0)
-        self.log.pack(fill="x", side="bottom", padx=5, pady=5)
-
-        self.preview_label = tk.Label(self, bg=BG)
-        self.preview_label.pack(fill="both", expand=True, pady=5)
-
-        self.runner = ProcRunner(self.log)
-        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_refiner_logs"),
-                          self.preview_label)
-
-    def browse_images(self):
-        paths = filedialog.askopenfilenames(
-            title="Select images",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
-                       ("All files", "*.*")])
-        if paths:
-            self._image_paths = list(paths)
-            names = [os.path.basename(p) for p in self._image_paths]
-            display = ", ".join(names[:4])
-            if len(names) > 4:
-                display += f" (+{len(names)-4} more)"
-            self.files_label.config(text=f"Images: {display}")
-
-    def clear_images(self):
-        self._image_paths = []
-        self.files_label.config(text="Images: (none — will use synthetic)")
-
-    def run_infer(self):
-        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer_refiner",
-               "--refiner-ckpt", self.refiner_ckpt.get(),
-               "--H", str(self.H_var.get()),
-               "--W", str(self.W_var.get()),
-               "--precision", self.prec_var.get()]
-        self.runner.run(cmd, cwd=PROJECT_ROOT)
-
 
 def main():
     root = tk.Tk()
@@ -1585,14 +804,10 @@ def main():
     nb = ttk.Notebook(root, style="Dark.TNotebook")
     nb.pack(fill="both", expand=True, padx=5, pady=5)
 
-    nb.add(UnrolledTrainTab(nb), text="S1 Train")
-    nb.add(UnrolledInferTab(nb), text="S1 Infer")
-    nb.add(Stage15TrainTab(nb), text="S1.5 Train")
-    nb.add(Stage15InferTab(nb), text="S1.5 Infer")
-    nb.add(RefinerTrainTab(nb), text="Refiner Train")
-    nb.add(RefinerInferTab(nb), text="Refiner Infer")
-    nb.add(Stage2TrainTab(nb), text="S2 Train")
-    nb.add(Stage2InferTab(nb), text="S2 Infer")
+    nb.add(S1TrainTab(nb), text="S1 Train")
+    nb.add(RefinerTrainTab(nb), text="Refiner")
+    nb.add(S2TrainTab(nb), text="S2 Train")
+    nb.add(InferenceTab(nb), text="Inference")
 
     root.mainloop()
 

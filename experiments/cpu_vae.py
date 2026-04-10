@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
-"""CPU VAE experiment — patch-based encoder/decoder with no Conv2d.
+"""CPU VAE experiment -- unified pipeline with cascaded stages.
 
-Stage 1: Train PatchVAE end-to-end (Unfold+Linear encoder, Linear+Fold decoder).
-Stage 2: Freeze PatchVAE, train FlattenDeflatten bottleneck in latent space.
+Pipeline stages:
+  s1:       Train UnrolledPatchVAE (fresh | resume | extend)
+  refiner:  Train LatentRefiner on frozen pipeline
+  s2:       Train FlattenDeflatten on frozen pipeline
+  infer:    Unified inference with timing
 
-No spatial convolutions anywhere — entire pipeline is CPU-friendly.
+No spatial convolutions in the encoder/decoder -- entire pipeline is
+CPU-friendly (patch-based unfold/fold + linear layers).
 
 Usage:
-    # Stage 1: train patch encoder/decoder
-    python -m experiments.cpu_vae stage1
+    # Train first stage from scratch
+    python -m experiments.cpu_vae s1 --mode fresh
 
-    # Stage 2: train flatten bottleneck on frozen patch VAE
-    python -m experiments.cpu_vae stage2 --patch-ckpt cpu_vae_logs/latest.pt
+    # Resume training
+    python -m experiments.cpu_vae s1 --mode resume --input-ckpt pipeline.pt
 
-    # Stage 1 inference
-    python -m experiments.cpu_vae infer1 --patch-ckpt cpu_vae_logs/latest.pt
+    # Extend with second spatial compression stage
+    python -m experiments.cpu_vae s1 --mode extend --input-ckpt pipeline.pt
 
-    # Stage 2 inference
-    python -m experiments.cpu_vae infer2 --patch-ckpt cpu_vae_logs/latest.pt \
-        --flatten-ckpt cpu_vae_flatten_logs/latest.pt
+    # Train refiner
+    python -m experiments.cpu_vae refiner --input-ckpt pipeline.pt
+
+    # Train flatten bottleneck
+    python -m experiments.cpu_vae s2 --input-ckpt pipeline.pt
+
+    # Unified inference
+    python -m experiments.cpu_vae infer --ckpt pipeline.pt
 """
 
 import argparse
@@ -204,7 +213,7 @@ class PatchVAE(nn.Module):
 
 
 class UnrolledPatchVAE(nn.Module):
-    """Unrolled patch VAE — sub-patch pixel structure with positional encoding.
+    """Unrolled patch VAE -- sub-patch pixel structure with positional encoding.
 
     Instead of treating each patch as an opaque 192-dim vector, this model:
       1. Unrolls each 8x8 patch into a line of 64 pixels
@@ -217,8 +226,8 @@ class UnrolledPatchVAE(nn.Module):
     The encoder knows sub-patch spatial structure explicitly rather than
     learning it implicitly through a single linear projection.
 
-    All operations are batched across patches — no per-patch loops.
-    Fully CPU-friendly — no Conv2d anywhere.
+    All operations are batched across patches -- no per-patch loops.
+    Fully CPU-friendly -- no Conv2d anywhere.
 
     Args:
         patch_size: spatial patch size (default 8 for 8x compression)
@@ -484,7 +493,7 @@ class LatentRefiner(nn.Module):
 
     Takes a spatial latent (B, C, H, W), serializes via walk order,
     runs residual Conv1d blocks for cross-position mixing, reshapes back.
-    Same input/output shape — no dimensionality change.
+    Same input/output shape -- no dimensionality change.
 
     Smooths patch boundary artifacts by mixing neighboring latent positions.
 
@@ -597,7 +606,7 @@ class LatentRefiner(nn.Module):
             latent: (B, C, H, W)
 
         Returns:
-            refined: (B, C, H, W) — same shape, smoothed
+            refined: (B, C, H, W) -- same shape, smoothed
         """
         B, C, H, W = latent.shape
         # Flatten to 1D sequence
@@ -649,28 +658,6 @@ def _make_model(model_type, patch_size=8, overlap=0, image_channels=3,
         )
 
 
-def _load_model(ckpt_path, device="cpu"):
-    """Load PatchVAE or UnrolledPatchVAE from checkpoint."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = ckpt.get("config", {})
-    model_type = cfg.get("model_type", "patch")
-
-    model = _make_model(
-        model_type=model_type,
-        patch_size=cfg.get("patch_size", 8),
-        overlap=cfg.get("overlap", 0),
-        image_channels=cfg.get("image_channels", 3),
-        latent_channels=cfg.get("latent_channels", 32),
-        hidden_dim=cfg.get("hidden_dim", 0),
-        inner_dim=cfg.get("inner_dim", 64),
-        post_kernel=cfg.get("post_kernel", 0),
-    ).to(device)
-
-    src_sd = ckpt["model"] if "model" in ckpt else ckpt
-    model.load_state_dict(src_sd)
-    return model, ckpt, cfg
-
-
 # =============================================================================
 # Image loading helper
 # =============================================================================
@@ -692,16 +679,260 @@ def load_real_images(paths, H, W, device="cpu"):
 
 
 # =============================================================================
+# Signal handling
+# =============================================================================
+
+_stop_requested = False
+
+def _handle_stop(sig, frame):
+    global _stop_requested
+    _stop_requested = True
+    print("\n[Stop requested]", flush=True)
+
+signal.signal(signal.SIGTERM, _handle_stop)
+signal.signal(signal.SIGINT, _handle_stop)
+if sys.platform == "win32":
+    signal.signal(signal.SIGBREAK, _handle_stop)
+
+
+# =============================================================================
+# Unified pipeline: load / save / convert
+# =============================================================================
+
+def _convert_legacy(ckpt):
+    """Convert old checkpoint formats to unified pipeline format.
+
+    Handles:
+    - Stage 1 checkpoints (just a single model with 'model' key)
+    - Stage 1.5 fused checkpoints (s1_model + model keys)
+    - Refiner checkpoints (s1_model + optional s1_5_model + refiner)
+
+    Returns a unified pipeline checkpoint dict.
+    """
+    # Already in pipeline format
+    if "pipeline" in ckpt:
+        return ckpt
+
+    pipeline_stages = []
+    image_size = (ckpt.get("config", {}).get("H", 360),
+                  ckpt.get("config", {}).get("W", 640))
+
+    # Check if this is a refiner checkpoint
+    if "refiner" in ckpt:
+        # Has upstream S1
+        if "s1_model" in ckpt:
+            s1_cfg = ckpt["s1_config"]
+            pipeline_stages.append({
+                "type": s1_cfg.get("model_type", "unrolled"),
+                "config": s1_cfg,
+                "state_dict": ckpt["s1_model"],
+            })
+        # Has upstream S1.5
+        if "s1_5_model" in ckpt:
+            s1_5_cfg = ckpt["s1_5_config"]
+            pipeline_stages.append({
+                "type": s1_5_cfg.get("model_type", "unrolled"),
+                "config": s1_5_cfg,
+                "state_dict": ckpt["s1_5_model"],
+            })
+        # Refiner itself
+        rcfg = ckpt.get("config", {})
+        pipeline_stages.append({
+            "type": "refiner",
+            "config": rcfg,
+            "state_dict": ckpt["refiner"],
+        })
+        active_stage = len(pipeline_stages) - 1
+
+    # Check if this is an S1.5 fused checkpoint
+    elif "s1_model" in ckpt and "model" in ckpt:
+        s1_cfg = ckpt["s1_config"]
+        pipeline_stages.append({
+            "type": s1_cfg.get("model_type", "unrolled"),
+            "config": s1_cfg,
+            "state_dict": ckpt["s1_model"],
+        })
+        s1_5_cfg = ckpt.get("config", {})
+        pipeline_stages.append({
+            "type": s1_5_cfg.get("model_type", "unrolled"),
+            "config": s1_5_cfg,
+            "state_dict": ckpt["model"],
+        })
+        active_stage = 1
+
+    # Check if this is a stage 2 (flatten) checkpoint
+    elif "bottleneck" in ckpt:
+        # Need to know patch_ckpt path -- can't load it, just store config
+        fcfg = ckpt.get("config", {})
+        pipeline_stages.append({
+            "type": "flatten",
+            "config": fcfg,
+            "state_dict": ckpt["bottleneck"],
+        })
+        active_stage = 0
+
+    # Plain S1 checkpoint
+    elif "model" in ckpt:
+        cfg = ckpt.get("config", {})
+        pipeline_stages.append({
+            "type": cfg.get("model_type", "unrolled"),
+            "config": cfg,
+            "state_dict": ckpt["model"],
+        })
+        active_stage = 0
+
+    else:
+        raise ValueError("Unrecognized checkpoint format")
+
+    return {
+        "format_version": 2,
+        "pipeline": pipeline_stages,
+        "active_stage": active_stage,
+        "image_size": image_size,
+        "global_step": ckpt.get("global_step", ckpt.get("step", 0)),
+        "optimizer": ckpt.get("optimizer"),
+        "scheduler": ckpt.get("scheduler"),
+        "scaler": ckpt.get("scaler"),
+    }
+
+
+def _load_pipeline(ckpt_path, device):
+    """Load unified pipeline from checkpoint.
+
+    Returns (models_list, encode_fn, decode_fn, spatial_sizes, ckpt)
+    where:
+        models_list: list of (type_str, model, config) tuples
+        encode_fn: chains all stages' encode
+        decode_fn: chains all stages' decode in reverse
+        spatial_sizes: list of (H, W) at each level (index 0 = image size)
+        ckpt: the raw (possibly converted) checkpoint dict
+    """
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = _convert_legacy(raw)
+
+    pipeline_stages = ckpt["pipeline"]
+    image_size = ckpt.get("image_size", (360, 640))
+
+    models_list = []
+    for stage in pipeline_stages:
+        stype = stage["type"]
+        cfg = stage["config"]
+        sd = stage["state_dict"]
+
+        if stype in ("unrolled", "patch"):
+            model = _make_model(
+                model_type=stype,
+                patch_size=cfg.get("patch_size", 8),
+                overlap=cfg.get("overlap", 0),
+                image_channels=cfg.get("image_channels", 3),
+                latent_channels=cfg.get("latent_channels", 32),
+                hidden_dim=cfg.get("hidden_dim", 0),
+                inner_dim=cfg.get("inner_dim", 64),
+                post_kernel=cfg.get("post_kernel", 0),
+            ).to(device)
+            model.load_state_dict(sd)
+            models_list.append((stype, model, cfg))
+
+        elif stype == "refiner":
+            model = LatentRefiner(
+                latent_channels=cfg.get("latent_channels", 3),
+                spatial_h=cfg.get("spatial_h", 36),
+                spatial_w=cfg.get("spatial_w", 64),
+                n_blocks=cfg.get("n_blocks", 4),
+                hidden_channels=cfg.get("hidden_channels", 0),
+                kernel_size=cfg.get("kernel_size", 5),
+                walk_order=cfg.get("walk_order", "hilbert"),
+                dropout=cfg.get("dropout", 0.0),
+            ).to(device)
+            model.load_state_dict(sd)
+            models_list.append(("refiner", model, cfg))
+
+        elif stype == "flatten":
+            model = FlattenDeflatten(
+                latent_channels=cfg.get("latent_channels", 32),
+                bottleneck_channels=cfg.get("bottleneck_channels", 6),
+                spatial_h=cfg.get("spatial_h", 45),
+                spatial_w=cfg.get("spatial_w", 80),
+                walk_order=cfg.get("walk_order", "raster"),
+                kernel_size=cfg.get("kernel_size", 1),
+                deflatten_hidden=cfg.get("deflatten_hidden", 0),
+            ).to(device)
+            model.load_state_dict(sd)
+            models_list.append(("flatten", model, cfg))
+
+    # Compute spatial sizes at each level
+    sizes = [image_size]
+    for model_type, model, cfg in models_list:
+        if model_type in ("unrolled", "patch"):
+            pH, pW = model._patch_grid_size(sizes[-1][0], sizes[-1][1])
+            sizes.append((pH, pW))
+        elif model_type == "refiner":
+            sizes.append(sizes[-1])
+        elif model_type == "flatten":
+            sizes.append(sizes[-1])
+
+    # Build encode_fn
+    def encode_fn(x):
+        for model_type, model, cfg in models_list:
+            if model_type in ("unrolled", "patch"):
+                x = model.encode(x)
+            elif model_type == "refiner":
+                x = model(x)
+            elif model_type == "flatten":
+                x = model.flatten(x)
+        return x
+
+    # Build decode_fn
+    def decode_fn(x):
+        for i in range(len(models_list) - 1, -1, -1):
+            model_type, model, cfg = models_list[i]
+            if model_type in ("unrolled", "patch"):
+                x = model.decode(x, original_size=sizes[i])
+            elif model_type == "refiner":
+                x = model(x)
+            elif model_type == "flatten":
+                x = model.deflatten(x)
+        return x
+
+    return models_list, encode_fn, decode_fn, sizes, ckpt
+
+
+def _make_pipeline_checkpoint(models_list, active_stage, image_size,
+                              opt, sched, scaler, global_step):
+    """Serialize full pipeline to checkpoint dict."""
+    pipeline_stages = []
+    for model_type, model, cfg in models_list:
+        pipeline_stages.append({
+            "type": model_type,
+            "config": cfg,
+            "state_dict": model.state_dict(),
+        })
+
+    ckpt = {
+        "pipeline": pipeline_stages,
+        "active_stage": active_stage,
+        "image_size": image_size,
+        "global_step": global_step,
+        "optimizer": opt.state_dict() if opt is not None else None,
+        "scheduler": sched.state_dict() if sched is not None else None,
+        "scaler": scaler.state_dict() if scaler is not None else None,
+    }
+    return ckpt
+
+
+# =============================================================================
 # Preview helpers
 # =============================================================================
 
 @torch.no_grad()
-def save_preview_stage1(model, gen, logdir, step, device, amp_dtype,
-                        preview_image=None):
-    """Save GT | Recon grid as PNG. If preview_image path is set, render
-    a large reference GT|Recon row above the synthetic strip."""
+def save_preview_pipeline(encode_fn, decode_fn, gen, logdir, step, device,
+                          amp_dtype, preview_image=None):
+    """Save GT | Full Decode preview.
+
+    If preview_image is set, render a large reference GT|Decode row above
+    a smaller synthetic sample row.
+    """
     try:
-        model.eval()
         from PIL import Image
 
         H, W = gen.H, gen.W
@@ -711,7 +942,8 @@ def save_preview_stage1(model, gen, logdir, step, device, amp_dtype,
         if preview_image and os.path.exists(preview_image):
             ref = load_real_image(preview_image, H, W, device)
             with torch.amp.autocast(device.type, dtype=amp_dtype):
-                ref_recon, _ = model(ref)
+                lat = encode_fn(ref)
+                ref_recon = decode_fn(lat)
             ref_gt = ref[0].cpu().numpy().transpose(1, 2, 0)
             ref_rc = ref_recon[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0)
             ref_gt = (ref_gt * 255).clip(0, 255).astype(np.uint8)
@@ -719,18 +951,19 @@ def save_preview_stage1(model, gen, logdir, step, device, amp_dtype,
             sep_v = np.full((H, 4, 3), 14, dtype=np.uint8)
             ref_row = np.concatenate([ref_gt, sep_v, ref_rc], axis=1)
             sections.append(ref_row)
-            del ref, ref_recon
+            del ref, lat, ref_recon
 
         # -- Synthetic strip (small, bottom) --
         images = gen.generate(8)
         x = images.to(device)
 
         with torch.amp.autocast(device.type, dtype=amp_dtype):
-            recon, _ = model(x)
+            lat = encode_fn(x)
+            recon = decode_fn(lat)
 
         rc = recon[:, :3].clamp(0, 1).float().cpu().numpy()
         gt = images.cpu().numpy()
-        del recon, x
+        del recon, x, lat
 
         cols, rows = 4, 2
         sep = 4
@@ -751,7 +984,6 @@ def save_preview_stage1(model, gen, logdir, step, device, amp_dtype,
         # -- Combine --
         if len(sections) > 1:
             syn_w = sections[1].shape[1]
-            # Scale reference row to match synthetic grid width (centered)
             ref_h, ref_w = sections[0].shape[:2]
             from PIL import Image as _PILImg
             ref_pil = _PILImg.fromarray(sections[0])
@@ -764,8 +996,6 @@ def save_preview_stage1(model, gen, logdir, step, device, amp_dtype,
         else:
             grid = sections[0]
 
-        model.train()
-
         stepped = os.path.join(logdir, f"preview_{step:06d}.png")
         latest = os.path.join(logdir, "preview_latest.png")
         Image.fromarray(grid).save(stepped)
@@ -775,186 +1005,13 @@ def save_preview_stage1(model, gen, logdir, step, device, amp_dtype,
         import traceback
         print(f"  preview failed: {e}", flush=True)
         traceback.print_exc()
-        model.train()
-
-
-@torch.no_grad()
-def save_preview_stage2(patch_vae, bottleneck, gen, logdir, step, device,
-                        amp_dtype, preview_image=None):
-    """Save GT | PatchVAE | PatchVAE+Flatten comparison. If preview_image
-    is set, render a reference row above the synthetic strip."""
-    try:
-        patch_vae.eval()
-        bottleneck.eval()
-        from PIL import Image
-
-        H, W = gen.H, gen.W
-        sep = np.full((H, 4, 3), 14, dtype=np.uint8)
-        sections = []
-
-        # -- Reference image (large, top) --
-        if preview_image and os.path.exists(preview_image):
-            ref = load_real_image(preview_image, H, W, device)
-            with torch.amp.autocast(device.type, dtype=amp_dtype):
-                ref_lat = patch_vae.encode(ref)
-                ref_vae = patch_vae.decode(ref_lat, original_size=(H, W))
-                ref_lat_r, _ = bottleneck(ref_lat)
-                ref_flat = patch_vae.decode(ref_lat_r, original_size=(H, W))
-            rg = (ref[0].cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            rv = (ref_vae[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            rf = (ref_flat[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            ref_row = np.concatenate([rg, sep, rv, sep, rf], axis=1)
-            sections.append(ref_row)
-            del ref, ref_lat, ref_vae, ref_lat_r, ref_flat
-
-        # -- Synthetic strip (single row: GT | Encoder | Flatten) --
-        images = gen.generate(1)
-        x = images.to(device)
-
-        H_orig, W_orig = x.shape[2], x.shape[3]
-        with torch.amp.autocast(device.type, dtype=amp_dtype):
-            latent = patch_vae.encode(x)
-            recon_vae = patch_vae.decode(latent, original_size=(H_orig, W_orig))
-            lat_recon, _ = bottleneck(latent)
-            recon_flat = patch_vae.decode(lat_recon, original_size=(H_orig, W_orig))
-
-        g = (images[0].cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-        v = (recon_vae[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-        f = (recon_flat[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-        del recon_vae, recon_flat, latent, lat_recon
-
-        synth_row = np.concatenate([g, sep, v, sep, f], axis=1)
-        sections.append(synth_row)
-
-        # -- Combine: reference at native size, synthetic scaled to half --
-        if len(sections) > 1:
-            ref_w = sections[0].shape[1]
-            # Scale synthetic strip to match reference width, half height
-            from PIL import Image as _PILImg
-            syn_pil = _PILImg.fromarray(sections[1])
-            syn_scale = ref_w / sections[1].shape[1]
-            syn_h = int(sections[1].shape[0] * syn_scale * 0.5)
-            syn_pil = syn_pil.resize((ref_w, syn_h), _PILImg.BILINEAR)
-            sections[1] = np.array(syn_pil)
-            gap = np.full((6, ref_w, 3), 14, dtype=np.uint8)
-            grid = np.concatenate([sections[0], gap, sections[1]], axis=0)
-        else:
-            grid = sections[0]
-
-        bottleneck.train()
-
-        stepped = os.path.join(logdir, f"preview_{step:06d}.png")
-        latest = os.path.join(logdir, "preview_latest.png")
-        Image.fromarray(grid).save(stepped)
-        Image.fromarray(grid).save(latest)
-        print(f"  preview: {stepped} (GT | Encoder | Flatten)", flush=True)
-    except Exception as e:
-        import traceback
-        print(f"  preview failed: {e}", flush=True)
-        traceback.print_exc()
-        bottleneck.train()
-
-
-@torch.no_grad()
-def save_real_preview_stage1(model, image_paths, H, W, logdir, device,
-                             amp_dtype):
-    """Load real images, encode/decode, save GT | Recon grid."""
-    try:
-        model.eval()
-        x = load_real_images(image_paths, H, W, device)
-
-        with torch.amp.autocast(device.type, dtype=amp_dtype):
-            recon, _ = model(x)
-
-        rc = recon[:, :3].clamp(0, 1).float().cpu().numpy()
-        gt = x.cpu().numpy()
-
-        from PIL import Image as PILImage
-        sep = np.full((H, 4, 3), 14, dtype=np.uint8)
-        rows = []
-        for i in range(len(gt)):
-            g = (gt[i].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            r = (rc[i].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            rows.append(np.concatenate([g, sep, r], axis=1))
-
-        gap = np.full((4, rows[0].shape[1], 3), 14, dtype=np.uint8)
-        grid = np.concatenate(sum([[r, gap] for r in rows], [])[:-1], axis=0)
-
-        out = os.path.join(logdir, "real_preview_latest.png")
-        PILImage.fromarray(grid).save(out)
-        print(f"  real preview: {out} (GT | Recon)", flush=True)
-        return out
-    except Exception as e:
-        import traceback
-        print(f"  real preview failed: {e}", flush=True)
-        traceback.print_exc()
-        return None
-
-
-@torch.no_grad()
-def save_real_preview_stage2(patch_vae, bottleneck, image_paths, H, W,
-                             logdir, device, amp_dtype):
-    """Load real images, encode through full pipeline, save comparison."""
-    try:
-        patch_vae.eval()
-        bottleneck.eval()
-        x = load_real_images(image_paths, H, W, device)
-
-        with torch.amp.autocast(device.type, dtype=amp_dtype):
-            latent = patch_vae.encode(x)
-            recon_vae = patch_vae.decode(latent, original_size=(H, W))
-            lat_recon, _ = bottleneck(latent)
-            recon_flat = patch_vae.decode(lat_recon, original_size=(H, W))
-
-        gt = x.cpu().numpy()
-        rc_vae = recon_vae[:, :3].clamp(0, 1).float().cpu().numpy()
-        rc_flat = recon_flat[:, :3].clamp(0, 1).float().cpu().numpy()
-
-        from PIL import Image as PILImage
-        sep = np.full((H, 4, 3), 14, dtype=np.uint8)
-        rows = []
-        for i in range(len(gt)):
-            g = (gt[i].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            v = (rc_vae[i].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            f = (rc_flat[i].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            rows.append(np.concatenate([g, sep, v, sep, f], axis=1))
-
-        gap = np.full((4, rows[0].shape[1], 3), 14, dtype=np.uint8)
-        grid = np.concatenate(sum([[r, gap] for r in rows], [])[:-1], axis=0)
-
-        out = os.path.join(logdir, "real_preview_latest.png")
-        PILImage.fromarray(grid).save(out)
-        print(f"  real preview: {out} (GT | Encoder | Flatten)", flush=True)
-        return out
-    except Exception as e:
-        import traceback
-        print(f"  real preview failed: {e}", flush=True)
-        traceback.print_exc()
-        return None
 
 
 # =============================================================================
-# Signal handling
+# train_s1: fresh | resume | extend
 # =============================================================================
 
-_stop_requested = False
-
-def _handle_stop(sig, frame):
-    global _stop_requested
-    _stop_requested = True
-    print("\n[Stop requested]", flush=True)
-
-signal.signal(signal.SIGTERM, _handle_stop)
-signal.signal(signal.SIGINT, _handle_stop)
-if sys.platform == "win32":
-    signal.signal(signal.SIGBREAK, _handle_stop)
-
-
-# =============================================================================
-# Stage 1: Train PatchVAE
-# =============================================================================
-
-def train_stage1(args):
+def train_s1(args):
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -962,43 +1019,189 @@ def train_stage1(args):
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    # -- Model --
-    latent_ch = args.latent_ch
-    hidden_dim = args.hidden_dim
-    inner_dim = args.inner_dim
-    overlap = args.overlap
-    post_kernel = args.post_kernel
-    model_type = args.model_type
-    if args.resume:
-        _peek = torch.load(args.resume, map_location="cpu", weights_only=False)
-        _cfg = _peek.get("config", {})
-        latent_ch = _cfg.get("latent_channels", latent_ch)
-        hidden_dim = _cfg.get("hidden_dim", hidden_dim)
-        inner_dim = _cfg.get("inner_dim", inner_dim)
-        overlap = _cfg.get("overlap", overlap)
-        post_kernel = _cfg.get("post_kernel", post_kernel)
-        model_type = _cfg.get("model_type", model_type)
-        del _peek
+    mode = args.mode  # fresh | resume | extend
+    image_size = (args.H, args.W)
 
-    model = _make_model(
-        model_type=model_type,
-        patch_size=args.patch_size,
-        overlap=overlap,
-        image_channels=3,
-        latent_channels=latent_ch,
-        hidden_dim=hidden_dim,
-        inner_dim=inner_dim,
-        post_kernel=post_kernel,
-    ).to(device)
+    # ---- Build pipeline ----
+    models_list = []
+    upstream_encode_fn = None
+    upstream_decode_fn = None
+    spatial_sizes = [image_size]
+    global_step = 0
+    loaded_opt = None
+    loaded_sched = None
+    loaded_scaler = None
 
-    pc = model.param_count()
-    mb = sum(p.numel() * 4 for p in model.parameters()) / 1024 / 1024
-    type_label = "UnrolledPatchVAE" if model_type == "unrolled" else "PatchVAE"
-    extra = f"inner={inner_dim}" if model_type == "unrolled" else f"hidden={hidden_dim}"
-    ovl = f", overlap={overlap}" if overlap > 0 else ""
-    pk = f", post_kernel={post_kernel}" if post_kernel > 0 else ""
-    print(f"{type_label}: patch={args.patch_size}, latent={latent_ch}, "
-          f"{extra}{ovl}{pk}, {pc['total']:,} params, {mb:.1f}MB")
+    if mode in ("resume", "extend"):
+        if not args.input_ckpt:
+            raise ValueError(f"--input-ckpt required for mode={mode}")
+        print(f"Loading pipeline from {args.input_ckpt}...")
+        models_list, upstream_encode_fn, upstream_decode_fn, spatial_sizes, ckpt = \
+            _load_pipeline(args.input_ckpt, device)
+        global_step = ckpt.get("global_step", 0)
+        loaded_opt = ckpt.get("optimizer")
+        loaded_sched = ckpt.get("scheduler")
+        loaded_scaler = ckpt.get("scaler")
+
+        # Print loaded pipeline
+        for i, (mt, m, c) in enumerate(models_list):
+            if mt in ("unrolled", "patch"):
+                pc = m.param_count()["total"]
+            elif mt == "refiner":
+                pc = m.param_count()
+            else:
+                pc = m.param_count()
+            print(f"  Stage {i}: {mt}, {pc:,} params, "
+                  f"spatial {spatial_sizes[i]} -> {spatial_sizes[i+1]}")
+
+    if mode == "fresh":
+        # Create new model operating on images (image_channels=3)
+        active_model = _make_model(
+            model_type=args.model_type,
+            patch_size=args.patch_size,
+            overlap=args.overlap,
+            image_channels=3,
+            latent_channels=args.latent_ch,
+            hidden_dim=args.hidden_dim,
+            inner_dim=args.inner_dim,
+            post_kernel=args.post_kernel,
+        ).to(device)
+
+        active_cfg = {
+            "model_type": args.model_type,
+            "patch_size": args.patch_size,
+            "overlap": args.overlap,
+            "image_channels": 3,
+            "latent_channels": args.latent_ch,
+            "hidden_dim": args.hidden_dim,
+            "inner_dim": args.inner_dim,
+            "post_kernel": args.post_kernel,
+            "H": args.H,
+            "W": args.W,
+        }
+        models_list = [(args.model_type, active_model, active_cfg)]
+        active_stage = 0
+        pH, pW = active_model._patch_grid_size(args.H, args.W)
+        spatial_sizes = [image_size, (pH, pW)]
+
+    elif mode == "resume":
+        # Unfreeze the active stage and continue training
+        active_stage = ckpt.get("active_stage", len(models_list) - 1)
+        _mt, active_model, active_cfg = models_list[active_stage]
+        active_model.requires_grad_(True)
+        active_model.train()
+        # Freeze everything else
+        for i, (mt, m, c) in enumerate(models_list):
+            if i != active_stage:
+                m.eval()
+                m.requires_grad_(False)
+
+    elif mode == "extend":
+        # Freeze all existing, create NEW stage
+        for mt, m, c in models_list:
+            m.eval()
+            m.requires_grad_(False)
+
+        # The new stage's input channels = last stage's latent channels
+        last_mt, last_model, last_cfg = models_list[-1]
+        if last_mt in ("unrolled", "patch"):
+            input_ch = last_model.latent_channels
+        elif last_mt == "refiner":
+            input_ch = last_cfg.get("latent_channels", 3)
+        elif last_mt == "flatten":
+            input_ch = last_cfg.get("bottleneck_channels", 6)
+        else:
+            input_ch = 3
+
+        active_model = _make_model(
+            model_type="unrolled",
+            patch_size=args.patch_size,
+            overlap=args.overlap,
+            image_channels=input_ch,
+            latent_channels=args.latent_ch,
+            hidden_dim=args.hidden_dim,
+            inner_dim=args.inner_dim,
+            post_kernel=args.post_kernel,
+        ).to(device)
+
+        active_cfg = {
+            "model_type": "unrolled",
+            "patch_size": args.patch_size,
+            "overlap": args.overlap,
+            "image_channels": input_ch,
+            "latent_channels": args.latent_ch,
+            "hidden_dim": args.hidden_dim,
+            "inner_dim": args.inner_dim,
+            "post_kernel": args.post_kernel,
+            "H": args.H,
+            "W": args.W,
+        }
+
+        active_stage = len(models_list)
+        models_list.append(("unrolled", active_model, active_cfg))
+        pH, pW = active_model._patch_grid_size(
+            spatial_sizes[-1][0], spatial_sizes[-1][1])
+        spatial_sizes.append((pH, pW))
+
+        # Build upstream encode/decode (everything before active stage)
+        upstream_models = models_list[:active_stage]
+        upstream_sizes = spatial_sizes[:active_stage + 1]
+
+        def _upstream_encode(x):
+            for mt, m, c in upstream_models:
+                if mt in ("unrolled", "patch"):
+                    x = m.encode(x)
+                elif mt == "refiner":
+                    x = m(x)
+                elif mt == "flatten":
+                    x = m.flatten(x)
+            return x
+
+        def _upstream_decode(x):
+            for i in range(len(upstream_models) - 1, -1, -1):
+                mt, m, c = upstream_models[i]
+                if mt in ("unrolled", "patch"):
+                    x = m.decode(x, original_size=upstream_sizes[i])
+                elif mt == "refiner":
+                    x = m(x)
+                elif mt == "flatten":
+                    x = m.deflatten(x)
+            return x
+
+        upstream_encode_fn = _upstream_encode
+        upstream_decode_fn = _upstream_decode
+
+        # Reset step for new stage
+        global_step = 0
+        loaded_opt = None
+        loaded_sched = None
+        loaded_scaler = None
+
+    # Print active model info
+    pc = active_model.param_count()
+    if isinstance(pc, dict):
+        total_params = pc["total"]
+    else:
+        total_params = pc
+    mb = sum(p.numel() * 4 for p in active_model.parameters()) / 1024 / 1024
+    print(f"Active stage {active_stage}: {total_params:,} params, {mb:.1f}MB")
+    print(f"  Pipeline: {len(models_list)} stages, "
+          f"spatial {spatial_sizes[0]} -> {spatial_sizes[-1]}")
+    total_dims = 1
+    for d in spatial_sizes[-1]:
+        total_dims *= d
+    if len(models_list) > 0:
+        mt, m, c = models_list[-1]
+        if mt in ("unrolled", "patch"):
+            lat_ch = m.latent_channels
+        elif mt == "refiner":
+            lat_ch = c.get("latent_channels", 3)
+        elif mt == "flatten":
+            lat_ch = c.get("bottleneck_channels", 6)
+        else:
+            lat_ch = 3
+        print(f"  Final latent: {lat_ch}x{spatial_sizes[-1][0]}x{spatial_sizes[-1][1]} "
+              f"= {lat_ch * spatial_sizes[-1][0] * spatial_sizes[-1][1]} dims")
 
     # -- Generator --
     gen = VAEpp0rGenerator(
@@ -1022,40 +1225,28 @@ def train_stage1(args):
             print("WARNING: pip install lpips for perceptual loss")
 
     # -- Optimizer --
-    opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr),
+    opt = torch.optim.AdamW(active_model.parameters(), lr=float(args.lr),
                             weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01)
 
-    # -- Resume --
-    global_step = 0
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if "model" in ckpt:
-            strict = not args.loose_load
-            missing, unexpected = model.load_state_dict(ckpt["model"], strict=strict)
-            if missing:
-                print(f"  New layers (random init): {missing}")
-            if unexpected:
-                print(f"  Ignored keys: {unexpected}")
-            global_step = ckpt.get("global_step", 0)
-            if not args.fresh_opt and ckpt.get("optimizer"):
-                try:
-                    opt.load_state_dict(ckpt["optimizer"])
-                except Exception:
-                    print("  Fresh optimizer (mismatch)")
-            if ckpt.get("scheduler") and not args.fresh_opt:
-                sched.load_state_dict(ckpt["scheduler"])
-            else:
+    # Restore optimizer state for resume
+    if mode == "resume" and not args.fresh_opt:
+        if loaded_opt:
+            try:
+                opt.load_state_dict(loaded_opt)
+            except Exception:
+                print("  Fresh optimizer (mismatch)")
+        if loaded_sched:
+            try:
+                sched.load_state_dict(loaded_sched)
+            except Exception:
                 sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01,
-                    last_epoch=global_step)
-        else:
-            model.load_state_dict(ckpt)
-        print(f"Resumed from {args.resume} at step {global_step}")
+                    opt, T_max=args.total_steps,
+                    eta_min=float(args.lr) * 0.01, last_epoch=global_step)
 
     if args.fresh_opt and global_step > 0:
-        opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr),
+        opt = torch.optim.AdamW(active_model.parameters(), lr=float(args.lr),
                                 weight_decay=0.01)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=args.total_steps - global_step,
@@ -1066,42 +1257,59 @@ def train_stage1(args):
                  "fp32": torch.float32}[args.precision]
     scaler = torch.amp.GradScaler("cuda",
                                    enabled=(args.precision == "fp16"))
+    if mode == "resume" and loaded_scaler and not args.fresh_opt:
+        try:
+            scaler.load_state_dict(loaded_scaler)
+        except Exception:
+            pass
 
     accum = args.grad_accum
 
-    print(f"Steps: {args.total_steps}, LR: {args.lr}, Batch: {args.batch_size}"
+    print(f"Mode: {mode}, Steps: {args.total_steps}, LR: {args.lr}, "
+          f"Batch: {args.batch_size}"
           f"{f', accum={accum}' if accum > 1 else ''}")
-    print(f"Weights: mse={args.w_mse} lpips={args.w_lpips}")
+    print(f"Weights: mse={args.w_mse} lpips={args.w_lpips}"
+          f"{f' latent={args.w_latent} pixel={args.w_pixel}' if mode == 'extend' else ''}")
     print(f"Precision: {args.precision}, Device: {device}")
     print(flush=True)
 
-    def _make_checkpoint():
-        return {
-            "model": model.state_dict(),
-            "optimizer": opt.state_dict(),
-            "scheduler": sched.state_dict(),
-            "scaler": scaler.state_dict(),
-            "global_step": global_step,
-            "config": {
-                "model_type": model_type,
-                "patch_size": args.patch_size,
-                "overlap": overlap,
-                "latent_channels": latent_ch,
-                "hidden_dim": hidden_dim,
-                "inner_dim": inner_dim,
-                "post_kernel": post_kernel,
-                "image_channels": 3,
-                "H": args.H,
-                "W": args.W,
-            },
-        }
+    # Build full pipeline encode/decode for previews
+    all_sizes = spatial_sizes
+
+    def full_encode(x):
+        for mt, m, c in models_list:
+            if mt in ("unrolled", "patch"):
+                x = m.encode(x)
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.flatten(x)
+        return x
+
+    def full_decode(x):
+        for i in range(len(models_list) - 1, -1, -1):
+            mt, m, c = models_list[i]
+            if mt in ("unrolled", "patch"):
+                x = m.decode(x, original_size=all_sizes[i])
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.deflatten(x)
+        return x
+
+    def _make_ckpt():
+        return _make_pipeline_checkpoint(
+            models_list, active_stage, image_size,
+            opt, sched, scaler, global_step)
 
     # Initial preview
     preview_image = getattr(args, 'preview_image', None)
-    save_preview_stage1(model, gen, str(logdir), global_step, device, amp_dtype,
-                        preview_image=preview_image)
+    active_model.eval()
+    save_preview_pipeline(full_encode, full_decode, gen, str(logdir),
+                          global_step, device, amp_dtype,
+                          preview_image=preview_image)
 
-    # -- Loop --
+    # -- Training loop --
     t0 = time.time()
     start_step = global_step
     stop_file = logdir / ".stop"
@@ -1115,536 +1323,7 @@ def train_stage1(args):
             print("[Stop detected, saving...]", flush=True)
             break
 
-        model.train()
-        opt.zero_grad(set_to_none=True)
-        losses = {}
-
-        for _ai in range(accum):
-            images = gen.generate(args.batch_size)  # (B, 3, H, W)
-            x = images.to(device)
-
-            with torch.amp.autocast(device.type, dtype=amp_dtype):
-                recon, latent = model(x)
-
-                mse = F.mse_loss(recon, x)
-                total = args.w_mse * mse
-                losses["mse"] = losses.get("mse", 0) + mse.item() / accum
-
-                if lpips_fn is not None:
-                    rc_lp = recon[:, :3] * 2 - 1
-                    gt_lp = x[:, :3] * 2 - 1
-                    lp = lpips_fn(rc_lp, gt_lp).mean()
-                    total = total + args.w_lpips * lp
-                    losses["lpips"] = losses.get("lpips", 0) + lp.item() / accum
-
-            scaler.scale(total / accum).backward()
-            del recon, latent, images, x
-
-        scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(opt)
-        scaler.update()
-        sched.step()
-
-        global_step += 1
-
-        if global_step % args.log_every == 0:
-            el = time.time() - t0
-            steps_run = global_step - start_step
-            sps = steps_run / max(el, 1)
-            eta = (args.total_steps - global_step) / max(sps, 1e-6)
-            lr = opt.param_groups[0]["lr"]
-            ls = " ".join(f"{k}={v:.4f}" for k, v in losses.items())
-            eta_str = f"{eta/3600:.1f}h" if eta > 3600 else f"{eta/60:.0f}m"
-            print(f"[{global_step}/{args.total_steps}] {ls} "
-                  f"lr={lr:.1e} ({sps:.1f} step/s, {eta_str} left)", flush=True)
-
-        if global_step % args.preview_every == 0:
-            save_preview_stage1(model, gen, str(logdir), global_step,
-                                device, amp_dtype,
-                                preview_image=preview_image)
-
-        if global_step % args.save_every == 0:
-            d = _make_checkpoint()
-            p = logdir / f"step_{global_step:06d}.pt"
-            torch.save(d, p)
-            torch.save(d, logdir / "latest.pt")
-            print(f"  saved {p}", flush=True)
-
-            ckpts = sorted(logdir.glob("step_*.pt"),
-                           key=lambda x: x.stat().st_mtime)
-            while len(ckpts) > 10:
-                ckpts.pop(0).unlink()
-
-    # Save on exit
-    if global_step > start_step:
-        d = _make_checkpoint()
-        torch.save(d, logdir / f"step_{global_step:06d}.pt")
-        torch.save(d, logdir / "latest.pt")
-        print(f"  saved step {global_step}", flush=True)
-
-    print(f"\nDone. {global_step - start_step} steps in "
-          f"{(time.time() - t0) / 60:.1f}min", flush=True)
-
-
-# =============================================================================
-# Stage 2: Train FlattenDeflatten on frozen PatchVAE
-# =============================================================================
-
-def train_stage2(args):
-    device = torch.device(args.device)
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-
-    logdir = pathlib.Path(args.logdir)
-    logdir.mkdir(parents=True, exist_ok=True)
-
-    # -- Load frozen PatchVAE --
-    print(f"Loading encoder from {args.patch_ckpt}...")
-    patch_vae, ckpt, patch_cfg = _load_model(args.patch_ckpt, device)
-    patch_size = patch_cfg.get("patch_size", 8)
-    lat_ch = patch_cfg.get("latent_channels", 32)
-    model_type = patch_cfg.get("model_type", "patch")
-    patch_vae.eval()
-    patch_vae.requires_grad_(False)
-    type_label = "UnrolledPatchVAE" if model_type == "unrolled" else "PatchVAE"
-    print(f"  {type_label}: patch={patch_size}, latent={lat_ch}, frozen")
-
-    # Probe latent spatial dims (accounts for overlap/padding)
-    lat_H, lat_W = patch_vae._patch_grid_size(args.H, args.W)
-    print(f"  Latent: ({lat_ch}, {lat_H}, {lat_W}) = "
-          f"{lat_ch * lat_H * lat_W} values")
-    print(f"  Bottleneck: {args.bottleneck_ch}ch x {lat_H * lat_W} positions "
-          f"= {args.bottleneck_ch * lat_H * lat_W} flat values")
-    print(f"  Compression: {lat_ch / args.bottleneck_ch:.1f}:1 channel")
-
-    # -- Flatten/Deflatten bottleneck --
-    bottleneck = FlattenDeflatten(
-        latent_channels=lat_ch,
-        bottleneck_channels=args.bottleneck_ch,
-        spatial_h=lat_H, spatial_w=lat_W,
-        walk_order=args.walk_order,
-        kernel_size=args.kernel_size,
-        deflatten_hidden=args.deflatten_hidden,
-    ).to(device)
-    print(f"  Bottleneck: {bottleneck.param_count():,} params, "
-          f"walk={args.walk_order}")
-
-    # -- Generator --
-    gen = VAEpp0rGenerator(
-        height=args.H, width=args.W, device=str(device),
-        bank_size=5000, n_base_layers=128,
-    )
-    gen.build_banks()
-    gen.disco_quadrant = True
-    print(f"  Generator: bank=5000, layers=128, disco=True")
-
-    # -- Optimizer (bottleneck only) --
-    opt = torch.optim.AdamW(bottleneck.parameters(), lr=float(args.lr),
-                            weight_decay=0.01)
-
-    # -- Resume --
-    start_step = 0
-    if args.resume:
-        rk = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if "bottleneck" in rk:
-            bottleneck.load_state_dict(rk["bottleneck"])
-            start_step = rk.get("step", 0)
-            if rk.get("optimizer") and not args.fresh_opt:
-                try:
-                    opt.load_state_dict(rk["optimizer"])
-                except Exception:
-                    print("  Fresh optimizer (mismatch)")
-            print(f"  Resumed bottleneck from {args.resume} at step {start_step}")
-
-    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
-                 "fp32": torch.float32}[args.precision]
-    scaler = torch.amp.GradScaler("cuda",
-                                   enabled=(args.precision == "fp16"))
-
-    accum = args.grad_accum
-
-    print(f"Steps: {args.total_steps}, LR: {args.lr}, Batch: {args.batch_size}"
-          f"{f', accum={accum}' if accum > 1 else ''}")
-    print(flush=True)
-
-    def _make_checkpoint():
-        return {
-            "bottleneck": bottleneck.state_dict(),
-            "optimizer": opt.state_dict(),
-            "step": step,
-            "config": {
-                "latent_channels": lat_ch,
-                "bottleneck_channels": args.bottleneck_ch,
-                "spatial_h": lat_H,
-                "spatial_w": lat_W,
-                "walk_order": args.walk_order,
-                "kernel_size": args.kernel_size,
-                "deflatten_hidden": args.deflatten_hidden,
-                "patch_ckpt": args.patch_ckpt,
-                "patch_size": patch_size,
-                "model_type": model_type,
-            },
-        }
-
-    # Initial preview
-    preview_image = getattr(args, 'preview_image', None)
-    save_preview_stage2(patch_vae, bottleneck, gen, str(logdir), start_step,
-                        device, amp_dtype, preview_image=preview_image)
-
-    # -- Loop --
-    t0 = time.time()
-    stop_file = logdir / ".stop"
-    if stop_file.exists():
-        stop_file.unlink()
-
-    step = start_step
-    for step in range(start_step + 1, args.total_steps + 1):
-        if _stop_requested or stop_file.exists():
-            if stop_file.exists():
-                stop_file.unlink()
-            break
-
-        bottleneck.train()
-        opt.zero_grad(set_to_none=True)
-
-        for _ai in range(accum):
-            images = gen.generate(args.batch_size)
-            x = images.to(device)
-
-            with torch.amp.autocast(device.type, dtype=amp_dtype):
-                # Encode through frozen PatchVAE
-                with torch.no_grad():
-                    latent = patch_vae.encode(x)  # (B, C, pH, pW)
-
-                # Flatten + deflatten
-                lat_recon, flat = bottleneck(latent)
-
-                # Latent reconstruction loss
-                lat_loss = F.mse_loss(lat_recon, latent)
-
-                # Pixel reconstruction loss through frozen decoder
-                _orig = (args.H, args.W)
-                with torch.no_grad():
-                    gt_recon = patch_vae.decode(latent, original_size=_orig)
-                flat_recon = patch_vae.decode(lat_recon, original_size=_orig)
-                pixel_loss = F.mse_loss(flat_recon, gt_recon)
-
-                total = args.w_latent * lat_loss + args.w_pixel * pixel_loss
-
-            scaler.scale(total / accum).backward()
-            del latent, lat_recon, flat, gt_recon, flat_recon, images, x
-
-        scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(bottleneck.parameters(), 1.0)
-        scaler.step(opt)
-        scaler.update()
-
-        if step % args.log_every == 0:
-            el = time.time() - t0
-            sps = (step - start_step) / max(el, 1)
-            eta = (args.total_steps - step) / max(sps, 1e-6)
-            eta_str = f"{eta/60:.0f}m" if eta < 3600 else f"{eta/3600:.1f}h"
-            print(f"[{step}/{args.total_steps}] lat={lat_loss.item():.6f} "
-                  f"pix={pixel_loss.item():.6f} "
-                  f"({sps:.1f} step/s, {eta_str} left)", flush=True)
-
-        if step % args.preview_every == 0:
-            save_preview_stage2(patch_vae, bottleneck, gen, str(logdir), step,
-                                device, amp_dtype,
-                                preview_image=preview_image)
-
-        if step % args.save_every == 0:
-            d = _make_checkpoint()
-            torch.save(d, logdir / f"step_{step:06d}.pt")
-            torch.save(d, logdir / "latest.pt")
-            print(f"  saved step {step}", flush=True)
-
-            ckpts = sorted(logdir.glob("step_*.pt"),
-                           key=lambda x: x.stat().st_mtime)
-            while len(ckpts) > 10:
-                ckpts.pop(0).unlink()
-
-    # Save on exit
-    if step > start_step:
-        d = _make_checkpoint()
-        torch.save(d, logdir / f"step_{step:06d}.pt")
-        torch.save(d, logdir / "latest.pt")
-        print(f"  saved step {step}", flush=True)
-
-    print(f"\nDone. {step - start_step} steps in "
-          f"{(time.time() - t0) / 60:.1f}min")
-
-
-# =============================================================================
-# Stage 1.5: Train cascaded spatial compression on frozen S1 latent
-# =============================================================================
-
-@torch.no_grad()
-def save_preview_stage1_5(s1_model, s1_5_model, gen, logdir, step, device,
-                          amp_dtype, preview_image=None):
-    """Save GT | S1 recon | S1.5 recon preview."""
-    try:
-        s1_model.eval()
-        s1_5_model.eval()
-        from PIL import Image
-
-        H, W = gen.H, gen.W
-        sep = np.full((H, 4, 3), 14, dtype=np.uint8)
-        sections = []
-
-        # -- Reference image --
-        if preview_image and os.path.exists(preview_image):
-            ref = load_real_image(preview_image, H, W, device)
-            with torch.amp.autocast(device.type, dtype=amp_dtype):
-                s1_lat = s1_model.encode(ref)
-                s1_recon = s1_model.decode(s1_lat, original_size=(H, W))
-                s1_5_lat = s1_5_model.encode(s1_lat)
-                s1_lat_recon = s1_5_model.decode(s1_5_lat,
-                    original_size=(s1_lat.shape[2], s1_lat.shape[3]))
-                s1_5_recon = s1_model.decode(s1_lat_recon, original_size=(H, W))
-            rg = (ref[0].cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            r1 = (s1_recon[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            r15 = (s1_5_recon[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            ref_row = np.concatenate([rg, sep, r1, sep, r15], axis=1)
-            sections.append(ref_row)
-            del ref, s1_lat, s1_recon, s1_5_lat, s1_lat_recon, s1_5_recon
-
-        # -- Synthetic (single row) --
-        images = gen.generate(1)
-        x = images.to(device)
-        with torch.amp.autocast(device.type, dtype=amp_dtype):
-            s1_lat = s1_model.encode(x)
-            s1_recon = s1_model.decode(s1_lat, original_size=(H, W))
-            s1_5_lat = s1_5_model.encode(s1_lat)
-            s1_lat_recon = s1_5_model.decode(s1_5_lat,
-                original_size=(s1_lat.shape[2], s1_lat.shape[3]))
-            s1_5_recon = s1_model.decode(s1_lat_recon, original_size=(H, W))
-
-        g = (images[0].cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-        v = (s1_recon[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-        f = (s1_5_recon[0, :3].clamp(0, 1).float().cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-        del s1_lat, s1_recon, s1_5_lat, s1_lat_recon, s1_5_recon
-
-        synth_row = np.concatenate([g, sep, v, sep, f], axis=1)
-        sections.append(synth_row)
-
-        # -- Combine --
-        if len(sections) > 1:
-            ref_w = sections[0].shape[1]
-            syn_w = sections[1].shape[1]
-            from PIL import Image as _PILImg
-            syn_pil = _PILImg.fromarray(sections[1])
-            syn_scale = ref_w / syn_w
-            syn_h = int(sections[1].shape[0] * syn_scale * 0.5)
-            syn_pil = syn_pil.resize((ref_w, syn_h), _PILImg.BILINEAR)
-            sections[1] = np.array(syn_pil)
-            gap = np.full((6, ref_w, 3), 14, dtype=np.uint8)
-            grid = np.concatenate([sections[0], gap, sections[1]], axis=0)
-        else:
-            grid = sections[0]
-
-        s1_5_model.train()
-
-        stepped = os.path.join(logdir, f"preview_{step:06d}.png")
-        latest = os.path.join(logdir, "preview_latest.png")
-        Image.fromarray(grid).save(stepped)
-        Image.fromarray(grid).save(latest)
-        print(f"  preview: {stepped} (GT | S1 | S1.5)", flush=True)
-    except Exception as e:
-        import traceback
-        print(f"  preview failed: {e}", flush=True)
-        traceback.print_exc()
-        s1_5_model.train()
-
-
-def train_stage1_5(args):
-    device = torch.device(args.device)
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-
-    logdir = pathlib.Path(args.logdir)
-    logdir.mkdir(parents=True, exist_ok=True)
-
-    # -- Resume: load S1 + S1.5 config from fused checkpoint --
-    start_step = 0
-    rk = None
-    if args.resume:
-        rk = torch.load(args.resume, map_location="cpu", weights_only=False)
-        # Fused checkpoint contains S1 — load from there
-        if "s1_model" in rk:
-            print(f"Loading S1 from fused checkpoint {args.resume}...")
-            s1_cfg = rk["s1_config"]
-            s1_model = _make_model(
-                model_type=s1_cfg.get("model_type", "unrolled"),
-                patch_size=s1_cfg.get("patch_size", 8),
-                overlap=s1_cfg.get("overlap", 0),
-                image_channels=s1_cfg.get("image_channels", 3),
-                latent_channels=s1_cfg.get("latent_channels", 3),
-                inner_dim=s1_cfg.get("inner_dim", 4),
-                post_kernel=s1_cfg.get("post_kernel", 0),
-                hidden_dim=s1_cfg.get("hidden_dim", 0),
-            ).to(device)
-            s1_model.load_state_dict(rk["s1_model"])
-        else:
-            # Old checkpoint without fused S1 — fall back to --s1-ckpt
-            print(f"Loading S1 from {args.s1_ckpt}...")
-            s1_model, _, s1_cfg = _load_model(args.s1_ckpt, device)
-    else:
-        # Fresh train — load S1 from --s1-ckpt
-        print(f"Loading S1 from {args.s1_ckpt}...")
-        s1_model, _, s1_cfg = _load_model(args.s1_ckpt, device)
-
-    s1_model.eval()
-    s1_model.requires_grad_(False)
-    s1_ps = s1_cfg.get("patch_size", 8)
-    s1_lc = s1_cfg.get("latent_channels", 3)
-    print(f"  S1: patch={s1_ps}, latent={s1_lc}, frozen")
-
-    # Probe S1 latent dims
-    s1_lat_H, s1_lat_W = s1_model._patch_grid_size(args.H, args.W)
-    print(f"  S1 latent: ({s1_lc}, {s1_lat_H}, {s1_lat_W}) = "
-          f"{s1_lc * s1_lat_H * s1_lat_W} dims")
-
-    # -- S1.5 model (from resume config or CLI args) --
-    if rk and "config" in rk:
-        # Rebuild from checkpoint config
-        s1_5_cfg = rk["config"]
-        s1_5_model = _make_model(
-            model_type="unrolled",
-            patch_size=s1_5_cfg.get("patch_size", args.patch_size),
-            overlap=s1_5_cfg.get("overlap", args.overlap),
-            image_channels=s1_lc,
-            latent_channels=s1_5_cfg.get("latent_channels", args.latent_ch),
-            inner_dim=s1_5_cfg.get("inner_dim", args.inner_dim),
-            post_kernel=s1_5_cfg.get("post_kernel", args.post_kernel),
-            hidden_dim=s1_5_cfg.get("hidden_dim", args.hidden_dim),
-        ).to(device)
-    else:
-        s1_5_model = _make_model(
-            model_type="unrolled",
-            patch_size=args.patch_size,
-            overlap=args.overlap,
-            image_channels=s1_lc,
-            latent_channels=args.latent_ch,
-            inner_dim=args.inner_dim,
-            post_kernel=args.post_kernel,
-            hidden_dim=args.hidden_dim,
-        ).to(device)
-
-    s1_5_lat_H, s1_5_lat_W = s1_5_model._patch_grid_size(s1_lat_H, s1_lat_W)
-    pc = s1_5_model.param_count()
-    print(f"  S1.5: patch={s1_5_model.patch_size}, overlap={s1_5_model.overlap}, "
-          f"latent={s1_5_model.latent_channels}, inner={s1_5_model.inner_dim}")
-    print(f"  S1.5 latent: ({s1_5_model.latent_channels}, {s1_5_lat_H}, {s1_5_lat_W}) = "
-          f"{s1_5_model.latent_channels * s1_5_lat_H * s1_5_lat_W} dims")
-    print(f"  S1.5 params: {pc['total']:,}")
-    print(f"  Total compression: {args.H}x{args.W}x3 -> "
-          f"{s1_5_model.latent_channels}x{s1_5_lat_H}x{s1_5_lat_W} = "
-          f"{s1_5_model.latent_channels * s1_5_lat_H * s1_5_lat_W} dims "
-          f"({(args.H * args.W * 3) / (s1_5_model.latent_channels * s1_5_lat_H * s1_5_lat_W):.0f}:1)")
-
-    # -- Generator --
-    gen = VAEpp0rGenerator(
-        height=args.H, width=args.W, device=str(device),
-        bank_size=5000, n_base_layers=128,
-    )
-    gen.build_banks()
-    gen.disco_quadrant = True
-    print(f"  Generator: bank=5000, layers=128, disco=True")
-
-    # -- Optimizer --
-    opt = torch.optim.AdamW(s1_5_model.parameters(), lr=float(args.lr),
-                            weight_decay=0.01)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01)
-
-    # -- Resume weights --
-    if rk and "model" in rk:
-        strict = not getattr(args, 'loose_load', False)
-        missing, unexpected = s1_5_model.load_state_dict(rk["model"],
-                                                          strict=strict)
-        if missing:
-            print(f"  New layers (random init): {missing}")
-        start_step = rk.get("global_step", 0)
-        if not args.fresh_opt and rk.get("optimizer"):
-            try:
-                opt.load_state_dict(rk["optimizer"])
-            except Exception:
-                print("  Fresh optimizer (mismatch)")
-        if rk.get("scheduler") and not args.fresh_opt:
-            sched.load_state_dict(rk["scheduler"])
-        else:
-            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01,
-                last_epoch=start_step)
-        print(f"  Resumed S1.5 at step {start_step}")
-
-    if args.fresh_opt and start_step > 0:
-        opt = torch.optim.AdamW(s1_5_model.parameters(), lr=float(args.lr),
-                                weight_decay=0.01)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=args.total_steps - start_step,
-            eta_min=float(args.lr) * 0.01)
-        print(f"  Fresh optimizer from step {start_step}")
-
-    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
-                 "fp32": torch.float32}[args.precision]
-    scaler = torch.amp.GradScaler("cuda",
-                                   enabled=(args.precision == "fp16"))
-
-    accum = args.grad_accum
-
-    print(f"Steps: {args.total_steps}, LR: {args.lr}, Batch: {args.batch_size}"
-          f"{f', accum={accum}' if accum > 1 else ''}")
-    print(flush=True)
-
-    def _make_checkpoint():
-        return {
-            "model": s1_5_model.state_dict(),
-            "s1_model": s1_model.state_dict(),
-            "s1_config": s1_cfg,
-            "optimizer": opt.state_dict(),
-            "scheduler": sched.state_dict(),
-            "scaler": scaler.state_dict(),
-            "global_step": global_step,
-            "config": {
-                "model_type": "unrolled",
-                "patch_size": s1_5_model.patch_size,
-                "overlap": s1_5_model.overlap,
-                "latent_channels": s1_5_model.latent_channels,
-                "inner_dim": s1_5_model.inner_dim,
-                "hidden_dim": s1_5_model.hidden_dim,
-                "post_kernel": s1_5_model.post_kernel,
-                "image_channels": s1_lc,
-                "s1_lat_H": s1_lat_H,
-                "s1_lat_W": s1_lat_W,
-                "H": args.H,
-                "W": args.W,
-            },
-        }
-
-    preview_image = getattr(args, 'preview_image', None)
-
-    # Initial preview
-    save_preview_stage1_5(s1_model, s1_5_model, gen, str(logdir), start_step,
-                          device, amp_dtype, preview_image=preview_image)
-
-    # -- Loop --
-    t0 = time.time()
-    global_step = start_step
-    stop_file = logdir / ".stop"
-    if stop_file.exists():
-        stop_file.unlink()
-
-    while global_step < args.total_steps:
-        if _stop_requested or stop_file.exists():
-            if stop_file.exists():
-                stop_file.unlink()
-            print("[Stop detected, saving...]", flush=True)
-            break
-
-        s1_5_model.train()
+        active_model.train()
         opt.zero_grad(set_to_none=True)
         losses = {}
 
@@ -1653,33 +1332,66 @@ def train_stage1_5(args):
             x = images.to(device)
 
             with torch.amp.autocast(device.type, dtype=amp_dtype):
-                # Encode through frozen S1
-                with torch.no_grad():
-                    s1_lat = s1_model.encode(x)  # (B, s1_lc, H1, W1)
+                if mode == "fresh" or mode == "resume":
+                    if mode == "resume" and active_stage > 0:
+                        # Encode through frozen upstream stages
+                        with torch.no_grad():
+                            for i in range(active_stage):
+                                mt, m, c = models_list[i]
+                                if mt in ("unrolled", "patch"):
+                                    x = m.encode(x)
+                                elif mt == "refiner":
+                                    x = m(x)
+                                elif mt == "flatten":
+                                    x = m.flatten(x)
+                            target = x.clone()
 
-                # S1.5 encode/decode (latent reconstruction)
-                s1_5_recon, s1_5_lat = s1_5_model(s1_lat)
+                        # Forward through active model
+                        recon, latent = active_model(x)
+                        mse = F.mse_loss(recon, target)
+                        total = args.w_mse * mse
+                        losses["mse"] = losses.get("mse", 0) + mse.item() / accum
+                    else:
+                        # Fresh: train directly on images
+                        recon, latent = active_model(x)
+                        mse = F.mse_loss(recon, x)
+                        total = args.w_mse * mse
+                        losses["mse"] = losses.get("mse", 0) + mse.item() / accum
 
-                # Latent reconstruction loss (S1.5 output vs S1 latent)
-                lat_loss = F.mse_loss(s1_5_recon, s1_lat)
+                    if lpips_fn is not None and mode in ("fresh",):
+                        rc_lp = recon[:, :3] * 2 - 1
+                        gt_lp = x[:, :3] * 2 - 1
+                        lp = lpips_fn(rc_lp, gt_lp).mean()
+                        total = total + args.w_lpips * lp
+                        losses["lpips"] = losses.get("lpips", 0) + lp.item() / accum
 
-                # Pixel reconstruction loss through frozen S1 decoder
-                with torch.no_grad():
-                    gt_pixels = s1_model.decode(s1_lat,
-                        original_size=(args.H, args.W))
-                recon_pixels = s1_model.decode(s1_5_recon,
-                    original_size=(args.H, args.W))
-                pixel_loss = F.mse_loss(recon_pixels, gt_pixels)
+                elif mode == "extend":
+                    # Encode through frozen upstream
+                    with torch.no_grad():
+                        input_latent = upstream_encode_fn(x)
 
-                total = args.w_latent * lat_loss + args.w_pixel * pixel_loss
-                losses["lat"] = losses.get("lat", 0) + lat_loss.item() / accum
-                losses["pix"] = losses.get("pix", 0) + pixel_loss.item() / accum
+                    # Forward through active model
+                    recon_lat, lat = active_model(input_latent)
+
+                    # Latent loss: reconstructed latent vs input latent
+                    lat_loss = F.mse_loss(recon_lat, input_latent)
+                    losses["lat"] = losses.get("lat", 0) + lat_loss.item() / accum
+
+                    # Pixel loss: full pipeline decode vs original image
+                    with torch.no_grad():
+                        # Decode through upstream
+                        pass
+                    recon_pixels = upstream_decode_fn(recon_lat)
+                    pixel_loss = F.mse_loss(recon_pixels, x)
+                    losses["pix"] = losses.get("pix", 0) + pixel_loss.item() / accum
+
+                    total = args.w_latent * lat_loss + args.w_pixel * pixel_loss
 
             scaler.scale(total / accum).backward()
-            del s1_lat, s1_5_recon, s1_5_lat, gt_pixels, recon_pixels, images, x
+            del images
 
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(s1_5_model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(active_model.parameters(), 1.0)
         scaler.step(opt)
         scaler.update()
         sched.step()
@@ -1698,12 +1410,13 @@ def train_stage1_5(args):
                   f"lr={lr:.1e} ({sps:.1f} step/s, {eta_str} left)", flush=True)
 
         if global_step % args.preview_every == 0:
-            save_preview_stage1_5(s1_model, s1_5_model, gen, str(logdir),
+            active_model.eval()
+            save_preview_pipeline(full_encode, full_decode, gen, str(logdir),
                                   global_step, device, amp_dtype,
                                   preview_image=preview_image)
 
         if global_step % args.save_every == 0:
-            d = _make_checkpoint()
+            d = _make_ckpt()
             p = logdir / f"step_{global_step:06d}.pt"
             torch.save(d, p)
             torch.save(d, logdir / "latest.pt")
@@ -1716,7 +1429,7 @@ def train_stage1_5(args):
 
     # Save on exit
     if global_step > start_step:
-        d = _make_checkpoint()
+        d = _make_ckpt()
         torch.save(d, logdir / f"step_{global_step:06d}.pt")
         torch.save(d, logdir / "latest.pt")
         print(f"  saved step {global_step}", flush=True)
@@ -1726,273 +1439,8 @@ def train_stage1_5(args):
 
 
 # =============================================================================
-# Inference
+# train_refiner
 # =============================================================================
-
-@torch.no_grad()
-def _load_fused_s1_5(ckpt_path, device):
-    """Load S1 + S1.5 from a fused checkpoint (or separate files).
-
-    If the checkpoint contains 's1_model', both are loaded from one file.
-    Otherwise falls back to loading S1 from the path in the config.
-
-    Returns (s1_model, s1_5_model, s1_5_cfg).
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    s1_5_cfg = ckpt.get("config", {})
-
-    # Load S1.5
-    s1_5_model = _make_model(
-        model_type=s1_5_cfg.get("model_type", "unrolled"),
-        patch_size=s1_5_cfg.get("patch_size", 4),
-        overlap=s1_5_cfg.get("overlap", 0),
-        image_channels=s1_5_cfg.get("image_channels", 3),
-        latent_channels=s1_5_cfg.get("latent_channels", 3),
-        inner_dim=s1_5_cfg.get("inner_dim", 4),
-        post_kernel=s1_5_cfg.get("post_kernel", 0),
-        hidden_dim=s1_5_cfg.get("hidden_dim", 0),
-    ).to(device)
-    s1_5_model.load_state_dict(ckpt["model"])
-
-    # Load S1 (fused or from path)
-    if "s1_model" in ckpt:
-        s1_cfg = ckpt["s1_config"]
-        s1_model = _make_model(
-            model_type=s1_cfg.get("model_type", "unrolled"),
-            patch_size=s1_cfg.get("patch_size", 8),
-            overlap=s1_cfg.get("overlap", 0),
-            image_channels=s1_cfg.get("image_channels", 3),
-            latent_channels=s1_cfg.get("latent_channels", 3),
-            inner_dim=s1_cfg.get("inner_dim", 4),
-            post_kernel=s1_cfg.get("post_kernel", 0),
-            hidden_dim=s1_cfg.get("hidden_dim", 0),
-        ).to(device)
-        s1_model.load_state_dict(ckpt["s1_model"])
-    else:
-        s1_ckpt_path = s1_5_cfg.get("s1_ckpt")
-        if s1_ckpt_path:
-            s1_model, _, _ = _load_model(s1_ckpt_path, device)
-        else:
-            raise ValueError("No S1 model found in checkpoint or config")
-
-    return s1_model, s1_5_model, s1_5_cfg
-
-
-def infer_stage1_5(args):
-    """Stage 1.5 inference: S1 + S1.5, show GT | S1 | S1.5."""
-    device = torch.device(args.device)
-
-    print(f"Loading S1 + S1.5 from {args.s1_5_ckpt}...")
-    s1_model, s1_5_model, s1_5_cfg = _load_fused_s1_5(args.s1_5_ckpt, device)
-    s1_model.eval()
-    s1_5_model.eval()
-
-    s1_lat_H = s1_5_cfg.get("s1_lat_H", 60)
-    s1_lat_W = s1_5_cfg.get("s1_lat_W", 107)
-    s1_5_lat_H, s1_5_lat_W = s1_5_model._patch_grid_size(s1_lat_H, s1_lat_W)
-    lc = s1_5_cfg.get("latent_channels", 3)
-    print(f"  S1.5 latent: ({lc}, {s1_5_lat_H}, {s1_5_lat_W}) = "
-          f"{lc * s1_5_lat_H * s1_5_lat_W} dims")
-
-    gen = VAEpp0rGenerator(
-        height=args.H, width=args.W, device=str(device),
-        bank_size=5000, n_base_layers=128,
-    )
-    gen.build_banks()
-    gen.disco_quadrant = True
-
-    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
-                 "fp32": torch.float32}[args.precision]
-
-    logdir = pathlib.Path(args.logdir)
-    logdir.mkdir(parents=True, exist_ok=True)
-
-    save_preview_stage1_5(s1_model, s1_5_model, gen, str(logdir), 0,
-                          device, amp_dtype)
-    print(f"Saved to {logdir}")
-
-
-# =============================================================================
-# Refiner: latent smoothing via residual Conv1d
-# =============================================================================
-
-def _load_upstream(args, device, from_ckpt=None):
-    """Load the upstream pipeline (S1, optionally S1.5) for refiner.
-
-    If from_ckpt is provided (a loaded checkpoint dict), loads upstream
-    models from the fused checkpoint. Otherwise loads from args paths.
-
-    Returns (encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state, models)
-    where upstream_state is a dict to embed in the refiner checkpoint,
-    and models is a dict of {'s1': model, 's1_5': model_or_None}.
-    """
-    upstream_state = {}
-
-    if from_ckpt and "s1_model" in from_ckpt:
-        # Load from fused refiner checkpoint
-        s1_cfg = from_ckpt["s1_config"]
-        s1_model = _make_model(
-            model_type=s1_cfg.get("model_type", "unrolled"),
-            patch_size=s1_cfg.get("patch_size", 8),
-            overlap=s1_cfg.get("overlap", 0),
-            image_channels=s1_cfg.get("image_channels", 3),
-            latent_channels=s1_cfg.get("latent_channels", 3),
-            inner_dim=s1_cfg.get("inner_dim", 4),
-            post_kernel=s1_cfg.get("post_kernel", 0),
-            hidden_dim=s1_cfg.get("hidden_dim", 0),
-        ).to(device)
-        s1_model.load_state_dict(from_ckpt["s1_model"])
-        upstream_state["s1_model"] = from_ckpt["s1_model"]
-        upstream_state["s1_config"] = s1_cfg
-
-        s1_5_model = None
-        if "s1_5_model" in from_ckpt:
-            s1_5_cfg = from_ckpt["s1_5_config"]
-            s1_5_model = _make_model(
-                model_type=s1_5_cfg.get("model_type", "unrolled"),
-                patch_size=s1_5_cfg.get("patch_size", 4),
-                overlap=s1_5_cfg.get("overlap", 0),
-                image_channels=s1_5_cfg.get("image_channels", 3),
-                latent_channels=s1_5_cfg.get("latent_channels", 3),
-                inner_dim=s1_5_cfg.get("inner_dim", 4),
-                post_kernel=s1_5_cfg.get("post_kernel", 0),
-                hidden_dim=s1_5_cfg.get("hidden_dim", 0),
-            ).to(device)
-            s1_5_model.load_state_dict(from_ckpt["s1_5_model"])
-            upstream_state["s1_5_model"] = from_ckpt["s1_5_model"]
-            upstream_state["s1_5_config"] = s1_5_cfg
-    else:
-        # Load S1 from file
-        s1_ckpt_path = getattr(args, 's1_ckpt', None)
-        s1_5_ckpt_path = getattr(args, 's1_5_ckpt', None)
-
-        if s1_5_ckpt_path and os.path.exists(s1_5_ckpt_path):
-            # S1.5 fused checkpoint contains S1
-            s1_model, s1_5_model, s1_5_cfg = _load_fused_s1_5(
-                s1_5_ckpt_path, device)
-            # Get S1 config from the fused checkpoint
-            fused = torch.load(s1_5_ckpt_path, map_location="cpu",
-                               weights_only=False)
-            upstream_state["s1_model"] = fused.get("s1_model",
-                                                    s1_model.state_dict())
-            upstream_state["s1_config"] = fused.get("s1_config", {})
-            upstream_state["s1_5_model"] = s1_5_model.state_dict()
-            upstream_state["s1_5_config"] = s1_5_cfg
-        elif s1_ckpt_path:
-            s1_model, _, s1_cfg = _load_model(s1_ckpt_path, device)
-            upstream_state["s1_model"] = s1_model.state_dict()
-            upstream_state["s1_config"] = s1_cfg
-            s1_5_model = None
-        else:
-            raise ValueError("Need --s1-ckpt or --s1-5-ckpt")
-
-    s1_model.eval()
-    s1_model.requires_grad_(False)
-    s1_H, s1_W = s1_model._patch_grid_size(args.H, args.W)
-
-    if s1_5_model is not None:
-        s1_5_model.eval()
-        s1_5_model.requires_grad_(False)
-        lat_H, lat_W = s1_5_model._patch_grid_size(s1_H, s1_W)
-        lat_C = s1_5_model.latent_channels
-
-        def encode_fn(x):
-            return s1_5_model.encode(s1_model.encode(x))
-
-        def decode_fn(lat):
-            return s1_model.decode(
-                s1_5_model.decode(lat, original_size=(s1_H, s1_W)),
-                original_size=(args.H, args.W))
-    else:
-        lat_H, lat_W = s1_H, s1_W
-        lat_C = s1_model.latent_channels
-
-        def encode_fn(x):
-            return s1_model.encode(x)
-
-        def decode_fn(lat):
-            return s1_model.decode(lat, original_size=(args.H, args.W))
-
-    models = {"s1": s1_model, "s1_5": s1_5_model}
-
-    print(f"  Upstream latent: ({lat_C}, {lat_H}, {lat_W}) = "
-          f"{lat_C * lat_H * lat_W} dims")
-    return encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state, models
-
-
-@torch.no_grad()
-def save_preview_refiner(encode_fn, decode_fn, refiner, gen, logdir, step,
-                         device, amp_dtype, preview_image=None):
-    """Save GT | Upstream | Refined preview."""
-    try:
-        refiner.eval()
-        from PIL import Image
-
-        H, W = gen.H, gen.W
-        sep = np.full((H, 4, 3), 14, dtype=np.uint8)
-        sections = []
-
-        # -- Reference image --
-        if preview_image and os.path.exists(preview_image):
-            ref = load_real_image(preview_image, H, W, device)
-            with torch.amp.autocast(device.type, dtype=amp_dtype):
-                lat = encode_fn(ref)
-                recon_raw = decode_fn(lat)
-                lat_refined = refiner(lat)
-                recon_refined = decode_fn(lat_refined)
-            rg = (ref[0].cpu().numpy().transpose(1, 2, 0) * 255
-                  ).clip(0, 255).astype(np.uint8)
-            rr = (recon_raw[0, :3].clamp(0, 1).float().cpu().numpy()
-                  .transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            rf = (recon_refined[0, :3].clamp(0, 1).float().cpu().numpy()
-                  .transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-            ref_row = np.concatenate([rg, sep, rr, sep, rf], axis=1)
-            sections.append(ref_row)
-
-        # -- Synthetic --
-        images = gen.generate(1)
-        x = images.to(device)
-        with torch.amp.autocast(device.type, dtype=amp_dtype):
-            lat = encode_fn(x)
-            recon_raw = decode_fn(lat)
-            lat_refined = refiner(lat)
-            recon_refined = decode_fn(lat_refined)
-        g = (images[0].cpu().numpy().transpose(1, 2, 0) * 255
-             ).clip(0, 255).astype(np.uint8)
-        v = (recon_raw[0, :3].clamp(0, 1).float().cpu().numpy()
-             .transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-        f = (recon_refined[0, :3].clamp(0, 1).float().cpu().numpy()
-             .transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-        synth_row = np.concatenate([g, sep, v, sep, f], axis=1)
-        sections.append(synth_row)
-
-        # Combine
-        if len(sections) > 1:
-            ref_w = sections[0].shape[1]
-            from PIL import Image as _PILImg
-            syn_pil = _PILImg.fromarray(sections[1])
-            syn_scale = ref_w / sections[1].shape[1]
-            syn_h = int(sections[1].shape[0] * syn_scale * 0.5)
-            syn_pil = syn_pil.resize((ref_w, syn_h), _PILImg.BILINEAR)
-            sections[1] = np.array(syn_pil)
-            gap = np.full((6, ref_w, 3), 14, dtype=np.uint8)
-            grid = np.concatenate([sections[0], gap, sections[1]], axis=0)
-        else:
-            grid = sections[0]
-
-        refiner.train()
-
-        stepped = os.path.join(logdir, f"preview_{step:06d}.png")
-        latest = os.path.join(logdir, "preview_latest.png")
-        Image.fromarray(grid).save(stepped)
-        Image.fromarray(grid).save(latest)
-        print(f"  preview: {stepped} (GT | Raw | Refined)", flush=True)
-    except Exception as e:
-        import traceback
-        print(f"  preview failed: {e}", flush=True)
-        traceback.print_exc()
-        refiner.train()
-
 
 def train_refiner(args):
     device = torch.device(args.device)
@@ -2002,23 +1450,42 @@ def train_refiner(args):
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    # -- Load upstream (from resume checkpoint if fused, else from args) --
-    rk_refiner = None
-    if args.resume:
-        rk_refiner = torch.load(args.resume, map_location="cpu",
-                                weights_only=False)
+    if not args.input_ckpt:
+        raise ValueError("--input-ckpt required for refiner training")
 
-    encode_fn, decode_fn, lat_C, lat_H, lat_W, upstream_state, models = \
-        _load_upstream(args, device, from_ckpt=rk_refiner)
+    print(f"Loading pipeline from {args.input_ckpt}...")
+    models_list, encode_fn, decode_fn, spatial_sizes, ckpt = \
+        _load_pipeline(args.input_ckpt, device)
 
-    # -- Refiner --
-    if rk_refiner and "config" in rk_refiner:
-        rcfg = rk_refiner["config"]
-        args.n_blocks = rcfg.get("n_blocks", args.n_blocks)
-        args.hidden_channels = rcfg.get("hidden_channels", args.hidden_channels)
-        args.kernel_size = rcfg.get("kernel_size", args.kernel_size)
-        args.walk_order = rcfg.get("walk_order", args.walk_order)
+    # Freeze all existing stages
+    for mt, m, c in models_list:
+        m.eval()
+        m.requires_grad_(False)
 
+    # Print pipeline info
+    for i, (mt, m, c) in enumerate(models_list):
+        if mt in ("unrolled", "patch"):
+            pc = m.param_count()["total"]
+        elif mt == "refiner":
+            pc = m.param_count()
+        else:
+            pc = m.param_count()
+        print(f"  Stage {i}: {mt}, {pc:,} params (frozen), "
+              f"spatial {spatial_sizes[i]} -> {spatial_sizes[i+1]}")
+
+    # Determine latent dims at end of pipeline
+    last_mt, last_model, last_cfg = models_list[-1]
+    if last_mt in ("unrolled", "patch"):
+        lat_C = last_model.latent_channels
+    elif last_mt == "refiner":
+        lat_C = last_cfg.get("latent_channels", 3)
+    elif last_mt == "flatten":
+        lat_C = last_cfg.get("bottleneck_channels", 6)
+    else:
+        lat_C = 3
+    lat_H, lat_W = spatial_sizes[-1]
+
+    # Create refiner
     refiner = LatentRefiner(
         latent_channels=lat_C,
         spatial_h=lat_H, spatial_w=lat_W,
@@ -2028,28 +1495,38 @@ def train_refiner(args):
         walk_order=args.walk_order,
         dropout=args.dropout,
     ).to(device)
+
+    refiner_cfg = {
+        "latent_channels": lat_C,
+        "spatial_h": lat_H,
+        "spatial_w": lat_W,
+        "n_blocks": args.n_blocks,
+        "hidden_channels": args.hidden_channels,
+        "kernel_size": args.kernel_size,
+        "walk_order": args.walk_order,
+        "dropout": args.dropout,
+    }
+
     hc_str = f", hidden={args.hidden_channels}" if args.hidden_channels > 0 else ""
     print(f"  Refiner: {args.n_blocks} blocks, kernel={args.kernel_size}{hc_str}, "
           f"walk={args.walk_order}, {refiner.param_count():,} params")
 
-    # -- Finetune decoder --
+    # Append refiner to pipeline
+    active_stage = len(models_list)
+    models_list.append(("refiner", refiner, refiner_cfg))
+    spatial_sizes.append(spatial_sizes[-1])
+
+    # Finetune decoder: unfreeze pipeline[-2] (stage before refiner)
     finetune_decoder = getattr(args, 'finetune_decoder', False)
-    if finetune_decoder:
-        # Unfreeze the last-stage decoder in the upstream pipeline
-        # S1.5 decoder if present, else S1 decoder
-        decoder_model = models["s1_5"] if models["s1_5"] is not None else models["s1"]
+    decoder_model = None
+    if finetune_decoder and len(models_list) >= 2:
+        _, decoder_model, _ = models_list[-2]
         decoder_model.requires_grad_(True)
         decoder_model.train()
-        # Keep encoder frozen
-        encoder_model = models["s1"]
-        encoder_model.requires_grad_(False)
-        encoder_model.eval()
-        if models["s1_5"] is not None and decoder_model is not models["s1"]:
-            # S1.5 is the decoder being finetuned — keep S1 encoder frozen
-            pass
         dec_params = sum(p.numel() for p in decoder_model.parameters()
                         if p.requires_grad)
-        print(f"  Finetuning decoder: {dec_params:,} trainable params")
+        print(f"  Finetuning decoder (stage {len(models_list)-2}): "
+              f"{dec_params:,} trainable params")
 
     # -- Generator --
     gen = VAEpp0rGenerator(
@@ -2059,41 +1536,14 @@ def train_refiner(args):
     gen.build_banks()
     gen.disco_quadrant = True
 
-    # -- Optimizer (refiner + optionally decoder) --
+    # -- Optimizer --
     train_params = list(refiner.parameters())
-    if finetune_decoder:
+    if finetune_decoder and decoder_model is not None:
         train_params += [p for p in decoder_model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(train_params, lr=float(args.lr),
                             weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01)
-
-    # -- Resume --
-    start_step = 0
-    if args.resume:
-        rk = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if "refiner" in rk:
-            refiner.load_state_dict(rk["refiner"])
-            start_step = rk.get("step", 0)
-            if not args.fresh_opt and rk.get("optimizer"):
-                try:
-                    opt.load_state_dict(rk["optimizer"])
-                except Exception:
-                    print("  Fresh optimizer (mismatch)")
-            if rk.get("scheduler") and not args.fresh_opt:
-                sched.load_state_dict(rk["scheduler"])
-            else:
-                sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    opt, T_max=args.total_steps,
-                    eta_min=float(args.lr) * 0.01, last_epoch=start_step)
-            print(f"  Resumed refiner from {args.resume} at step {start_step}")
-
-    if args.fresh_opt and start_step > 0:
-        opt = torch.optim.AdamW(refiner.parameters(), lr=float(args.lr),
-                                weight_decay=0.01)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=args.total_steps - start_step,
-            eta_min=float(args.lr) * 0.01)
 
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
                  "fp32": torch.float32}[args.precision]
@@ -2101,41 +1551,59 @@ def train_refiner(args):
                                    enabled=(args.precision == "fp16"))
 
     accum = args.grad_accum
+    image_size = (args.H, args.W)
 
     print(f"Steps: {args.total_steps}, LR: {args.lr}, Batch: {args.batch_size}")
     print(flush=True)
 
-    def _make_checkpoint():
-        ckpt = {
-            "refiner": refiner.state_dict(),
-            "optimizer": opt.state_dict(),
-            "scheduler": sched.state_dict(),
-            "step": step,
-            "config": {
-                "latent_channels": lat_C,
-                "spatial_h": lat_H,
-                "spatial_w": lat_W,
-                "n_blocks": args.n_blocks,
-                "hidden_channels": args.hidden_channels,
-                "kernel_size": args.kernel_size,
-                "walk_order": args.walk_order,
-                "dropout": args.dropout,
-            },
-        }
-        # Fuse upstream models into checkpoint (with current weights)
-        if finetune_decoder:
-            # Update upstream state with finetuned decoder weights
-            if models["s1_5"] is not None:
-                upstream_state["s1_5_model"] = models["s1_5"].state_dict()
-            upstream_state["s1_model"] = models["s1"].state_dict()
-        ckpt.update(upstream_state)
-        return ckpt
+    # Build full pipeline encode/decode with refiner
+    all_sizes = spatial_sizes
+
+    def full_encode(x):
+        for mt, m, c in models_list:
+            if mt in ("unrolled", "patch"):
+                x = m.encode(x)
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.flatten(x)
+        return x
+
+    def full_decode(x):
+        for i in range(len(models_list) - 1, -1, -1):
+            mt, m, c = models_list[i]
+            if mt in ("unrolled", "patch"):
+                x = m.decode(x, original_size=all_sizes[i])
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.deflatten(x)
+        return x
+
+    # Build upstream-only encode (without refiner) for getting clean latent
+    upstream_models = models_list[:active_stage]
+
+    def upstream_encode(x):
+        for mt, m, c in upstream_models:
+            if mt in ("unrolled", "patch"):
+                x = m.encode(x)
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.flatten(x)
+        return x
+
+    def _make_ckpt():
+        return _make_pipeline_checkpoint(
+            models_list, active_stage, image_size,
+            opt, sched, scaler, step)
 
     preview_image = getattr(args, 'preview_image', None)
 
-    save_preview_refiner(encode_fn, decode_fn, refiner, gen, str(logdir),
-                         start_step, device, amp_dtype,
-                         preview_image=preview_image)
+    # Initial preview
+    refiner.eval()
+    save_preview_pipeline(full_encode, full_decode, gen, str(logdir),
+                          0, device, amp_dtype, preview_image=preview_image)
 
     # -- Loop --
     t0 = time.time()
@@ -2143,14 +1611,16 @@ def train_refiner(args):
     if stop_file.exists():
         stop_file.unlink()
 
-    step = start_step
-    for step in range(start_step + 1, args.total_steps + 1):
+    step = 0
+    for step in range(1, args.total_steps + 1):
         if _stop_requested or stop_file.exists():
             if stop_file.exists():
                 stop_file.unlink()
             break
 
         refiner.train()
+        if finetune_decoder and decoder_model is not None:
+            decoder_model.train()
         opt.zero_grad(set_to_none=True)
 
         for _ai in range(accum):
@@ -2159,7 +1629,7 @@ def train_refiner(args):
 
             with torch.amp.autocast(device.type, dtype=amp_dtype):
                 with torch.no_grad():
-                    lat = encode_fn(x)
+                    lat = upstream_encode(x)
 
                 # Optional blur to give refiner a denoising signal
                 if args.blur_sigma > 0:
@@ -2169,7 +1639,9 @@ def train_refiner(args):
                     lat_input = lat
 
                 lat_refined = refiner(lat_input)
-                pixel_refined = decode_fn(lat_refined)
+
+                # Decode through full pipeline (refiner output -> upstream decode)
+                pixel_refined = full_decode(lat_refined)
 
                 # Pixel loss: refined decode should match original image
                 pixel_loss = F.mse_loss(pixel_refined, x)
@@ -2182,14 +1654,17 @@ def train_refiner(args):
             del lat, lat_refined, pixel_refined, images, x
 
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(refiner.parameters(), 1.0)
+        clip_params = list(refiner.parameters())
+        if finetune_decoder and decoder_model is not None:
+            clip_params += list(decoder_model.parameters())
+        torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
         scaler.step(opt)
         scaler.update()
         sched.step()
 
         if step % args.log_every == 0:
             el = time.time() - t0
-            sps = (step - start_step) / max(el, 1)
+            sps = step / max(el, 1)
             eta = (args.total_steps - step) / max(sps, 1e-6)
             eta_str = f"{eta/60:.0f}m" if eta < 3600 else f"{eta/3600:.1f}h"
             print(f"[{step}/{args.total_steps}] pix={pixel_loss.item():.6f} "
@@ -2197,12 +1672,13 @@ def train_refiner(args):
                   f"({sps:.1f} step/s, {eta_str} left)", flush=True)
 
         if step % args.preview_every == 0:
-            save_preview_refiner(encode_fn, decode_fn, refiner, gen,
-                                 str(logdir), step, device, amp_dtype,
-                                 preview_image=preview_image)
+            refiner.eval()
+            save_preview_pipeline(full_encode, full_decode, gen, str(logdir),
+                                  step, device, amp_dtype,
+                                  preview_image=preview_image)
 
         if step % args.save_every == 0:
-            d = _make_checkpoint()
+            d = _make_ckpt()
             torch.save(d, logdir / f"step_{step:06d}.pt")
             torch.save(d, logdir / "latest.pt")
             print(f"  saved step {step}", flush=True)
@@ -2212,122 +1688,313 @@ def train_refiner(args):
             while len(ckpts) > 10:
                 ckpts.pop(0).unlink()
 
-    if step > start_step:
-        d = _make_checkpoint()
+    if step > 0:
+        d = _make_ckpt()
         torch.save(d, logdir / f"step_{step:06d}.pt")
         torch.save(d, logdir / "latest.pt")
         print(f"  saved step {step}", flush=True)
 
-    print(f"\nDone. {step - start_step} steps in "
-          f"{(time.time() - t0) / 60:.1f}min")
+    print(f"\nDone. {step} steps in {(time.time() - t0) / 60:.1f}min")
 
 
-@torch.no_grad()
-def infer_refiner(args):
-    """Refiner inference — loads everything from one fused checkpoint."""
+# =============================================================================
+# train_s2: flatten bottleneck
+# =============================================================================
+
+def train_s2(args):
     device = torch.device(args.device)
-
-    print(f"Loading refiner from {args.refiner_ckpt}...")
-    rk = torch.load(args.refiner_ckpt, map_location="cpu", weights_only=False)
-    rcfg = rk.get("config", {})
-
-    encode_fn, decode_fn, lat_C, lat_H, lat_W, _, _ = \
-        _load_upstream(args, device, from_ckpt=rk)
-
-    refiner = LatentRefiner(
-        latent_channels=rcfg.get("latent_channels", lat_C),
-        spatial_h=rcfg.get("spatial_h", lat_H),
-        spatial_w=rcfg.get("spatial_w", lat_W),
-        n_blocks=rcfg.get("n_blocks", 4),
-        hidden_channels=rcfg.get("hidden_channels", 0),
-        kernel_size=rcfg.get("kernel_size", 5),
-        walk_order=rcfg.get("walk_order", "hilbert"),
-        dropout=rcfg.get("dropout", 0.0),
-    ).to(device)
-    refiner.load_state_dict(rk["refiner"])
-    refiner.eval()
-    print(f"  Refiner: {refiner.param_count():,} params")
-
-    gen = VAEpp0rGenerator(
-        height=args.H, width=args.W, device=str(device),
-        bank_size=5000, n_base_layers=128,
-    )
-    gen.build_banks()
-    gen.disco_quadrant = True
-
-    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
-                 "fp32": torch.float32}[args.precision]
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
 
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    save_preview_refiner(encode_fn, decode_fn, refiner, gen, str(logdir),
-                         0, device, amp_dtype)
-    print(f"Saved to {logdir}")
+    if not args.input_ckpt:
+        raise ValueError("--input-ckpt required for s2 training")
 
+    print(f"Loading pipeline from {args.input_ckpt}...")
+    models_list, encode_fn, decode_fn, spatial_sizes, ckpt = \
+        _load_pipeline(args.input_ckpt, device)
 
-# =============================================================================
-# Inference
-# =============================================================================
+    # Freeze all existing stages
+    for mt, m, c in models_list:
+        m.eval()
+        m.requires_grad_(False)
 
-@torch.no_grad()
-def infer_stage1(args):
-    """Stage 1 inference: load PatchVAE/UnrolledPatchVAE, show GT | Recon."""
-    device = torch.device(args.device)
+    # Print pipeline info
+    for i, (mt, m, c) in enumerate(models_list):
+        if mt in ("unrolled", "patch"):
+            pc = m.param_count()["total"]
+        elif mt == "refiner":
+            pc = m.param_count()
+        else:
+            pc = m.param_count()
+        print(f"  Stage {i}: {mt}, {pc:,} params (frozen), "
+              f"spatial {spatial_sizes[i]} -> {spatial_sizes[i+1]}")
 
-    print(f"Loading model from {args.patch_ckpt}...")
-    model, _, cfg = _load_model(args.patch_ckpt, device)
-    model.eval()
+    # Determine latent dims
+    last_mt, last_model, last_cfg = models_list[-1]
+    if last_mt in ("unrolled", "patch"):
+        lat_ch = last_model.latent_channels
+    elif last_mt == "refiner":
+        lat_ch = last_cfg.get("latent_channels", 3)
+    elif last_mt == "flatten":
+        lat_ch = last_cfg.get("bottleneck_channels", 6)
+    else:
+        lat_ch = 3
+    lat_H, lat_W = spatial_sizes[-1]
 
-    pc = model.param_count()
-    print(f"  {cfg.get('model_type', 'patch')}: {pc['total']:,} params")
+    print(f"  Upstream latent: ({lat_ch}, {lat_H}, {lat_W}) = "
+          f"{lat_ch * lat_H * lat_W} values")
+    print(f"  Bottleneck: {args.bottleneck_ch}ch x {lat_H * lat_W} positions "
+          f"= {args.bottleneck_ch * lat_H * lat_W} flat values")
+    print(f"  Compression: {lat_ch / args.bottleneck_ch:.1f}:1 channel")
 
-    gen = VAEpp0rGenerator(
-        height=args.H, width=args.W, device=str(device),
-        bank_size=5000, n_base_layers=128,
-    )
-    gen.build_banks()
-    gen.disco_quadrant = True
-
-    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
-                 "fp32": torch.float32}[args.precision]
-
-    logdir = pathlib.Path(args.logdir)
-    logdir.mkdir(parents=True, exist_ok=True)
-
-    save_preview_stage1(model, gen, str(logdir), 0, device, amp_dtype)
-    print(f"Saved to {logdir}")
-
-
-@torch.no_grad()
-def infer_stage2(args):
-    """Stage 2 inference: encoder + FlattenDeflatten, show GT | Patch | Flat."""
-    device = torch.device(args.device)
-
-    # Load encoder (PatchVAE or UnrolledPatchVAE)
-    print(f"Loading encoder from {args.patch_ckpt}...")
-    patch_vae, _, cfg = _load_model(args.patch_ckpt, device)
-    patch_vae.eval()
-
-    # Load FlattenDeflatten
-    print(f"Loading FlattenDeflatten from {args.flatten_ckpt}...")
-    fk = torch.load(args.flatten_ckpt, map_location="cpu", weights_only=False)
-    fcfg = fk.get("config", {})
-
+    # Create FlattenDeflatten
     bottleneck = FlattenDeflatten(
-        latent_channels=fcfg.get("latent_channels", 32),
-        bottleneck_channels=fcfg.get("bottleneck_channels", 6),
-        spatial_h=fcfg.get("spatial_h", args.H // 8),
-        spatial_w=fcfg.get("spatial_w", args.W // 8),
-        walk_order=fcfg.get("walk_order", "raster"),
-        kernel_size=fcfg.get("kernel_size", 1),
-        deflatten_hidden=fcfg.get("deflatten_hidden", 0),
+        latent_channels=lat_ch,
+        bottleneck_channels=args.bottleneck_ch,
+        spatial_h=lat_H, spatial_w=lat_W,
+        walk_order=args.walk_order,
+        kernel_size=args.kernel_size,
+        deflatten_hidden=args.deflatten_hidden,
     ).to(device)
-    bottleneck.load_state_dict(fk["bottleneck"])
+
+    flatten_cfg = {
+        "latent_channels": lat_ch,
+        "bottleneck_channels": args.bottleneck_ch,
+        "spatial_h": lat_H,
+        "spatial_w": lat_W,
+        "walk_order": args.walk_order,
+        "kernel_size": args.kernel_size,
+        "deflatten_hidden": args.deflatten_hidden,
+    }
+
+    print(f"  Bottleneck: {bottleneck.param_count():,} params, "
+          f"walk={args.walk_order}")
+
+    # Append to pipeline
+    active_stage = len(models_list)
+    models_list.append(("flatten", bottleneck, flatten_cfg))
+    spatial_sizes.append(spatial_sizes[-1])
+
+    # -- Generator --
+    gen = VAEpp0rGenerator(
+        height=args.H, width=args.W, device=str(device),
+        bank_size=5000, n_base_layers=128,
+    )
+    gen.build_banks()
+    gen.disco_quadrant = True
+    print(f"  Generator: bank=5000, layers=128, disco=True")
+
+    # -- Optimizer --
+    opt = torch.optim.AdamW(bottleneck.parameters(), lr=float(args.lr),
+                            weight_decay=0.01)
+
+    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+                 "fp32": torch.float32}[args.precision]
+    scaler = torch.amp.GradScaler("cuda",
+                                   enabled=(args.precision == "fp16"))
+
+    accum = args.grad_accum
+    image_size = (args.H, args.W)
+
+    print(f"Steps: {args.total_steps}, LR: {args.lr}, Batch: {args.batch_size}"
+          f"{f', accum={accum}' if accum > 1 else ''}")
+    print(flush=True)
+
+    # Build full pipeline encode/decode with flatten
+    all_sizes = spatial_sizes
+
+    def full_encode(x):
+        for mt, m, c in models_list:
+            if mt in ("unrolled", "patch"):
+                x = m.encode(x)
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.flatten(x)
+        return x
+
+    def full_decode(x):
+        for i in range(len(models_list) - 1, -1, -1):
+            mt, m, c = models_list[i]
+            if mt in ("unrolled", "patch"):
+                x = m.decode(x, original_size=all_sizes[i])
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.deflatten(x)
+        return x
+
+    # Upstream-only encode/decode (without flatten)
+    upstream_models = models_list[:active_stage]
+    upstream_sizes = spatial_sizes[:active_stage + 1]
+
+    def upstream_encode(x):
+        for mt, m, c in upstream_models:
+            if mt in ("unrolled", "patch"):
+                x = m.encode(x)
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.flatten(x)
+        return x
+
+    def upstream_decode(x):
+        for i in range(len(upstream_models) - 1, -1, -1):
+            mt, m, c = upstream_models[i]
+            if mt in ("unrolled", "patch"):
+                x = m.decode(x, original_size=upstream_sizes[i])
+            elif mt == "refiner":
+                x = m(x)
+            elif mt == "flatten":
+                x = m.deflatten(x)
+        return x
+
+    def _make_ckpt():
+        return _make_pipeline_checkpoint(
+            models_list, active_stage, image_size,
+            opt, None, scaler, step)
+
+    preview_image = getattr(args, 'preview_image', None)
+
+    # Initial preview
     bottleneck.eval()
+    save_preview_pipeline(full_encode, full_decode, gen, str(logdir),
+                          0, device, amp_dtype, preview_image=preview_image)
 
-    print(f"  Bottleneck: {bottleneck.param_count():,} params")
+    # -- Loop --
+    t0 = time.time()
+    stop_file = logdir / ".stop"
+    if stop_file.exists():
+        stop_file.unlink()
 
+    step = 0
+    for step in range(1, args.total_steps + 1):
+        if _stop_requested or stop_file.exists():
+            if stop_file.exists():
+                stop_file.unlink()
+            break
+
+        bottleneck.train()
+        opt.zero_grad(set_to_none=True)
+
+        for _ai in range(accum):
+            images = gen.generate(args.batch_size)
+            x = images.to(device)
+
+            with torch.amp.autocast(device.type, dtype=amp_dtype):
+                # Encode through frozen upstream
+                with torch.no_grad():
+                    latent = upstream_encode(x)
+
+                # Flatten + deflatten
+                lat_recon, flat = bottleneck(latent)
+
+                # Latent reconstruction loss
+                lat_loss = F.mse_loss(lat_recon, latent)
+
+                # Pixel reconstruction loss through frozen upstream decoder
+                _orig = image_size
+                with torch.no_grad():
+                    gt_recon = upstream_decode(latent)
+                flat_recon = upstream_decode(lat_recon)
+                pixel_loss = F.mse_loss(flat_recon, gt_recon)
+
+                total = args.w_latent * lat_loss + args.w_pixel * pixel_loss
+
+            scaler.scale(total / accum).backward()
+            del latent, lat_recon, flat, gt_recon, flat_recon, images, x
+
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(bottleneck.parameters(), 1.0)
+        scaler.step(opt)
+        scaler.update()
+
+        if step % args.log_every == 0:
+            el = time.time() - t0
+            sps = step / max(el, 1)
+            eta = (args.total_steps - step) / max(sps, 1e-6)
+            eta_str = f"{eta/60:.0f}m" if eta < 3600 else f"{eta/3600:.1f}h"
+            print(f"[{step}/{args.total_steps}] lat={lat_loss.item():.6f} "
+                  f"pix={pixel_loss.item():.6f} "
+                  f"({sps:.1f} step/s, {eta_str} left)", flush=True)
+
+        if step % args.preview_every == 0:
+            bottleneck.eval()
+            save_preview_pipeline(full_encode, full_decode, gen, str(logdir),
+                                  step, device, amp_dtype,
+                                  preview_image=preview_image)
+
+        if step % args.save_every == 0:
+            d = _make_ckpt()
+            torch.save(d, logdir / f"step_{step:06d}.pt")
+            torch.save(d, logdir / "latest.pt")
+            print(f"  saved step {step}", flush=True)
+
+            ckpts = sorted(logdir.glob("step_*.pt"),
+                           key=lambda x: x.stat().st_mtime)
+            while len(ckpts) > 10:
+                ckpts.pop(0).unlink()
+
+    if step > 0:
+        d = _make_ckpt()
+        torch.save(d, logdir / f"step_{step:06d}.pt")
+        torch.save(d, logdir / "latest.pt")
+        print(f"  saved step {step}", flush=True)
+
+    print(f"\nDone. {step} steps in {(time.time() - t0) / 60:.1f}min")
+
+
+# =============================================================================
+# infer_pipeline: unified inference with timing
+# =============================================================================
+
+@torch.no_grad()
+def infer_pipeline(args):
+    """Unified inference: log pipeline info, per-stage timing, generate preview."""
+    device = torch.device(args.device)
+
+    print(f"Loading pipeline from {args.ckpt}...")
+    models_list, encode_fn, decode_fn, spatial_sizes, ckpt = \
+        _load_pipeline(args.ckpt, device)
+
+    # Set all models to eval
+    for mt, m, c in models_list:
+        m.eval()
+
+    print(f"\nPipeline: {len(models_list)} stages")
+    print(f"  Image size: {spatial_sizes[0]}")
+
+    total_params = 0
+    for i, (mt, m, c) in enumerate(models_list):
+        if mt in ("unrolled", "patch"):
+            pc = m.param_count()["total"]
+        elif mt == "refiner":
+            pc = m.param_count()
+        else:
+            pc = m.param_count()
+        total_params += pc
+
+        # Latent dims at this stage's output
+        out_size = spatial_sizes[i + 1]
+        if mt in ("unrolled", "patch"):
+            lat_ch = m.latent_channels
+        elif mt == "refiner":
+            lat_ch = c.get("latent_channels", 3)
+        elif mt == "flatten":
+            lat_ch = c.get("bottleneck_channels", 6)
+        else:
+            lat_ch = 3
+        lat_dims = lat_ch * out_size[0] * out_size[1]
+
+        print(f"  Stage {i}: {mt}, {pc:,} params, "
+              f"latent ({lat_ch}, {out_size[0]}, {out_size[1]}) = {lat_dims} dims")
+
+    print(f"  Total params: {total_params:,}")
+
+    # -- Generator --
     gen = VAEpp0rGenerator(
         height=args.H, width=args.W, device=str(device),
         bank_size=5000, n_base_layers=128,
@@ -2338,12 +2005,69 @@ def infer_stage2(args):
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
                  "fp32": torch.float32}[args.precision]
 
+    # -- Per-stage timing --
+    print(f"\nTiming (single image, {args.precision}):")
+
+    images = gen.generate(1)
+    x = images.to(device)
+
+    # Encode timing per stage
+    encode_times = []
+    current = x
+    for i, (mt, m, c) in enumerate(models_list):
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        t0 = time.perf_counter()
+
+        with torch.amp.autocast(device.type, dtype=amp_dtype):
+            if mt in ("unrolled", "patch"):
+                current = m.encode(current)
+            elif mt == "refiner":
+                current = m(current)
+            elif mt == "flatten":
+                current = m.flatten(current)
+
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        dt = (time.perf_counter() - t0) * 1000
+        encode_times.append(dt)
+        print(f"  Encode stage {i} ({mt}): {dt:.1f}ms")
+
+    latent = current
+
+    # Decode timing per stage (reverse)
+    decode_times = []
+    current = latent
+    for i in range(len(models_list) - 1, -1, -1):
+        mt, m, c = models_list[i]
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        t0 = time.perf_counter()
+
+        with torch.amp.autocast(device.type, dtype=amp_dtype):
+            if mt in ("unrolled", "patch"):
+                current = m.decode(current, original_size=spatial_sizes[i])
+            elif mt == "refiner":
+                current = m(current)
+            elif mt == "flatten":
+                current = m.deflatten(current)
+
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        dt = (time.perf_counter() - t0) * 1000
+        decode_times.append(dt)
+        print(f"  Decode stage {i} ({mt}): {dt:.1f}ms")
+
+    total_encode = sum(encode_times)
+    total_decode = sum(decode_times)
+    print(f"\n  Total encode: {total_encode:.1f}ms")
+    print(f"  Total decode: {total_decode:.1f}ms")
+    print(f"  Round-trip:   {total_encode + total_decode:.1f}ms")
+
+    # -- Preview --
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    save_preview_stage2(patch_vae, bottleneck, gen, str(logdir), 0,
-                        device, amp_dtype)
-    print(f"Saved to {logdir}")
+    preview_image = getattr(args, 'preview_image', None)
+    save_preview_pipeline(encode_fn, decode_fn, gen, str(logdir), 0,
+                          device, amp_dtype, preview_image=preview_image)
+    print(f"\nSaved to {logdir}")
 
 
 # =============================================================================
@@ -2351,44 +2075,48 @@ def infer_stage2(args):
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="CPU VAE experiment")
+    p = argparse.ArgumentParser(description="CPU VAE experiment (unified pipeline)")
     sub = p.add_subparsers(dest="command", required=True)
 
-    # -- Stage 1: train --
-    s1 = sub.add_parser("stage1", help="Train PatchVAE or UnrolledPatchVAE")
-    s1.add_argument("--model-type", default="patch",
+    # -- s1: train spatial compression --
+    s1 = sub.add_parser("s1", help="Train spatial compression stage "
+                        "(fresh | resume | extend)")
+    s1.add_argument("--mode", default="fresh",
+                    choices=["fresh", "resume", "extend"],
+                    help="fresh=new model, resume=continue training, "
+                         "extend=add new cascade stage")
+    s1.add_argument("--input-ckpt", default=None,
+                    help="Pipeline checkpoint (required for resume/extend)")
+    s1.add_argument("--model-type", default="unrolled",
                     choices=["patch", "unrolled"],
-                    help="'patch' = PatchVAE (linear projection), "
-                         "'unrolled' = UnrolledPatchVAE (sub-patch structure)")
+                    help="'patch' = PatchVAE, 'unrolled' = UnrolledPatchVAE")
     s1.add_argument("--H", type=int, default=360)
     s1.add_argument("--W", type=int, default=640)
     s1.add_argument("--patch-size", type=int, default=8)
     s1.add_argument("--overlap", type=int, default=0,
-                    help="Pixel overlap between adjacent patches (0=none, "
-                         "1-3 recommended). Blends patch boundaries on decode.")
+                    help="Pixel overlap between adjacent patches (0=none)")
     s1.add_argument("--latent-ch", type=int, default=32)
     s1.add_argument("--hidden-dim", type=int, default=0,
                     help="Hidden layer width for PatchVAE (0 = direct)")
     s1.add_argument("--inner-dim", type=int, default=8,
-                    help="Inner channel width for UnrolledPatchVAE "
-                         "(4=fast ~9ms, 8=default ~21ms, 64=slow ~250ms)")
+                    help="Inner channel width for UnrolledPatchVAE")
     s1.add_argument("--post-kernel", type=int, default=0,
-                    help="Cross-patch Conv1d kernel after encode/before decode "
-                         "(0=off, 5+=recommended for boundary smoothing)")
+                    help="Cross-patch Conv1d kernel (0=off)")
     s1.add_argument("--batch-size", type=int, default=4)
     s1.add_argument("--lr", default="2e-4")
     s1.add_argument("--total-steps", type=int, default=30000)
     s1.add_argument("--w-mse", type=float, default=1.0)
     s1.add_argument("--w-lpips", type=float, default=0.5)
+    s1.add_argument("--w-latent", type=float, default=1.0,
+                    help="Latent MSE weight (extend mode)")
+    s1.add_argument("--w-pixel", type=float, default=0.5,
+                    help="Pixel loss weight (extend mode)")
     s1.add_argument("--precision", default="bf16",
                     choices=["fp16", "bf16", "fp32"])
     s1.add_argument("--grad-accum", type=int, default=1)
     s1.add_argument("--seed", type=int, default=42)
     s1.add_argument("--device", default="cuda:0")
-    s1.add_argument("--resume", default=None)
     s1.add_argument("--fresh-opt", action="store_true")
-    s1.add_argument("--loose-load", action="store_true",
-                    help="Allow missing/extra keys when resuming (for adding new layers)")
     s1.add_argument("--logdir", default="cpu_vae_logs")
     s1.add_argument("--log-every", type=int, default=1)
     s1.add_argument("--save-every", type=int, default=5000)
@@ -2396,10 +2124,45 @@ def main():
     s1.add_argument("--preview-image", default=None,
                     help="Path to a reference image for tracking progress")
 
-    # -- Stage 2: train flatten --
-    s2 = sub.add_parser("stage2", help="Train FlattenDeflatten on frozen PatchVAE")
-    s2.add_argument("--patch-ckpt", required=True,
-                    help="Path to trained PatchVAE checkpoint")
+    # -- refiner: train latent refiner --
+    sr = sub.add_parser("refiner", help="Train latent refiner on frozen pipeline")
+    sr.add_argument("--input-ckpt", required=True,
+                    help="Pipeline checkpoint to refine")
+    sr.add_argument("--H", type=int, default=360)
+    sr.add_argument("--W", type=int, default=640)
+    sr.add_argument("--n-blocks", type=int, default=4)
+    sr.add_argument("--hidden-channels", type=int, default=0,
+                    help="Internal channel width (0=same as latent channels)")
+    sr.add_argument("--kernel-size", type=int, default=5)
+    sr.add_argument("--walk-order", default="hilbert",
+                    choices=["raster", "hilbert", "morton"])
+    sr.add_argument("--dropout", type=float, default=0.0)
+    sr.add_argument("--blur-sigma", type=float, default=0.0,
+                    help="Gaussian noise sigma added to input latent (0=off)")
+    sr.add_argument("--finetune-decoder", action="store_true",
+                    help="Jointly finetune the upstream decoder with the refiner")
+    sr.add_argument("--batch-size", type=int, default=4)
+    sr.add_argument("--lr", default="1e-3")
+    sr.add_argument("--total-steps", type=int, default=10000)
+    sr.add_argument("--w-pixel", type=float, default=1.0)
+    sr.add_argument("--w-reg", type=float, default=0.01,
+                    help="Latent regularization weight")
+    sr.add_argument("--precision", default="bf16",
+                    choices=["fp16", "bf16", "fp32"])
+    sr.add_argument("--grad-accum", type=int, default=1)
+    sr.add_argument("--seed", type=int, default=42)
+    sr.add_argument("--device", default="cuda:0")
+    sr.add_argument("--fresh-opt", action="store_true")
+    sr.add_argument("--logdir", default="cpu_vae_refiner_logs")
+    sr.add_argument("--log-every", type=int, default=1)
+    sr.add_argument("--save-every", type=int, default=2000)
+    sr.add_argument("--preview-every", type=int, default=100)
+    sr.add_argument("--preview-image", default=None)
+
+    # -- s2: train flatten bottleneck --
+    s2 = sub.add_parser("s2", help="Train FlattenDeflatten on frozen pipeline")
+    s2.add_argument("--input-ckpt", required=True,
+                    help="Pipeline checkpoint")
     s2.add_argument("--H", type=int, default=360)
     s2.add_argument("--W", type=int, default=640)
     s2.add_argument("--bottleneck-ch", type=int, default=6)
@@ -2408,7 +2171,7 @@ def main():
     s2.add_argument("--kernel-size", type=int, default=1,
                     help="Conv1d kernel size (1=per-position, 3+=cross-position mixing)")
     s2.add_argument("--deflatten-hidden", type=int, default=0,
-                    help="Hidden dim in deflatten path (0=direct, >0=Conv1d->GELU->Conv1d)")
+                    help="Hidden dim in deflatten path (0=direct)")
     s2.add_argument("--batch-size", type=int, default=4)
     s2.add_argument("--lr", default="1e-3")
     s2.add_argument("--total-steps", type=int, default=10000)
@@ -2419,144 +2182,35 @@ def main():
     s2.add_argument("--grad-accum", type=int, default=1)
     s2.add_argument("--seed", type=int, default=42)
     s2.add_argument("--device", default="cuda:0")
-    s2.add_argument("--resume", default=None)
     s2.add_argument("--fresh-opt", action="store_true")
     s2.add_argument("--logdir", default="cpu_vae_flatten_logs")
     s2.add_argument("--log-every", type=int, default=1)
     s2.add_argument("--save-every", type=int, default=2000)
     s2.add_argument("--preview-every", type=int, default=200)
-    s2.add_argument("--preview-image", default=None,
-                    help="Path to a reference image for tracking progress")
+    s2.add_argument("--preview-image", default=None)
 
-    # -- Stage 1.5: cascaded spatial compression --
-    s15 = sub.add_parser("stage1_5", help="Train S1.5 cascaded compression")
-    s15.add_argument("--s1-ckpt", required=True,
-                     help="Path to trained S1 checkpoint")
-    s15.add_argument("--H", type=int, default=360)
-    s15.add_argument("--W", type=int, default=640)
-    s15.add_argument("--patch-size", type=int, default=4,
-                     help="S1.5 patch size (operates on S1 latent grid)")
-    s15.add_argument("--overlap", type=int, default=0)
-    s15.add_argument("--latent-ch", type=int, default=3)
-    s15.add_argument("--inner-dim", type=int, default=4)
-    s15.add_argument("--hidden-dim", type=int, default=0,
-                     help="Hidden layer width in enc/dec mix (0=direct)")
-    s15.add_argument("--post-kernel", type=int, default=0)
-    s15.add_argument("--batch-size", type=int, default=4)
-    s15.add_argument("--lr", default="2e-4")
-    s15.add_argument("--total-steps", type=int, default=20000)
-    s15.add_argument("--w-latent", type=float, default=1.0)
-    s15.add_argument("--w-pixel", type=float, default=0.5)
-    s15.add_argument("--precision", default="bf16",
+    # -- infer: unified inference --
+    inf = sub.add_parser("infer", help="Unified pipeline inference with timing")
+    inf.add_argument("--ckpt", required=True,
+                     help="Pipeline checkpoint")
+    inf.add_argument("--H", type=int, default=360)
+    inf.add_argument("--W", type=int, default=640)
+    inf.add_argument("--precision", default="bf16",
                      choices=["fp16", "bf16", "fp32"])
-    s15.add_argument("--grad-accum", type=int, default=1)
-    s15.add_argument("--seed", type=int, default=42)
-    s15.add_argument("--device", default="cuda:0")
-    s15.add_argument("--resume", default=None)
-    s15.add_argument("--fresh-opt", action="store_true")
-    s15.add_argument("--loose-load", action="store_true")
-    s15.add_argument("--logdir", default="cpu_vae_s1_5_logs")
-    s15.add_argument("--log-every", type=int, default=1)
-    s15.add_argument("--save-every", type=int, default=5000)
-    s15.add_argument("--preview-every", type=int, default=100)
-    s15.add_argument("--preview-image", default=None)
-
-    # -- Stage 1.5 inference --
-    i15 = sub.add_parser("infer1_5", help="S1 + S1.5 inference (fused checkpoint)")
-    i15.add_argument("--s1-5-ckpt", required=True,
-                     help="Fused S1.5 checkpoint (contains S1 weights)")
-    i15.add_argument("--H", type=int, default=360)
-    i15.add_argument("--W", type=int, default=640)
-    i15.add_argument("--precision", default="bf16")
-    i15.add_argument("--device", default="cuda:0")
-    i15.add_argument("--logdir", default="cpu_vae_s1_5_logs")
-
-    # -- Refiner: train --
-    sr = sub.add_parser("refiner", help="Train latent refiner")
-    sr.add_argument("--s1-ckpt", required=True)
-    sr.add_argument("--s1-5-ckpt", default=None,
-                    help="Optional S1.5 checkpoint (refiner runs after S1.5)")
-    sr.add_argument("--H", type=int, default=360)
-    sr.add_argument("--W", type=int, default=640)
-    sr.add_argument("--n-blocks", type=int, default=4)
-    sr.add_argument("--hidden-channels", type=int, default=0,
-                    help="Internal channel width (0=same as latent channels)")
-    sr.add_argument("--kernel-size", type=int, default=5)
-    sr.add_argument("--walk-order", default="hilbert",
-                    choices=["raster", "hilbert", "morton"])
-    sr.add_argument("--dropout", type=float, default=0.0)
-    sr.add_argument("--batch-size", type=int, default=4)
-    sr.add_argument("--lr", default="1e-3")
-    sr.add_argument("--total-steps", type=int, default=10000)
-    sr.add_argument("--w-pixel", type=float, default=1.0)
-    sr.add_argument("--w-reg", type=float, default=0.01,
-                    help="Latent regularization weight (keep refined close to clean)")
-    sr.add_argument("--blur-sigma", type=float, default=0.0,
-                    help="Gaussian noise sigma added to input latent (0=off, "
-                         "0.05-0.2 recommended for denoising signal)")
-    sr.add_argument("--finetune-decoder", action="store_true",
-                    help="Jointly finetune the upstream decoder with the refiner")
-    sr.add_argument("--precision", default="bf16",
-                    choices=["fp16", "bf16", "fp32"])
-    sr.add_argument("--grad-accum", type=int, default=1)
-    sr.add_argument("--seed", type=int, default=42)
-    sr.add_argument("--device", default="cuda:0")
-    sr.add_argument("--resume", default=None)
-    sr.add_argument("--fresh-opt", action="store_true")
-    sr.add_argument("--logdir", default="cpu_vae_refiner_logs")
-    sr.add_argument("--log-every", type=int, default=1)
-    sr.add_argument("--save-every", type=int, default=2000)
-    sr.add_argument("--preview-every", type=int, default=100)
-    sr.add_argument("--preview-image", default=None)
-
-    # -- Refiner: inference --
-    ir = sub.add_parser("infer_refiner",
-                        help="Refiner inference (fused checkpoint)")
-    ir.add_argument("--refiner-ckpt", required=True,
-                    help="Fused refiner checkpoint (contains all upstream)")
-    ir.add_argument("--H", type=int, default=360)
-    ir.add_argument("--W", type=int, default=640)
-    ir.add_argument("--precision", default="bf16")
-    ir.add_argument("--device", default="cuda:0")
-    ir.add_argument("--logdir", default="cpu_vae_refiner_logs")
-
-    # -- Stage 1 inference --
-    i1 = sub.add_parser("infer1", help="PatchVAE inference")
-    i1.add_argument("--patch-ckpt", required=True)
-    i1.add_argument("--H", type=int, default=360)
-    i1.add_argument("--W", type=int, default=640)
-    i1.add_argument("--precision", default="bf16")
-    i1.add_argument("--device", default="cuda:0")
-    i1.add_argument("--logdir", default="cpu_vae_logs")
-
-    # -- Stage 2 inference --
-    i2 = sub.add_parser("infer2", help="PatchVAE + Flatten inference")
-    i2.add_argument("--patch-ckpt", required=True)
-    i2.add_argument("--flatten-ckpt", required=True)
-    i2.add_argument("--H", type=int, default=360)
-    i2.add_argument("--W", type=int, default=640)
-    i2.add_argument("--precision", default="bf16")
-    i2.add_argument("--device", default="cuda:0")
-    i2.add_argument("--logdir", default="cpu_vae_flatten_logs")
+    inf.add_argument("--device", default="cuda:0")
+    inf.add_argument("--logdir", default="cpu_vae_logs")
+    inf.add_argument("--preview-image", default=None)
 
     args = p.parse_args()
 
-    if args.command == "stage1":
-        train_stage1(args)
-    elif args.command == "stage1_5":
-        train_stage1_5(args)
+    if args.command == "s1":
+        train_s1(args)
     elif args.command == "refiner":
         train_refiner(args)
-    elif args.command == "stage2":
-        train_stage2(args)
-    elif args.command == "infer1":
-        infer_stage1(args)
-    elif args.command == "infer1_5":
-        infer_stage1_5(args)
-    elif args.command == "infer_refiner":
-        infer_refiner(args)
-    elif args.command == "infer2":
-        infer_stage2(args)
+    elif args.command == "s2":
+        train_s2(args)
+    elif args.command == "infer":
+        infer_pipeline(args)
 
 
 if __name__ == "__main__":
