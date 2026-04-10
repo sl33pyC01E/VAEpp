@@ -479,6 +479,130 @@ class UnrolledPatchVAE(nn.Module):
         return {"encoder": enc, "decoder": dec, "total": total}
 
 
+class LatentRefiner(nn.Module):
+    """Conv1d refinement module for latent grids.
+
+    Takes a spatial latent (B, C, H, W), serializes via walk order,
+    runs residual Conv1d blocks for cross-position mixing, reshapes back.
+    Same input/output shape — no dimensionality change.
+
+    Smooths patch boundary artifacts by mixing neighboring latent positions.
+
+    Args:
+        latent_channels: channel count of the latent grid
+        spatial_h, spatial_w: spatial dims of the latent grid
+        n_blocks: number of residual Conv1d blocks
+        kernel_size: Conv1d kernel size per block
+        walk_order: serialization order for 1D mixing
+    """
+
+    def __init__(self, latent_channels=3, spatial_h=36, spatial_w=64,
+                 n_blocks=4, kernel_size=5, walk_order="hilbert"):
+        super().__init__()
+        self.C = latent_channels
+        self.H = spatial_h
+        self.W = spatial_w
+        self.n_positions = spatial_h * spatial_w
+        self.n_blocks = n_blocks
+        self.walk_order = walk_order
+
+        # Residual Conv1d blocks
+        self.blocks = nn.ModuleList()
+        for _ in range(n_blocks):
+            self.blocks.append(nn.Sequential(
+                nn.Conv1d(latent_channels, latent_channels,
+                          kernel_size, padding="same"),
+                nn.GELU(),
+                nn.Conv1d(latent_channels, latent_channels,
+                          kernel_size, padding="same"),
+            ))
+
+        # Walk order indices
+        self.register_buffer("walk_idx", self._build_walk_index())
+        self.register_buffer("unwalk_idx", self._build_unwalk_index())
+
+    def _build_walk_index(self):
+        if self.walk_order == "raster":
+            return torch.arange(self.n_positions)
+        elif self.walk_order == "hilbert":
+            return torch.tensor(self._hilbert_curve(self.H, self.W),
+                                dtype=torch.long)
+        elif self.walk_order == "morton":
+            return torch.tensor(self._morton_curve(self.H, self.W),
+                                dtype=torch.long)
+        return torch.arange(self.n_positions)
+
+    def _build_unwalk_index(self):
+        idx = self.walk_idx
+        inv = torch.zeros_like(idx)
+        inv[idx] = torch.arange(len(idx))
+        return inv
+
+    def _hilbert_curve(self, h, w):
+        order = max(h, w).bit_length()
+        n = 1 << order
+        def d2xy(n, d):
+            x = y = 0
+            s = 1
+            while s < n:
+                rx = 1 if (d & 2) else 0
+                ry = 1 if ((d & 1) ^ rx) else 0
+                if ry == 0:
+                    if rx == 1:
+                        x = s - 1 - x
+                        y = s - 1 - y
+                    x, y = y, x
+                x += s * rx
+                y += s * ry
+                d >>= 2
+                s <<= 1
+            return x, y
+        coords = []
+        for d in range(n * n):
+            x, y = d2xy(n, d)
+            if y < h and x < w:
+                coords.append(y * w + x)
+        return coords
+
+    def _morton_curve(self, h, w):
+        coords = []
+        for i in range(h):
+            for j in range(w):
+                z = 0
+                for bit in range(16):
+                    z |= ((i >> bit) & 1) << (2 * bit + 1)
+                    z |= ((j >> bit) & 1) << (2 * bit)
+                coords.append((z, i * w + j))
+        coords.sort()
+        return [c[1] for c in coords]
+
+    def forward(self, latent):
+        """Refine latent grid via residual Conv1d mixing.
+
+        Args:
+            latent: (B, C, H, W)
+
+        Returns:
+            refined: (B, C, H, W) — same shape, smoothed
+        """
+        B, C, H, W = latent.shape
+        # Flatten to 1D sequence
+        seq = latent.reshape(B, C, H * W)
+        # Walk reorder
+        seq = seq[:, :, self.walk_idx]
+
+        # Residual blocks
+        for block in self.blocks:
+            seq = block(seq) + seq
+
+        # Unwalk and reshape
+        seq = seq[:, :, self.unwalk_idx]
+        return seq.reshape(B, C, H, W)
+
+    def param_count(self):
+        return sum(p.numel() for p in self.parameters())
+
+
 def _make_model(model_type, patch_size=8, overlap=0, image_channels=3,
                 latent_channels=32, hidden_dim=0, inner_dim=64,
                 post_kernel=0):
@@ -1581,6 +1705,349 @@ def infer_stage1_5(args):
     print(f"Saved to {logdir}")
 
 
+# =============================================================================
+# Refiner: latent smoothing via residual Conv1d
+# =============================================================================
+
+def _load_upstream(args, device):
+    """Load the upstream pipeline (S1, optionally S1.5) for refiner training.
+
+    Returns (encode_fn, decode_fn, lat_C, lat_H, lat_W) where
+    encode_fn maps images -> latent and decode_fn maps latent -> pixels.
+    """
+    # Load S1
+    s1_model, _, s1_cfg = _load_model(args.s1_ckpt, device)
+    s1_model.eval()
+    s1_model.requires_grad_(False)
+    s1_H, s1_W = s1_model._patch_grid_size(args.H, args.W)
+
+    s1_5_model = None
+    if getattr(args, 's1_5_ckpt', None):
+        s1_5_model, _, s1_5_cfg = _load_model(args.s1_5_ckpt, device)
+        s1_5_model.eval()
+        s1_5_model.requires_grad_(False)
+
+    if s1_5_model is not None:
+        lat_H, lat_W = s1_5_model._patch_grid_size(s1_H, s1_W)
+        lat_C = s1_5_model.latent_channels
+
+        def encode_fn(x):
+            s1_lat = s1_model.encode(x)
+            return s1_5_model.encode(s1_lat)
+
+        def decode_fn(lat):
+            s1_lat = s1_5_model.decode(lat, original_size=(s1_H, s1_W))
+            return s1_model.decode(s1_lat, original_size=(args.H, args.W))
+    else:
+        lat_H, lat_W = s1_H, s1_W
+        lat_C = s1_model.latent_channels
+
+        def encode_fn(x):
+            return s1_model.encode(x)
+
+        def decode_fn(lat):
+            return s1_model.decode(lat, original_size=(args.H, args.W))
+
+    print(f"  Upstream latent: ({lat_C}, {lat_H}, {lat_W}) = "
+          f"{lat_C * lat_H * lat_W} dims")
+    return encode_fn, decode_fn, lat_C, lat_H, lat_W
+
+
+@torch.no_grad()
+def save_preview_refiner(encode_fn, decode_fn, refiner, gen, logdir, step,
+                         device, amp_dtype, preview_image=None):
+    """Save GT | Upstream | Refined preview."""
+    try:
+        refiner.eval()
+        from PIL import Image
+
+        H, W = gen.H, gen.W
+        sep = np.full((H, 4, 3), 14, dtype=np.uint8)
+        sections = []
+
+        # -- Reference image --
+        if preview_image and os.path.exists(preview_image):
+            ref = load_real_image(preview_image, H, W, device)
+            with torch.amp.autocast(device.type, dtype=amp_dtype):
+                lat = encode_fn(ref)
+                recon_raw = decode_fn(lat)
+                lat_refined = refiner(lat)
+                recon_refined = decode_fn(lat_refined)
+            rg = (ref[0].cpu().numpy().transpose(1, 2, 0) * 255
+                  ).clip(0, 255).astype(np.uint8)
+            rr = (recon_raw[0, :3].clamp(0, 1).float().cpu().numpy()
+                  .transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+            rf = (recon_refined[0, :3].clamp(0, 1).float().cpu().numpy()
+                  .transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+            ref_row = np.concatenate([rg, sep, rr, sep, rf], axis=1)
+            sections.append(ref_row)
+
+        # -- Synthetic --
+        images = gen.generate(1)
+        x = images.to(device)
+        with torch.amp.autocast(device.type, dtype=amp_dtype):
+            lat = encode_fn(x)
+            recon_raw = decode_fn(lat)
+            lat_refined = refiner(lat)
+            recon_refined = decode_fn(lat_refined)
+        g = (images[0].cpu().numpy().transpose(1, 2, 0) * 255
+             ).clip(0, 255).astype(np.uint8)
+        v = (recon_raw[0, :3].clamp(0, 1).float().cpu().numpy()
+             .transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+        f = (recon_refined[0, :3].clamp(0, 1).float().cpu().numpy()
+             .transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+        synth_row = np.concatenate([g, sep, v, sep, f], axis=1)
+        sections.append(synth_row)
+
+        # Combine
+        if len(sections) > 1:
+            ref_w = sections[0].shape[1]
+            from PIL import Image as _PILImg
+            syn_pil = _PILImg.fromarray(sections[1])
+            syn_scale = ref_w / sections[1].shape[1]
+            syn_h = int(sections[1].shape[0] * syn_scale * 0.5)
+            syn_pil = syn_pil.resize((ref_w, syn_h), _PILImg.BILINEAR)
+            sections[1] = np.array(syn_pil)
+            gap = np.full((6, ref_w, 3), 14, dtype=np.uint8)
+            grid = np.concatenate([sections[0], gap, sections[1]], axis=0)
+        else:
+            grid = sections[0]
+
+        refiner.train()
+
+        stepped = os.path.join(logdir, f"preview_{step:06d}.png")
+        latest = os.path.join(logdir, "preview_latest.png")
+        Image.fromarray(grid).save(stepped)
+        Image.fromarray(grid).save(latest)
+        print(f"  preview: {stepped} (GT | Raw | Refined)", flush=True)
+    except Exception as e:
+        import traceback
+        print(f"  preview failed: {e}", flush=True)
+        traceback.print_exc()
+        refiner.train()
+
+
+def train_refiner(args):
+    device = torch.device(args.device)
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+
+    logdir = pathlib.Path(args.logdir)
+    logdir.mkdir(parents=True, exist_ok=True)
+
+    # -- Load upstream --
+    encode_fn, decode_fn, lat_C, lat_H, lat_W = _load_upstream(args, device)
+
+    # -- Refiner --
+    refiner = LatentRefiner(
+        latent_channels=lat_C,
+        spatial_h=lat_H, spatial_w=lat_W,
+        n_blocks=args.n_blocks,
+        kernel_size=args.kernel_size,
+        walk_order=args.walk_order,
+    ).to(device)
+    print(f"  Refiner: {args.n_blocks} blocks, kernel={args.kernel_size}, "
+          f"walk={args.walk_order}, {refiner.param_count():,} params")
+
+    # -- Generator --
+    gen = VAEpp0rGenerator(
+        height=args.H, width=args.W, device=str(device),
+        bank_size=5000, n_base_layers=128,
+    )
+    gen.build_banks()
+    gen.disco_quadrant = True
+
+    # -- Optimizer --
+    opt = torch.optim.AdamW(refiner.parameters(), lr=float(args.lr),
+                            weight_decay=0.01)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01)
+
+    # -- Resume --
+    start_step = 0
+    if args.resume:
+        rk = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if "refiner" in rk:
+            refiner.load_state_dict(rk["refiner"])
+            start_step = rk.get("step", 0)
+            if not args.fresh_opt and rk.get("optimizer"):
+                try:
+                    opt.load_state_dict(rk["optimizer"])
+                except Exception:
+                    print("  Fresh optimizer (mismatch)")
+            if rk.get("scheduler") and not args.fresh_opt:
+                sched.load_state_dict(rk["scheduler"])
+            else:
+                sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=args.total_steps,
+                    eta_min=float(args.lr) * 0.01, last_epoch=start_step)
+            print(f"  Resumed refiner from {args.resume} at step {start_step}")
+
+    if args.fresh_opt and start_step > 0:
+        opt = torch.optim.AdamW(refiner.parameters(), lr=float(args.lr),
+                                weight_decay=0.01)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=args.total_steps - start_step,
+            eta_min=float(args.lr) * 0.01)
+
+    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+                 "fp32": torch.float32}[args.precision]
+    scaler = torch.amp.GradScaler("cuda",
+                                   enabled=(args.precision == "fp16"))
+
+    accum = args.grad_accum
+
+    print(f"Steps: {args.total_steps}, LR: {args.lr}, Batch: {args.batch_size}")
+    print(flush=True)
+
+    def _make_checkpoint():
+        return {
+            "refiner": refiner.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
+            "step": step,
+            "config": {
+                "latent_channels": lat_C,
+                "spatial_h": lat_H,
+                "spatial_w": lat_W,
+                "n_blocks": args.n_blocks,
+                "kernel_size": args.kernel_size,
+                "walk_order": args.walk_order,
+                "s1_ckpt": args.s1_ckpt,
+                "s1_5_ckpt": getattr(args, 's1_5_ckpt', None),
+            },
+        }
+
+    preview_image = getattr(args, 'preview_image', None)
+
+    save_preview_refiner(encode_fn, decode_fn, refiner, gen, str(logdir),
+                         start_step, device, amp_dtype,
+                         preview_image=preview_image)
+
+    # -- Loop --
+    t0 = time.time()
+    stop_file = logdir / ".stop"
+    if stop_file.exists():
+        stop_file.unlink()
+
+    step = start_step
+    for step in range(start_step + 1, args.total_steps + 1):
+        if _stop_requested or stop_file.exists():
+            if stop_file.exists():
+                stop_file.unlink()
+            break
+
+        refiner.train()
+        opt.zero_grad(set_to_none=True)
+
+        for _ai in range(accum):
+            images = gen.generate(args.batch_size)
+            x = images.to(device)
+
+            with torch.amp.autocast(device.type, dtype=amp_dtype):
+                with torch.no_grad():
+                    lat = encode_fn(x)
+                    pixel_gt = decode_fn(lat)
+
+                lat_refined = refiner(lat)
+                pixel_refined = decode_fn(lat_refined)
+
+                # Pixel loss: refined decode should match original image
+                pixel_loss = F.mse_loss(pixel_refined, x)
+                # Latent smoothness: refined latent shouldn't deviate too far
+                lat_reg = F.mse_loss(lat_refined, lat)
+
+                total = args.w_pixel * pixel_loss + args.w_reg * lat_reg
+
+            scaler.scale(total / accum).backward()
+            del lat, lat_refined, pixel_gt, pixel_refined, images, x
+
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(refiner.parameters(), 1.0)
+        scaler.step(opt)
+        scaler.update()
+        sched.step()
+
+        if step % args.log_every == 0:
+            el = time.time() - t0
+            sps = (step - start_step) / max(el, 1)
+            eta = (args.total_steps - step) / max(sps, 1e-6)
+            eta_str = f"{eta/60:.0f}m" if eta < 3600 else f"{eta/3600:.1f}h"
+            print(f"[{step}/{args.total_steps}] pix={pixel_loss.item():.6f} "
+                  f"reg={lat_reg.item():.6f} "
+                  f"({sps:.1f} step/s, {eta_str} left)", flush=True)
+
+        if step % args.preview_every == 0:
+            save_preview_refiner(encode_fn, decode_fn, refiner, gen,
+                                 str(logdir), step, device, amp_dtype,
+                                 preview_image=preview_image)
+
+        if step % args.save_every == 0:
+            d = _make_checkpoint()
+            torch.save(d, logdir / f"step_{step:06d}.pt")
+            torch.save(d, logdir / "latest.pt")
+            print(f"  saved step {step}", flush=True)
+
+            ckpts = sorted(logdir.glob("step_*.pt"),
+                           key=lambda x: x.stat().st_mtime)
+            while len(ckpts) > 10:
+                ckpts.pop(0).unlink()
+
+    if step > start_step:
+        d = _make_checkpoint()
+        torch.save(d, logdir / f"step_{step:06d}.pt")
+        torch.save(d, logdir / "latest.pt")
+        print(f"  saved step {step}", flush=True)
+
+    print(f"\nDone. {step - start_step} steps in "
+          f"{(time.time() - t0) / 60:.1f}min")
+
+
+@torch.no_grad()
+def infer_refiner(args):
+    """Refiner inference."""
+    device = torch.device(args.device)
+
+    encode_fn, decode_fn, lat_C, lat_H, lat_W = _load_upstream(args, device)
+
+    print(f"Loading refiner from {args.refiner_ckpt}...")
+    rk = torch.load(args.refiner_ckpt, map_location="cpu", weights_only=False)
+    rcfg = rk.get("config", {})
+
+    refiner = LatentRefiner(
+        latent_channels=rcfg.get("latent_channels", lat_C),
+        spatial_h=rcfg.get("spatial_h", lat_H),
+        spatial_w=rcfg.get("spatial_w", lat_W),
+        n_blocks=rcfg.get("n_blocks", 4),
+        kernel_size=rcfg.get("kernel_size", 5),
+        walk_order=rcfg.get("walk_order", "hilbert"),
+    ).to(device)
+    refiner.load_state_dict(rk["refiner"])
+    refiner.eval()
+    print(f"  Refiner: {refiner.param_count():,} params")
+
+    gen = VAEpp0rGenerator(
+        height=args.H, width=args.W, device=str(device),
+        bank_size=5000, n_base_layers=128,
+    )
+    gen.build_banks()
+    gen.disco_quadrant = True
+
+    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+                 "fp32": torch.float32}[args.precision]
+
+    logdir = pathlib.Path(args.logdir)
+    logdir.mkdir(parents=True, exist_ok=True)
+
+    save_preview_refiner(encode_fn, decode_fn, refiner, gen, str(logdir),
+                         0, device, amp_dtype)
+    print(f"Saved to {logdir}")
+
+
+# =============================================================================
+# Inference
+# =============================================================================
+
 @torch.no_grad()
 def infer_stage1(args):
     """Stage 1 inference: load PatchVAE/UnrolledPatchVAE, show GT | Recon."""
@@ -1782,6 +2249,47 @@ def main():
     i15.add_argument("--device", default="cuda:0")
     i15.add_argument("--logdir", default="cpu_vae_s1_5_logs")
 
+    # -- Refiner: train --
+    sr = sub.add_parser("refiner", help="Train latent refiner")
+    sr.add_argument("--s1-ckpt", required=True)
+    sr.add_argument("--s1-5-ckpt", default=None,
+                    help="Optional S1.5 checkpoint (refiner runs after S1.5)")
+    sr.add_argument("--H", type=int, default=360)
+    sr.add_argument("--W", type=int, default=640)
+    sr.add_argument("--n-blocks", type=int, default=4)
+    sr.add_argument("--kernel-size", type=int, default=5)
+    sr.add_argument("--walk-order", default="hilbert",
+                    choices=["raster", "hilbert", "morton"])
+    sr.add_argument("--batch-size", type=int, default=4)
+    sr.add_argument("--lr", default="1e-3")
+    sr.add_argument("--total-steps", type=int, default=10000)
+    sr.add_argument("--w-pixel", type=float, default=1.0)
+    sr.add_argument("--w-reg", type=float, default=0.1,
+                    help="Latent regularization weight (keep refined close to original)")
+    sr.add_argument("--precision", default="bf16",
+                    choices=["fp16", "bf16", "fp32"])
+    sr.add_argument("--grad-accum", type=int, default=1)
+    sr.add_argument("--seed", type=int, default=42)
+    sr.add_argument("--device", default="cuda:0")
+    sr.add_argument("--resume", default=None)
+    sr.add_argument("--fresh-opt", action="store_true")
+    sr.add_argument("--logdir", default="cpu_vae_refiner_logs")
+    sr.add_argument("--log-every", type=int, default=1)
+    sr.add_argument("--save-every", type=int, default=2000)
+    sr.add_argument("--preview-every", type=int, default=100)
+    sr.add_argument("--preview-image", default=None)
+
+    # -- Refiner: inference --
+    ir = sub.add_parser("infer_refiner", help="Refiner inference")
+    ir.add_argument("--s1-ckpt", required=True)
+    ir.add_argument("--s1-5-ckpt", default=None)
+    ir.add_argument("--refiner-ckpt", required=True)
+    ir.add_argument("--H", type=int, default=360)
+    ir.add_argument("--W", type=int, default=640)
+    ir.add_argument("--precision", default="bf16")
+    ir.add_argument("--device", default="cuda:0")
+    ir.add_argument("--logdir", default="cpu_vae_refiner_logs")
+
     # -- Stage 1 inference --
     i1 = sub.add_parser("infer1", help="PatchVAE inference")
     i1.add_argument("--patch-ckpt", required=True)
@@ -1807,12 +2315,16 @@ def main():
         train_stage1(args)
     elif args.command == "stage1_5":
         train_stage1_5(args)
+    elif args.command == "refiner":
+        train_refiner(args)
     elif args.command == "stage2":
         train_stage2(args)
     elif args.command == "infer1":
         infer_stage1(args)
     elif args.command == "infer1_5":
         infer_stage1_5(args)
+    elif args.command == "infer_refiner":
+        infer_refiner(args)
     elif args.command == "infer2":
         infer_stage2(args)
 
