@@ -2108,10 +2108,7 @@ def train_refiner(args):
             del lat, lat_refined, pixel_refined, images, x
 
         scaler.unscale_(opt)
-        clip_params = list(refiner.parameters())
-        if finetune_decoder and decoder_model is not None:
-            clip_params += list(decoder_model.parameters())
-        torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+        torch.nn.utils.clip_grad_norm_(train_params, 1.0)
         scaler.step(opt)
         scaler.update()
         sched.step()
