@@ -63,10 +63,19 @@ class PreviewWatcher:
             if best_path and best_mt > self._preview_mtime:
                 self._preview_mtime = best_mt
                 pil = Image.open(best_path)
-                # Scale to fit ~900px wide
+                # Scale to fit available space
                 w, h = pil.size
-                if w > 900:
-                    scale = 900 / w
+                try:
+                    avail_w = self._preview_label.winfo_width()
+                    avail_h = self._preview_label.winfo_height()
+                    if avail_w < 100:
+                        avail_w = self.winfo_width() - 20
+                    if avail_h < 100:
+                        avail_h = self.winfo_height() - 300
+                except Exception:
+                    avail_w, avail_h = 1000, 600
+                scale = min(avail_w / w, avail_h / h, 1.0)
+                if scale < 1.0:
                     pil = pil.resize((int(w * scale), int(h * scale)),
                                      BILINEAR)
                 self._preview_photo = ImageTk.PhotoImage(pil)
@@ -373,8 +382,8 @@ class Stage2TrainTab(tk.Frame, PreviewWatcher):
         # Row 1: checkpoints
         row1 = tk.Frame(top, bg=BG_PANEL)
         row1.pack(fill="x", pady=(5, 0))
-        f, self.patch_ckpt = make_float(row1, "PatchVAE checkpoint",
-            os.path.join(PROJECT_ROOT, "cpu_vae_logs", "latest.pt"), width=50)
+        f, self.patch_ckpt = make_float(row1, "Encoder checkpoint",
+            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"), width=50)
         f.pack(side="left", fill="x", expand=True)
 
         row1b = tk.Frame(top, bg=BG_PANEL)
@@ -386,13 +395,13 @@ class Stage2TrainTab(tk.Frame, PreviewWatcher):
         # Row 2: bottleneck config
         row2 = tk.Frame(top, bg=BG_PANEL)
         row2.pack(fill="x", pady=(5, 0))
-        f, self.bottleneck_ch = make_spin(row2, "Bottleneck ch", default=6)
+        f, self.bottleneck_ch = make_spin(row2, "Bottleneck ch", default=1)
         f.pack(side="left", padx=(0, 10))
 
         wf = tk.Frame(row2, bg=BG_PANEL)
         tk.Label(wf, text="Walk order", bg=BG_PANEL, fg=FG_DIM,
                  font=FONT_SMALL).pack(anchor="w")
-        self.walk_var = tk.StringVar(value="raster")
+        self.walk_var = tk.StringVar(value="hilbert")
         walk_menu = tk.OptionMenu(wf, self.walk_var, "raster", "hilbert",
                                   "morton")
         walk_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
@@ -401,7 +410,9 @@ class Stage2TrainTab(tk.Frame, PreviewWatcher):
         walk_menu.pack(anchor="w")
         wf.pack(side="left", padx=(0, 10))
 
-        f, self.kernel_var = make_spin(row2, "Kernel", default=1)
+        f, self.kernel_var = make_spin(row2, "Kernel", default=10)
+        f.pack(side="left", padx=(0, 10))
+        f, self.deflatten_hidden = make_spin(row2, "Defl hidden", default=0)
         f.pack(side="left", padx=(0, 10))
         f, self.lr_var = make_float(row2, "LR", "1e-3")
         f.pack(side="left", padx=(0, 10))
@@ -429,7 +440,7 @@ class Stage2TrainTab(tk.Frame, PreviewWatcher):
         row4.pack(fill="x", pady=(5, 0))
         f, self.save_every = make_spin(row4, "Save every", default=2000)
         f.pack(side="left", padx=(0, 10))
-        f, self.preview_every = make_spin(row4, "Preview every", default=200)
+        f, self.preview_every = make_spin(row4, "Preview every", default=100)
         f.pack(side="left", padx=(0, 10))
         f, self.grad_accum = make_spin(row4, "Grad accum", default=1)
         f.pack(side="left")
@@ -488,6 +499,7 @@ class Stage2TrainTab(tk.Frame, PreviewWatcher):
                "--bottleneck-ch", str(self.bottleneck_ch.get()),
                "--walk-order", self.walk_var.get(),
                "--kernel-size", str(self.kernel_var.get()),
+               "--deflatten-hidden", str(self.deflatten_hidden.get()),
                "--lr", self.lr_var.get(),
                "--batch-size", str(self.batch_var.get()),
                "--total-steps", str(self.steps_var.get()),
@@ -647,6 +659,7 @@ class Stage2InferTab(tk.Frame, PreviewWatcher):
                 spatial_w=fcfg.get("spatial_w", W // 8),
                 walk_order=fcfg.get("walk_order", "raster"),
                 kernel_size=fcfg.get("kernel_size", 1),
+                deflatten_hidden=fcfg.get("deflatten_hidden", 0),
             ).to(device)
             bottleneck.load_state_dict(fk["bottleneck"])
             bottleneck.eval()
@@ -695,6 +708,8 @@ class UnrolledTrainTab(tk.Frame, PreviewWatcher):
         f.pack(side="left", padx=(0, 10))
         f, self.overlap_var = make_spin(row1, "Overlap", default=0)
         f.pack(side="left", padx=(0, 10))
+        f, self.post_kernel = make_spin(row1, "Post kernel", default=0)
+        f.pack(side="left", padx=(0, 10))
         f, self.H_var = make_spin(row1, "H", default=360)
         f.pack(side="left", padx=(0, 10))
         f, self.W_var = make_spin(row1, "W", default=640)
@@ -733,6 +748,11 @@ class UnrolledTrainTab(tk.Frame, PreviewWatcher):
         f.pack(side="left", fill="x", expand=True)
         self.fresh_opt_var = tk.BooleanVar(value=False)
         tk.Checkbutton(row4, text="Fresh opt", variable=self.fresh_opt_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, font=FONT_SMALL
+                       ).pack(side="left", padx=(10, 0))
+        self.loose_load_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row4, text="Loose load", variable=self.loose_load_var,
                        bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
                        activebackground=BG_PANEL, font=FONT_SMALL
                        ).pack(side="left", padx=(10, 0))
@@ -787,6 +807,7 @@ class UnrolledTrainTab(tk.Frame, PreviewWatcher):
                "--latent-ch", str(self.latent_ch.get()),
                "--inner-dim", str(self.inner_dim.get()),
                "--overlap", str(self.overlap_var.get()),
+               "--post-kernel", str(self.post_kernel.get()),
                "--H", str(self.H_var.get()),
                "--W", str(self.W_var.get()),
                "--lr", self.lr_var.get(),
@@ -807,6 +828,8 @@ class UnrolledTrainTab(tk.Frame, PreviewWatcher):
             cmd.extend(["--resume", resume])
         if self.fresh_opt_var.get():
             cmd.append("--fresh-opt")
+        if self.loose_load_var.get():
+            cmd.append("--loose-load")
         self.runner.run(cmd, cwd=PROJECT_ROOT)
 
     def stop(self):
@@ -942,6 +965,321 @@ class UnrolledInferTab(tk.Frame, PreviewWatcher):
 
 
 # =============================================================================
+# Stage 1.5 Train Tab
+# =============================================================================
+
+class Stage15TrainTab(tk.Frame, PreviewWatcher):
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self.build()
+
+    def build(self):
+        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
+        top.pack(fill="x", padx=5, pady=5)
+
+        tk.Label(top, text="Stage 1.5: Cascaded Spatial Compression",
+                 bg=BG_PANEL, fg=FG, font=FONT_TITLE).pack(anchor="w")
+        tk.Label(top, text="Freeze S1. Train second UnrolledPatchVAE on "
+                 "S1 latent grid for spatial compression.",
+                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
+                                                                 pady=(5, 10))
+
+        # Row 1: S1 checkpoint
+        row1 = tk.Frame(top, bg=BG_PANEL)
+        row1.pack(fill="x", pady=(5, 0))
+        f, self.s1_ckpt = make_float(row1, "S1 checkpoint",
+            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"),
+            width=50)
+        f.pack(side="left", fill="x", expand=True)
+
+        # Row 2: S1.5 architecture
+        row2 = tk.Frame(top, bg=BG_PANEL)
+        row2.pack(fill="x", pady=(5, 0))
+        f, self.patch_size = make_spin(row2, "Patch size", default=4)
+        f.pack(side="left", padx=(0, 10))
+        f, self.latent_ch = make_spin(row2, "Latent ch", default=3)
+        f.pack(side="left", padx=(0, 10))
+        f, self.inner_dim = make_spin(row2, "Inner dim", default=4)
+        f.pack(side="left", padx=(0, 10))
+        f, self.overlap_var = make_spin(row2, "Overlap", default=0)
+        f.pack(side="left", padx=(0, 10))
+        f, self.post_kernel = make_spin(row2, "Post kernel", default=0)
+        f.pack(side="left", padx=(0, 10))
+        f, self.H_var = make_spin(row2, "H", default=360)
+        f.pack(side="left", padx=(0, 10))
+        f, self.W_var = make_spin(row2, "W", default=640)
+        f.pack(side="left")
+
+        # Row 3: training params
+        row3 = tk.Frame(top, bg=BG_PANEL)
+        row3.pack(fill="x", pady=(5, 0))
+        f, self.lr_var = make_float(row3, "LR", "2e-4")
+        f.pack(side="left", padx=(0, 10))
+        f, self.batch_var = make_spin(row3, "Batch", default=4)
+        f.pack(side="left", padx=(0, 10))
+        f, self.steps_var = make_spin(row3, "Steps", default=20000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.w_lat = make_float(row3, "w_latent", "1.0")
+        f.pack(side="left", padx=(0, 10))
+        f, self.w_pix = make_float(row3, "w_pixel", "0.5")
+        f.pack(side="left", padx=(0, 10))
+        f, self.prec_var = make_float(row3, "Precision", "bf16")
+        f.pack(side="left")
+
+        # Row 4: save/log
+        row4 = tk.Frame(top, bg=BG_PANEL)
+        row4.pack(fill="x", pady=(5, 0))
+        f, self.save_every = make_spin(row4, "Save every", default=5000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.preview_every = make_spin(row4, "Preview every", default=100)
+        f.pack(side="left", padx=(0, 10))
+        f, self.grad_accum = make_spin(row4, "Grad accum", default=1)
+        f.pack(side="left")
+
+        # Row 5: resume
+        row5 = tk.Frame(top, bg=BG_PANEL)
+        row5.pack(fill="x", pady=(5, 0))
+        f, self.resume_var = make_float(row5, "Resume checkpoint", "", width=50)
+        f.pack(side="left", fill="x", expand=True)
+        self.fresh_opt_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row5, text="Fresh opt", variable=self.fresh_opt_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, font=FONT_SMALL
+                       ).pack(side="left", padx=(10, 0))
+        self.loose_load_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row5, text="Loose load", variable=self.loose_load_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       activebackground=BG_PANEL, font=FONT_SMALL
+                       ).pack(side="left", padx=(10, 0))
+
+        # Row 6: preview image
+        row6 = tk.Frame(top, bg=BG_PANEL)
+        row6.pack(fill="x", pady=(5, 0))
+        self.preview_img_var = tk.StringVar(value="")
+        f = tk.Frame(row6, bg=BG_PANEL)
+        tk.Label(f, text="Preview image", bg=BG_PANEL, fg=FG_DIM,
+                 font=FONT_SMALL).pack(anchor="w")
+        ef = tk.Frame(f, bg=BG_PANEL)
+        tk.Entry(ef, textvariable=self.preview_img_var, bg=BG_INPUT, fg=FG,
+                 font=FONT, width=45, borderwidth=0,
+                 insertbackground=FG).pack(side="left", fill="x", expand=True)
+        make_btn(ef, "Browse", self._browse_preview, ACCENT, width=7
+                 ).pack(side="left", padx=(5, 0))
+        ef.pack(fill="x")
+        f.pack(side="left", fill="x", expand=True)
+
+        # Buttons
+        btn = tk.Frame(top, bg=BG_PANEL)
+        btn.pack(fill="x", pady=(10, 0))
+        make_btn(btn, "Train", self.start, GREEN).pack(side="left", padx=(0, 5))
+        make_btn(btn, "Stop", self.stop, BLUE).pack(side="left", padx=(0, 5))
+        make_btn(btn, "Kill", self.kill, RED).pack(side="left")
+
+        self.preview_label = tk.Label(self, bg=BG)
+        self.preview_label.pack(pady=5)
+
+        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
+                           insertbackground=FG, height=5, wrap=tk.WORD,
+                           borderwidth=0, highlightthickness=0)
+        self.log.pack(fill="both", expand=True, padx=5, pady=5)
+        self.runner = ProcRunner(self.log)
+
+        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs"),
+                          self.preview_label)
+
+    def _browse_preview(self):
+        path = filedialog.askopenfilename(
+            title="Select preview image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                       ("All files", "*.*")])
+        if path:
+            self.preview_img_var.set(path)
+
+    def start(self):
+        cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "stage1_5",
+               "--s1-ckpt", self.s1_ckpt.get(),
+               "--patch-size", str(self.patch_size.get()),
+               "--latent-ch", str(self.latent_ch.get()),
+               "--inner-dim", str(self.inner_dim.get()),
+               "--overlap", str(self.overlap_var.get()),
+               "--post-kernel", str(self.post_kernel.get()),
+               "--H", str(self.H_var.get()),
+               "--W", str(self.W_var.get()),
+               "--lr", self.lr_var.get(),
+               "--batch-size", str(self.batch_var.get()),
+               "--total-steps", str(self.steps_var.get()),
+               "--w-latent", self.w_lat.get(),
+               "--w-pixel", self.w_pix.get(),
+               "--precision", self.prec_var.get(),
+               "--save-every", str(self.save_every.get()),
+               "--preview-every", str(self.preview_every.get()),
+               "--grad-accum", str(self.grad_accum.get())]
+        preview_img = self.preview_img_var.get().strip()
+        if preview_img:
+            cmd.extend(["--preview-image", preview_img])
+        resume = self.resume_var.get().strip()
+        if resume:
+            cmd.extend(["--resume", resume])
+        if self.fresh_opt_var.get():
+            cmd.append("--fresh-opt")
+        if self.loose_load_var.get():
+            cmd.append("--loose-load")
+        self.runner.run(cmd, cwd=PROJECT_ROOT)
+
+    def stop(self):
+        stop_file = os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs", ".stop")
+        Path(stop_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(stop_file).touch()
+
+    def kill(self):
+        self.runner.kill()
+
+
+# =============================================================================
+# Stage 1.5 Inference Tab
+# =============================================================================
+
+class Stage15InferTab(tk.Frame, PreviewWatcher):
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self._image_paths = []
+        self.build()
+
+    def build(self):
+        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
+        top.pack(fill="x", padx=5, pady=5)
+
+        tk.Label(top, text="Stage 1.5: Inference", bg=BG_PANEL, fg=FG,
+                 font=FONT_TITLE).pack(anchor="w")
+        tk.Label(top, text="S1 + S1.5 cascaded. "
+                 "Shows GT | S1 Recon | S1.5 Recon.",
+                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(anchor="w",
+                                                                 pady=(5, 10))
+
+        row1 = tk.Frame(top, bg=BG_PANEL)
+        row1.pack(fill="x", pady=(5, 0))
+        f, self.s1_ckpt = make_float(row1, "S1 checkpoint",
+            os.path.join(PROJECT_ROOT, "cpu_vae_unrolled_logs", "latest.pt"),
+            width=50)
+        f.pack(side="left", fill="x", expand=True)
+
+        row2 = tk.Frame(top, bg=BG_PANEL)
+        row2.pack(fill="x", pady=(5, 0))
+        f, self.s1_5_ckpt = make_float(row2, "S1.5 checkpoint",
+            os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs", "latest.pt"),
+            width=50)
+        f.pack(side="left", fill="x", expand=True)
+
+        row3 = tk.Frame(top, bg=BG_PANEL)
+        row3.pack(fill="x", pady=(5, 0))
+        f, self.H_var = make_spin(row3, "H", default=360)
+        f.pack(side="left", padx=(0, 10))
+        f, self.W_var = make_spin(row3, "W", default=640)
+        f.pack(side="left", padx=(0, 10))
+        f, self.prec_var = make_float(row3, "Precision", "bf16")
+        f.pack(side="left")
+
+        # Image browse
+        row4 = tk.Frame(top, bg=BG_PANEL)
+        row4.pack(fill="x", pady=(5, 0))
+        self.files_label = tk.Label(row4,
+            text="Images: (none — will use synthetic)",
+            bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL)
+        self.files_label.pack(side="left", fill="x", expand=True)
+
+        btn = tk.Frame(top, bg=BG_PANEL)
+        btn.pack(fill="x", pady=(10, 0))
+        make_btn(btn, "Browse", self.browse_images, ACCENT).pack(
+            side="left", padx=(0, 5))
+        make_btn(btn, "Clear", self.clear_images, BLUE).pack(
+            side="left", padx=(0, 5))
+        make_btn(btn, "Run", self.run_infer, GREEN).pack(side="left")
+
+        self.preview_label = tk.Label(self, bg=BG)
+        self.preview_label.pack(pady=5)
+
+        self.log = tk.Text(self, bg=BG_LOG, fg=FG, font=FONT_SMALL,
+                           insertbackground=FG, height=5, wrap=tk.WORD,
+                           borderwidth=0, highlightthickness=0)
+        self.log.pack(fill="both", expand=True, padx=5, pady=5)
+        self.runner = ProcRunner(self.log)
+
+        self.init_preview(os.path.join(PROJECT_ROOT, "cpu_vae_s1_5_logs"),
+                          self.preview_label)
+
+    def browse_images(self):
+        paths = filedialog.askopenfilenames(
+            title="Select images",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                       ("All files", "*.*")])
+        if paths:
+            self._image_paths = list(paths)
+            names = [os.path.basename(p) for p in self._image_paths]
+            display = ", ".join(names[:4])
+            if len(names) > 4:
+                display += f" (+{len(names)-4} more)"
+            self.files_label.config(text=f"Images: {display}")
+
+    def clear_images(self):
+        self._image_paths = []
+        self.files_label.config(text="Images: (none — will use synthetic)")
+
+    def run_infer(self):
+        if self._image_paths:
+            self._run_real_infer()
+        else:
+            cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "infer1_5",
+                   "--s1-ckpt", self.s1_ckpt.get(),
+                   "--s1-5-ckpt", self.s1_5_ckpt.get(),
+                   "--H", str(self.H_var.get()),
+                   "--W", str(self.W_var.get()),
+                   "--precision", self.prec_var.get()]
+            self.runner.run(cmd, cwd=PROJECT_ROOT)
+
+    def _run_real_infer(self):
+        import torch
+        from experiments.cpu_vae import (_load_model, load_real_images,
+                                         save_preview_stage1_5)
+
+        s1_path = self.s1_ckpt.get()
+        s1_5_path = self.s1_5_ckpt.get()
+        H, W = self.H_var.get(), self.W_var.get()
+        prec = self.prec_var.get()
+        paths = list(self._image_paths)
+
+        self.log.delete("1.0", tk.END)
+        self.log.insert(tk.END, f"Loading S1 + S1.5...\n")
+
+        def _work():
+            amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+                         "fp32": torch.float32}[prec]
+            device = torch.device("cuda:0" if torch.cuda.is_available()
+                                  else "cpu")
+            s1, _, _ = _load_model(s1_path, device)
+            s1.eval()
+            s1_5, _, _ = _load_model(s1_5_path, device)
+            s1_5.eval()
+
+            # Build a minimal gen-like object for preview
+            class _FakeGen:
+                pass
+            fg = _FakeGen()
+            fg.H, fg.W = H, W
+            fg.generate = lambda n: load_real_images(paths[:n], H, W, device)
+
+            logdir = os.path.dirname(s1_5_path) or "cpu_vae_s1_5_logs"
+            os.makedirs(logdir, exist_ok=True)
+            print(f"Running on {len(paths)} real image(s)...", flush=True)
+            save_preview_stage1_5(s1, s1_5, fg, logdir, 0,
+                                   device, amp_dtype)
+            self._preview_mtime = 0
+            self._preview_dir = logdir
+
+        from gui.common import run_with_log
+        run_with_log(self, _work)
+
+
+# =============================================================================
 # Main window
 # =============================================================================
 
@@ -969,6 +1307,8 @@ def main():
     nb.add(Stage1InferTab(nb), text="S1 Infer")
     nb.add(UnrolledTrainTab(nb), text="Unrolled Train")
     nb.add(UnrolledInferTab(nb), text="Unrolled Infer")
+    nb.add(Stage15TrainTab(nb), text="S1.5 Train")
+    nb.add(Stage15InferTab(nb), text="S1.5 Infer")
     nb.add(Stage2TrainTab(nb), text="S2 Train")
     nb.add(Stage2InferTab(nb), text="S2 Infer")
 
