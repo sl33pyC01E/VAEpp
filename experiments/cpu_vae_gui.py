@@ -204,15 +204,15 @@ class S1TrainTab(tk.Frame, PreviewWatcher):
         # Architecture row
         row1 = tk.Frame(top, bg=BG_PANEL)
         row1.pack(fill="x", pady=(5, 0))
-        f, self.patch_size = make_spin(row1, "Patch size", default=8)
+        f, self.patch_size = make_spin(row1, "Patch size", default=3)
         f.pack(side="left", padx=(0, 10))
         f, self.latent_ch = make_spin(row1, "Latent ch", default=3)
         f.pack(side="left", padx=(0, 10))
         f, self.inner_dim = make_spin(row1, "Inner dim", default=4)
         f.pack(side="left", padx=(0, 10))
-        f, self.hidden_dim_var = make_spin(row1, "Hidden dim", default=0)
+        f, self.hidden_dim_var = make_spin(row1, "Hidden dim", default=32)
         f.pack(side="left", padx=(0, 10))
-        f, self.overlap_var = make_spin(row1, "Overlap", default=2)
+        f, self.overlap_var = make_spin(row1, "Overlap", default=1)
         f.pack(side="left", padx=(0, 10))
         f, self.post_kernel = make_spin(row1, "Post kernel", default=5)
         f.pack(side="left")
@@ -226,7 +226,9 @@ class S1TrainTab(tk.Frame, PreviewWatcher):
         f.pack(side="left", padx=(0, 10))
         f, self.steps_var = make_spin(row2, "Steps", default=30000)
         f.pack(side="left", padx=(0, 10))
-        f, self.w_mse = make_float(row2, "w_mse", "1.0")
+        f, self.w_l1 = make_float(row2, "w_l1", "1.0")
+        f.pack(side="left", padx=(0, 10))
+        f, self.w_mse = make_float(row2, "w_mse", "0.0")
         f.pack(side="left", padx=(0, 10))
         f, self.w_lpips = make_float(row2, "w_lpips", "0.5")
         f.pack(side="left", padx=(0, 10))
@@ -295,6 +297,7 @@ class S1TrainTab(tk.Frame, PreviewWatcher):
                "--lr", self.lr_var.get(),
                "--batch-size", str(self.batch_var.get()),
                "--total-steps", str(self.steps_var.get()),
+               "--w-l1", self.w_l1.get(),
                "--w-mse", self.w_mse.get(),
                "--w-lpips", self.w_lpips.get(),
                "--precision", self.prec_var.get(),
@@ -353,8 +356,32 @@ class RefinerTrainTab(tk.Frame, PreviewWatcher):
         # Config row
         row1 = tk.Frame(top, bg=BG_PANEL)
         row1.pack(fill="x", pady=(5, 0))
-        f, self.n_blocks = make_spin(row1, "Blocks", default=4)
+
+        # Type dropdown
+        tf = tk.Frame(row1, bg=BG_PANEL)
+        tk.Label(tf, text="Type", bg=BG_PANEL, fg=FG_DIM,
+                 font=FONT_SMALL).pack(anchor="w")
+        self.refiner_type_var = tk.StringVar(value="attention")
+        type_menu = tk.OptionMenu(tf, self.refiner_type_var,
+                                  "attention", "conv1d")
+        type_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
+                         activebackground=BG_PANEL, activeforeground=FG,
+                         highlightthickness=0, borderwidth=0)
+        type_menu.pack(anchor="w")
+        tf.pack(side="left", padx=(0, 10))
+
+        f, self.n_blocks = make_spin(row1, "Blocks", default=2)
         f.pack(side="left", padx=(0, 10))
+        # Attention params
+        f, self.n_heads = make_spin(row1, "Heads", default=4)
+        f.pack(side="left", padx=(0, 10))
+        f, self.embed_dim = make_spin(row1, "Embed dim", default=0)
+        f.pack(side="left", padx=(0, 10))
+        f, self.attn_patch = make_spin(row1, "Attn patch", default=3)
+        f.pack(side="left", padx=(0, 10))
+        f, self.attn_overlap = make_spin(row1, "Attn overlap", default=1)
+        f.pack(side="left", padx=(0, 10))
+        # Conv1d params
         f, self.hidden_ch = make_spin(row1, "Hidden ch", default=0)
         f.pack(side="left", padx=(0, 10))
         f, self.kernel_var = make_spin(row1, "Kernel", default=5)
@@ -437,7 +464,12 @@ class RefinerTrainTab(tk.Frame, PreviewWatcher):
     def start(self):
         cmd = [VENV_PYTHON, "-m", "experiments.cpu_vae", "refiner",
                "--input-ckpt", self.input_ckpt_var.get(),
+               "--refiner-type", self.refiner_type_var.get(),
                "--n-blocks", str(self.n_blocks.get()),
+               "--n-heads", str(self.n_heads.get()),
+               "--embed-dim", str(self.embed_dim.get()),
+               "--attn-patch-size", str(self.attn_patch.get()),
+               "--attn-patch-overlap", str(self.attn_overlap.get()),
                "--hidden-channels", str(self.hidden_ch.get()),
                "--kernel-size", str(self.kernel_var.get()),
                "--walk-order", self.walk_var.get(),

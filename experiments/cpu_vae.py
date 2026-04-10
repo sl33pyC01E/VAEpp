@@ -634,6 +634,261 @@ class LatentRefiner(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class PatchAttentionRefiner(nn.Module):
+    """Self-attention refinement module for latent grids.
+
+    Takes a spatial latent (B, C, H, W), optionally unfolds into
+    overlapping patches for richer per-token features, applies
+    transformer blocks with 2D rotary positional embeddings,
+    then folds back. Same input/output shape — no dimensionality change.
+
+    When patch_size > 0: each token is a flattened patch neighborhood
+    (C * ps * ps values), giving sub-grid structure to the attention.
+    Overlapping patches are averaged on fold-back, same as UnrolledPatchVAE.
+
+    When patch_size = 0: each grid position is a token (C values per token).
+
+    Global receptive field: every token attends to every other token.
+    CPU-friendly for small grids (< 4000 tokens).
+
+    Args:
+        latent_channels: channel count of the latent grid
+        spatial_h, spatial_w: spatial dims of the latent grid
+        n_blocks: number of transformer blocks
+        n_heads: number of attention heads
+        embed_dim: internal embedding dimension (0 = auto)
+        patch_size: unfold patch size (0 = no patchification, stride=1)
+        dropout: dropout rate
+    """
+
+    def __init__(self, latent_channels=3, spatial_h=22, spatial_w=40,
+                 n_blocks=2, n_heads=4, embed_dim=0, patch_size=0,
+                 patch_overlap=0, dropout=0.0):
+        super().__init__()
+        self.C = latent_channels
+        self.H = spatial_h
+        self.W = spatial_w
+        self.n_blocks = n_blocks
+        self.n_heads = n_heads
+        self.patch_size = patch_size
+        self.patch_overlap = patch_overlap
+        self.patch_stride = max(patch_size - patch_overlap, 1) if patch_size > 0 else 1
+
+        # Token dimensions
+        if patch_size > 0:
+            # Each token = flattened patch: C * ps * ps values
+            self.token_dim = latent_channels * patch_size * patch_size
+            self.n_tokens_h = (spatial_h - patch_size) // self.patch_stride + 1
+            self.n_tokens_w = (spatial_w - patch_size) // self.patch_stride + 1
+            self.n_positions = self.n_tokens_h * self.n_tokens_w
+        else:
+            self.token_dim = latent_channels
+            self.n_tokens_h = spatial_h
+            self.n_tokens_w = spatial_w
+            self.n_positions = spatial_h * spatial_w
+
+        # Ensure dim is large enough for multi-head attention and divisible by n_heads
+        min_dim = n_heads * 4
+        dim = embed_dim if embed_dim > 0 else max(self.token_dim, min_dim)
+        # Round up to nearest multiple of n_heads
+        if dim % n_heads != 0:
+            dim = ((dim // n_heads) + 1) * n_heads
+        self.dim = dim
+
+        # Project to/from embed dim
+        if dim != self.token_dim:
+            self.proj_in = nn.Linear(self.token_dim, dim)
+            self.proj_out = nn.Linear(dim, self.token_dim)
+        else:
+            self.proj_in = None
+            self.proj_out = None
+
+        # Precompute 2D rotary frequencies using token grid positions
+        self.register_buffer("rotary_freqs",
+                             self._build_rotary_freqs(
+                                 self.n_tokens_h, self.n_tokens_w,
+                                 dim // n_heads))
+
+        # Transformer blocks
+        self.blocks = nn.ModuleList()
+        for _ in range(n_blocks):
+            self.blocks.append(nn.ModuleDict({
+                "norm1": nn.LayerNorm(dim),
+                "attn_qkv": nn.Linear(dim, 3 * dim),
+                "attn_out": nn.Linear(dim, dim),
+                "norm2": nn.LayerNorm(dim),
+                "mlp": nn.Sequential(
+                    nn.Linear(dim, dim * 4),
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim),
+                ),
+            }))
+            if dropout > 0:
+                self.blocks[-1]["drop"] = nn.Dropout(dropout)
+
+    def _build_rotary_freqs(self, h, w, head_dim):
+        """Build 2D rotary positional embedding frequencies.
+
+        Returns (n_positions, head_dim) complex tensor encoding
+        (row, col) position as rotation frequencies.
+        """
+        half = head_dim // 2
+        # Frequency bands
+        freqs = torch.exp(torch.arange(0, half, dtype=torch.float32) *
+                          -(math.log(10000.0) / half))
+
+        # Row and col positions
+        rows = torch.arange(h, dtype=torch.float32)
+        cols = torch.arange(w, dtype=torch.float32)
+        grid_r, grid_c = torch.meshgrid(rows, cols, indexing="ij")
+        pos_r = grid_r.reshape(-1)  # (n_positions,)
+        pos_c = grid_c.reshape(-1)
+
+        # Encode row in first half, col in second half of head_dim
+        half_each = half // 2 if half >= 2 else 1
+        angles_r = pos_r.unsqueeze(1) * freqs[:half_each].unsqueeze(0)
+        angles_c = pos_c.unsqueeze(1) * freqs[:half_each].unsqueeze(0)
+
+        # (n_positions, half) — concatenate sin/cos for row and col
+        sin_r, cos_r = angles_r.sin(), angles_r.cos()
+        sin_c, cos_c = angles_c.sin(), angles_c.cos()
+
+        # Stack: (n_positions, head_dim)
+        # Interleave: [cos_r, sin_r, cos_c, sin_c, ...]
+        freqs_out = torch.zeros(self.n_positions, head_dim)
+        # Fill first half with row encoding, second half with col encoding
+        freqs_out[:, :half_each] = cos_r
+        freqs_out[:, half_each:2*half_each] = sin_r
+        if 2*half_each < head_dim:
+            rem = min(half_each, head_dim - 2*half_each)
+            freqs_out[:, 2*half_each:2*half_each+rem] = cos_c[:, :rem]
+            if 2*half_each + rem < head_dim:
+                rem2 = min(half_each, head_dim - 2*half_each - rem)
+                freqs_out[:, 2*half_each+rem:2*half_each+rem+rem2] = sin_c[:, :rem2]
+
+        return freqs_out  # (n_positions, head_dim)
+
+    def _apply_rotary(self, x):
+        """Apply rotary positional encoding to queries/keys.
+
+        Args:
+            x: (B, n_heads, N, head_dim)
+
+        Returns:
+            x with positional information encoded via rotation.
+        """
+        # Simple additive positional encoding using the precomputed freqs
+        # (Full rotary would use complex multiply, but additive is simpler
+        #  and works well for small grids)
+        return x + self.rotary_freqs.unsqueeze(0).unsqueeze(0)
+
+    def _tokenize(self, latent):
+        """Convert spatial latent to token sequence.
+
+        Args:
+            latent: (B, C, H, W)
+
+        Returns:
+            tokens: (B, N, token_dim)
+        """
+        B, C, H, W = latent.shape
+        if self.patch_size > 0:
+            patches = F.unfold(latent, kernel_size=self.patch_size,
+                               stride=self.patch_stride)
+            return patches.permute(0, 2, 1)
+        else:
+            return latent.reshape(B, C, H * W).permute(0, 2, 1)
+
+    def _detokenize(self, tokens, original_shape):
+        """Convert token sequence back to spatial latent.
+
+        Args:
+            tokens: (B, N, token_dim)
+            original_shape: (B, C, H, W)
+
+        Returns:
+            latent: (B, C, H, W)
+        """
+        B, C, H, W = original_shape
+        if self.patch_size > 0:
+            ps = self.patch_size
+            patches = tokens.permute(0, 2, 1)
+            recon = F.fold(patches, output_size=(H, W),
+                           kernel_size=ps, stride=self.patch_stride)
+            if self.patch_overlap > 0:
+                ones = torch.ones_like(patches)
+                divisor = F.fold(ones, output_size=(H, W),
+                                 kernel_size=ps, stride=self.patch_stride)
+                recon = recon / divisor.clamp(min=1)
+            return recon
+        else:
+            return tokens.permute(0, 2, 1).reshape(B, C, H, W)
+
+    def forward(self, latent):
+        """Refine latent grid via self-attention.
+
+        Args:
+            latent: (B, C, H, W)
+
+        Returns:
+            refined: (B, C, H, W) — same shape
+        """
+        original_shape = latent.shape
+
+        # Tokenize
+        x = self._tokenize(latent)  # (B, N, token_dim)
+
+        # Project to embed dim
+        if self.proj_in is not None:
+            x = self.proj_in(x)
+
+        # Transformer blocks
+        for block in self.blocks:
+            # Self-attention
+            residual = x
+            x_norm = block["norm1"](x)
+            B_cur, N, D = x_norm.shape
+            head_dim = D // self.n_heads
+
+            qkv = block["attn_qkv"](x_norm).reshape(B_cur, N, 3, self.n_heads, head_dim)
+            q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+            # (B, n_heads, N, head_dim)
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+
+            # Apply positional encoding
+            q = self._apply_rotary(q)
+            k = self._apply_rotary(k)
+
+            # Scaled dot-product attention
+            attn = torch.matmul(q, k.transpose(-2, -1)) * (head_dim ** -0.5)
+            attn = F.softmax(attn, dim=-1)
+            out = torch.matmul(attn, v)
+
+            # Reshape back: (B, N, D)
+            out = out.permute(0, 2, 1, 3).reshape(B_cur, N, D)
+            out = block["attn_out"](out)
+            x = residual + out
+
+            # MLP
+            residual = x
+            x = residual + block["mlp"](block["norm2"](x))
+
+            if "drop" in block:
+                x = block["drop"](x)
+
+        # Project back to token dim
+        if self.proj_out is not None:
+            x = self.proj_out(x)
+
+        # Detokenize back to spatial
+        return self._detokenize(x, original_shape)
+
+    def param_count(self):
+        return sum(p.numel() for p in self.parameters())
+
+
 def _make_model(model_type, patch_size=8, overlap=0, image_channels=3,
                 latent_channels=32, hidden_dim=0, inner_dim=64,
                 post_kernel=0):
@@ -847,6 +1102,21 @@ def _load_pipeline(ckpt_path, device):
             model.load_state_dict(sd)
             models_list.append(("refiner", model, cfg))
 
+        elif stype == "attention":
+            model = PatchAttentionRefiner(
+                latent_channels=cfg.get("latent_channels", 3),
+                spatial_h=cfg.get("spatial_h", 22),
+                spatial_w=cfg.get("spatial_w", 40),
+                n_blocks=cfg.get("n_blocks", 2),
+                n_heads=cfg.get("n_heads", 4),
+                embed_dim=cfg.get("embed_dim", 0),
+                patch_size=cfg.get("patch_size", 0),
+                patch_overlap=cfg.get("patch_overlap", 0),
+                dropout=cfg.get("dropout", 0.0),
+            ).to(device)
+            model.load_state_dict(sd)
+            models_list.append(("attention", model, cfg))
+
         elif stype == "flatten":
             model = FlattenDeflatten(
                 latent_channels=cfg.get("latent_channels", 32),
@@ -866,7 +1136,7 @@ def _load_pipeline(ckpt_path, device):
         if model_type in ("unrolled", "patch"):
             pH, pW = model._patch_grid_size(sizes[-1][0], sizes[-1][1])
             sizes.append((pH, pW))
-        elif model_type == "refiner":
+        elif model_type in ("refiner", "attention"):
             sizes.append(sizes[-1])
         elif model_type == "flatten":
             sizes.append(sizes[-1])
@@ -956,6 +1226,14 @@ def _pipeline_name(models_list, global_step):
             s = f"ref-b{nb}-k{ks}"
             if hc > 0:
                 s += f"-h{hc}"
+            parts.append(s)
+        elif mt == "attention":
+            nb = cfg.get("n_blocks", 2)
+            nh = cfg.get("n_heads", 4)
+            ed = cfg.get("embed_dim", 0)
+            s = f"attn-b{nb}-h{nh}"
+            if ed > 0:
+                s += f"-d{ed}"
             parts.append(s)
         elif mt == "flatten":
             bc = cfg.get("bottleneck_channels", 6)
@@ -1200,7 +1478,7 @@ def train_s1(args):
             for mt, m, c in upstream_models:
                 if mt in ("unrolled", "patch"):
                     x = m.encode(x)
-                elif mt == "refiner":
+                elif mt in ("refiner", "attention"):
                     x = m(x)
                 elif mt == "flatten":
                     x = m.flatten(x)
@@ -1211,7 +1489,7 @@ def train_s1(args):
                 mt, m, c = upstream_models[i]
                 if mt in ("unrolled", "patch"):
                     x = m.decode(x, original_size=upstream_sizes[i])
-                elif mt == "refiner":
+                elif mt in ("refiner", "attention"):
                     x = m(x)
                 elif mt == "flatten":
                     x = m.deflatten(x)
@@ -1329,7 +1607,7 @@ def train_s1(args):
         for mt, m, c in models_list:
             if mt in ("unrolled", "patch"):
                 x = m.encode(x)
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.flatten(x)
@@ -1340,7 +1618,7 @@ def train_s1(args):
             mt, m, c = models_list[i]
             if mt in ("unrolled", "patch"):
                 x = m.decode(x, original_size=all_sizes[i])
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.deflatten(x)
@@ -1397,15 +1675,27 @@ def train_s1(args):
 
                         # Forward through active model
                         recon, latent = active_model(x)
-                        mse = F.mse_loss(recon, target)
-                        total = args.w_mse * mse
-                        losses["mse"] = losses.get("mse", 0) + mse.item() / accum
+                        total = torch.tensor(0.0, device=device)
+                        if args.w_l1 > 0:
+                            l1 = F.l1_loss(recon, target)
+                            total = total + args.w_l1 * l1
+                            losses["l1"] = losses.get("l1", 0) + l1.item() / accum
+                        if args.w_mse > 0:
+                            mse = F.mse_loss(recon, target)
+                            total = total + args.w_mse * mse
+                            losses["mse"] = losses.get("mse", 0) + mse.item() / accum
                     else:
                         # Fresh: train directly on images
                         recon, latent = active_model(x)
-                        mse = F.mse_loss(recon, x)
-                        total = args.w_mse * mse
-                        losses["mse"] = losses.get("mse", 0) + mse.item() / accum
+                        total = torch.tensor(0.0, device=device)
+                        if args.w_l1 > 0:
+                            l1 = F.l1_loss(recon, x)
+                            total = total + args.w_l1 * l1
+                            losses["l1"] = losses.get("l1", 0) + l1.item() / accum
+                        if args.w_mse > 0:
+                            mse = F.mse_loss(recon, x)
+                            total = total + args.w_mse * mse
+                            losses["mse"] = losses.get("mse", 0) + mse.item() / accum
 
                     if lpips_fn is not None and mode in ("fresh",):
                         rc_lp = recon[:, :3] * 2 - 1
@@ -1423,16 +1713,20 @@ def train_s1(args):
                     recon_lat, lat = active_model(input_latent)
 
                     # Latent loss: reconstructed latent vs input latent
-                    lat_loss = F.mse_loss(recon_lat, input_latent)
+                    lat_loss = F.l1_loss(recon_lat, input_latent)
                     losses["lat"] = losses.get("lat", 0) + lat_loss.item() / accum
 
                     # Pixel loss: full pipeline decode vs original image
-                    with torch.no_grad():
-                        # Decode through upstream
-                        pass
                     recon_pixels = upstream_decode_fn(recon_lat)
-                    pixel_loss = F.mse_loss(recon_pixels, x)
-                    losses["pix"] = losses.get("pix", 0) + pixel_loss.item() / accum
+                    pixel_loss = torch.tensor(0.0, device=device)
+                    if args.w_l1 > 0:
+                        px_l1 = F.l1_loss(recon_pixels, x)
+                        pixel_loss = pixel_loss + args.w_l1 * px_l1
+                        losses["px_l1"] = losses.get("px_l1", 0) + px_l1.item() / accum
+                    if args.w_mse > 0:
+                        px_mse = F.mse_loss(recon_pixels, x)
+                        pixel_loss = pixel_loss + args.w_mse * px_mse
+                        losses["px_mse"] = losses.get("px_mse", 0) + px_mse.item() / accum
 
                     total = args.w_latent * lat_loss + args.w_pixel * pixel_loss
 
@@ -1543,7 +1837,7 @@ def train_refiner(args):
         last_mt, last_model, last_cfg = models_list[-1]
         if last_mt in ("unrolled", "patch"):
             lat_C = last_model.latent_channels
-        elif last_mt == "refiner":
+        elif last_mt in ("refiner", "attention"):
             lat_C = last_cfg.get("latent_channels", 3)
         elif last_mt == "flatten":
             lat_C = last_cfg.get("bottleneck_channels", 6)
@@ -1551,31 +1845,58 @@ def train_refiner(args):
             lat_C = 3
         lat_H, lat_W = spatial_sizes[-1]
 
-        # Create refiner
-        refiner = LatentRefiner(
-            latent_channels=lat_C,
-            spatial_h=lat_H, spatial_w=lat_W,
-            n_blocks=args.n_blocks,
-            hidden_channels=args.hidden_channels,
-            kernel_size=args.kernel_size,
-            walk_order=args.walk_order,
-            dropout=args.dropout,
-        ).to(device)
+        # Create refiner (conv1d or attention)
+        refiner_type = getattr(args, 'refiner_type', 'conv1d')
+        if refiner_type == "attention":
+            attn_ps = getattr(args, 'attn_patch_size', 0)
+            attn_po = getattr(args, 'attn_patch_overlap', 0)
+            refiner = PatchAttentionRefiner(
+                latent_channels=lat_C,
+                spatial_h=lat_H, spatial_w=lat_W,
+                n_blocks=args.n_blocks,
+                n_heads=args.n_heads,
+                embed_dim=args.embed_dim,
+                patch_size=attn_ps,
+                patch_overlap=attn_po,
+                dropout=args.dropout,
+            ).to(device)
+            refiner_cfg = {
+                "latent_channels": lat_C,
+                "spatial_h": lat_H,
+                "spatial_w": lat_W,
+                "n_blocks": args.n_blocks,
+                "n_heads": args.n_heads,
+                "embed_dim": args.embed_dim,
+                "patch_size": attn_ps,
+                "patch_overlap": attn_po,
+                "dropout": args.dropout,
+            }
+            stage_type = "attention"
+        else:
+            refiner = LatentRefiner(
+                latent_channels=lat_C,
+                spatial_h=lat_H, spatial_w=lat_W,
+                n_blocks=args.n_blocks,
+                hidden_channels=args.hidden_channels,
+                kernel_size=args.kernel_size,
+                walk_order=args.walk_order,
+                dropout=args.dropout,
+            ).to(device)
+            refiner_cfg = {
+                "latent_channels": lat_C,
+                "spatial_h": lat_H,
+                "spatial_w": lat_W,
+                "n_blocks": args.n_blocks,
+                "hidden_channels": args.hidden_channels,
+                "kernel_size": args.kernel_size,
+                "walk_order": args.walk_order,
+                "dropout": args.dropout,
+            }
+            stage_type = "refiner"
 
-        refiner_cfg = {
-            "latent_channels": lat_C,
-            "spatial_h": lat_H,
-            "spatial_w": lat_W,
-            "n_blocks": args.n_blocks,
-            "hidden_channels": args.hidden_channels,
-            "kernel_size": args.kernel_size,
-            "walk_order": args.walk_order,
-            "dropout": args.dropout,
-        }
-
-        # Append refiner to pipeline
+        # Append to pipeline
         active_stage = len(models_list)
-        models_list.append(("refiner", refiner, refiner_cfg))
+        models_list.append((stage_type, refiner, refiner_cfg))
         spatial_sizes.append(spatial_sizes[-1])
     else:
         raise ValueError("Need --input-ckpt (fresh) or --resume (continue)")
@@ -1659,7 +1980,7 @@ def train_refiner(args):
         for mt, m, c in models_list:
             if mt in ("unrolled", "patch"):
                 x = m.encode(x)
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.flatten(x)
@@ -1670,7 +1991,7 @@ def train_refiner(args):
             mt, m, c = models_list[i]
             if mt in ("unrolled", "patch"):
                 x = m.decode(x, original_size=all_sizes[i])
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.deflatten(x)
@@ -1683,7 +2004,7 @@ def train_refiner(args):
         for mt, m, c in upstream_models:
             if mt in ("unrolled", "patch"):
                 x = m.encode(x)
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.flatten(x)
@@ -1930,7 +2251,7 @@ def train_s2(args):
         for mt, m, c in models_list:
             if mt in ("unrolled", "patch"):
                 x = m.encode(x)
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.flatten(x)
@@ -1941,7 +2262,7 @@ def train_s2(args):
             mt, m, c = models_list[i]
             if mt in ("unrolled", "patch"):
                 x = m.decode(x, original_size=all_sizes[i])
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.deflatten(x)
@@ -1955,7 +2276,7 @@ def train_s2(args):
         for mt, m, c in upstream_models:
             if mt in ("unrolled", "patch"):
                 x = m.encode(x)
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.flatten(x)
@@ -1966,7 +2287,7 @@ def train_s2(args):
             mt, m, c = upstream_models[i]
             if mt in ("unrolled", "patch"):
                 x = m.decode(x, original_size=upstream_sizes[i])
-            elif mt == "refiner":
+            elif mt in ("refiner", "attention"):
                 x = m(x)
             elif mt == "flatten":
                 x = m.deflatten(x)
@@ -2229,10 +2550,13 @@ def main():
     s1.add_argument("--batch-size", type=int, default=4)
     s1.add_argument("--lr", default="2e-4")
     s1.add_argument("--total-steps", type=int, default=30000)
-    s1.add_argument("--w-mse", type=float, default=1.0)
+    s1.add_argument("--w-l1", type=float, default=1.0,
+                    help="L1 reconstruction loss weight")
+    s1.add_argument("--w-mse", type=float, default=0.0,
+                    help="MSE reconstruction loss weight (0=off)")
     s1.add_argument("--w-lpips", type=float, default=0.5)
     s1.add_argument("--w-latent", type=float, default=1.0,
-                    help="Latent MSE weight (extend mode)")
+                    help="Latent loss weight (extend mode)")
     s1.add_argument("--w-pixel", type=float, default=0.5,
                     help="Pixel loss weight (extend mode)")
     s1.add_argument("--precision", default="bf16",
@@ -2252,14 +2576,30 @@ def main():
     sr = sub.add_parser("refiner", help="Train latent refiner on frozen pipeline")
     sr.add_argument("--input-ckpt", required=True,
                     help="Pipeline checkpoint to refine")
+    sr.add_argument("--refiner-type", default="attention",
+                    choices=["conv1d", "attention"],
+                    help="conv1d=LatentRefiner (Conv1d blocks), "
+                         "attention=PatchAttentionRefiner (transformer)")
     sr.add_argument("--H", type=int, default=360)
     sr.add_argument("--W", type=int, default=640)
-    sr.add_argument("--n-blocks", type=int, default=4)
+    sr.add_argument("--n-blocks", type=int, default=2,
+                    help="Number of blocks (Conv1d or transformer)")
     sr.add_argument("--hidden-channels", type=int, default=0,
-                    help="Internal channel width (0=same as latent channels)")
-    sr.add_argument("--kernel-size", type=int, default=5)
+                    help="Conv1d internal channel width (conv1d mode)")
+    sr.add_argument("--kernel-size", type=int, default=5,
+                    help="Conv1d kernel size (conv1d mode)")
     sr.add_argument("--walk-order", default="hilbert",
-                    choices=["raster", "hilbert", "morton"])
+                    choices=["raster", "hilbert", "morton"],
+                    help="Walk order for Conv1d serialization (conv1d mode)")
+    sr.add_argument("--n-heads", type=int, default=4,
+                    help="Attention heads (attention mode)")
+    sr.add_argument("--embed-dim", type=int, default=0,
+                    help="Attention embedding dim (0=auto, attention mode)")
+    sr.add_argument("--attn-patch-size", type=int, default=3,
+                    help="Attention patchification (0=per-position tokens, "
+                         "3+=unfold patches for richer tokens)")
+    sr.add_argument("--attn-patch-overlap", type=int, default=1,
+                    help="Attention patch overlap (controls stride=ps-overlap)")
     sr.add_argument("--dropout", type=float, default=0.0)
     sr.add_argument("--blur-sigma", type=float, default=0.0,
                     help="Gaussian noise sigma added to input latent (0=off)")
