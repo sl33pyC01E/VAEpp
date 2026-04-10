@@ -1450,82 +1450,104 @@ def train_refiner(args):
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    if not args.input_ckpt:
-        raise ValueError("--input-ckpt required for refiner training")
+    # -- Load pipeline: from --resume (continue) or --input-ckpt (fresh refiner) --
+    start_step = 0
+    resume_ckpt = None
 
-    print(f"Loading pipeline from {args.input_ckpt}...")
-    models_list, encode_fn, decode_fn, spatial_sizes, ckpt = \
-        _load_pipeline(args.input_ckpt, device)
+    if args.resume:
+        # Resume: load full pipeline (includes refiner as last stage)
+        print(f"Resuming from {args.resume}...")
+        models_list, encode_fn, decode_fn, spatial_sizes, resume_ckpt = \
+            _load_pipeline(args.resume, device)
+        active_stage = resume_ckpt.get("active_stage", len(models_list) - 1)
+        start_step = resume_ckpt.get("global_step", 0)
+        # The refiner is already in the pipeline as the last stage
+        # Freeze everything except the refiner
+        for i, (mt, m, c) in enumerate(models_list):
+            if i == active_stage:
+                m.train()
+                m.requires_grad_(True)
+            else:
+                m.eval()
+                m.requires_grad_(False)
+        _, refiner, refiner_cfg = models_list[active_stage]
+        lat_H, lat_W = spatial_sizes[active_stage]
+        lat_C = refiner_cfg.get("latent_channels", 3)
+        print(f"  Resumed refiner at step {start_step}")
 
-    # Freeze all existing stages
-    for mt, m, c in models_list:
-        m.eval()
-        m.requires_grad_(False)
+    elif args.input_ckpt:
+        # Fresh refiner: load upstream pipeline, create new refiner
+        print(f"Loading pipeline from {args.input_ckpt}...")
+        models_list, encode_fn, decode_fn, spatial_sizes, _ = \
+            _load_pipeline(args.input_ckpt, device)
+
+        # Freeze all existing stages
+        for mt, m, c in models_list:
+            m.eval()
+            m.requires_grad_(False)
+
+        # Determine latent dims at end of pipeline
+        last_mt, last_model, last_cfg = models_list[-1]
+        if last_mt in ("unrolled", "patch"):
+            lat_C = last_model.latent_channels
+        elif last_mt == "refiner":
+            lat_C = last_cfg.get("latent_channels", 3)
+        elif last_mt == "flatten":
+            lat_C = last_cfg.get("bottleneck_channels", 6)
+        else:
+            lat_C = 3
+        lat_H, lat_W = spatial_sizes[-1]
+
+        # Create refiner
+        refiner = LatentRefiner(
+            latent_channels=lat_C,
+            spatial_h=lat_H, spatial_w=lat_W,
+            n_blocks=args.n_blocks,
+            hidden_channels=args.hidden_channels,
+            kernel_size=args.kernel_size,
+            walk_order=args.walk_order,
+            dropout=args.dropout,
+        ).to(device)
+
+        refiner_cfg = {
+            "latent_channels": lat_C,
+            "spatial_h": lat_H,
+            "spatial_w": lat_W,
+            "n_blocks": args.n_blocks,
+            "hidden_channels": args.hidden_channels,
+            "kernel_size": args.kernel_size,
+            "walk_order": args.walk_order,
+            "dropout": args.dropout,
+        }
+
+        # Append refiner to pipeline
+        active_stage = len(models_list)
+        models_list.append(("refiner", refiner, refiner_cfg))
+        spatial_sizes.append(spatial_sizes[-1])
+    else:
+        raise ValueError("Need --input-ckpt (fresh) or --resume (continue)")
 
     # Print pipeline info
     for i, (mt, m, c) in enumerate(models_list):
-        if mt in ("unrolled", "patch"):
-            pc = m.param_count()["total"]
-        elif mt == "refiner":
-            pc = m.param_count()
-        else:
-            pc = m.param_count()
-        print(f"  Stage {i}: {mt}, {pc:,} params (frozen), "
-              f"spatial {spatial_sizes[i]} -> {spatial_sizes[i+1]}")
+        pc = m.param_count()["total"] if hasattr(m.param_count(), '__getitem__') else m.param_count()
+        frozen = "(frozen)" if i != active_stage else "(training)"
+        print(f"  Stage {i}: {mt}, {pc:,} params {frozen}")
 
-    # Determine latent dims at end of pipeline
-    last_mt, last_model, last_cfg = models_list[-1]
-    if last_mt in ("unrolled", "patch"):
-        lat_C = last_model.latent_channels
-    elif last_mt == "refiner":
-        lat_C = last_cfg.get("latent_channels", 3)
-    elif last_mt == "flatten":
-        lat_C = last_cfg.get("bottleneck_channels", 6)
-    else:
-        lat_C = 3
-    lat_H, lat_W = spatial_sizes[-1]
-
-    # Create refiner
-    refiner = LatentRefiner(
-        latent_channels=lat_C,
-        spatial_h=lat_H, spatial_w=lat_W,
-        n_blocks=args.n_blocks,
-        hidden_channels=args.hidden_channels,
-        kernel_size=args.kernel_size,
-        walk_order=args.walk_order,
-        dropout=args.dropout,
-    ).to(device)
-
-    refiner_cfg = {
-        "latent_channels": lat_C,
-        "spatial_h": lat_H,
-        "spatial_w": lat_W,
-        "n_blocks": args.n_blocks,
-        "hidden_channels": args.hidden_channels,
-        "kernel_size": args.kernel_size,
-        "walk_order": args.walk_order,
-        "dropout": args.dropout,
-    }
-
-    hc_str = f", hidden={args.hidden_channels}" if args.hidden_channels > 0 else ""
-    print(f"  Refiner: {args.n_blocks} blocks, kernel={args.kernel_size}{hc_str}, "
-          f"walk={args.walk_order}, {refiner.param_count():,} params")
-
-    # Append refiner to pipeline
-    active_stage = len(models_list)
-    models_list.append(("refiner", refiner, refiner_cfg))
-    spatial_sizes.append(spatial_sizes[-1])
+    hc_str = f", hidden={refiner_cfg.get('hidden_channels', 0)}" if refiner_cfg.get('hidden_channels', 0) > 0 else ""
+    print(f"  Refiner: {refiner_cfg.get('n_blocks', 4)} blocks, "
+          f"kernel={refiner_cfg.get('kernel_size', 5)}{hc_str}, "
+          f"{refiner.param_count():,} params")
 
     # Finetune decoder: unfreeze pipeline[-2] (stage before refiner)
     finetune_decoder = getattr(args, 'finetune_decoder', False)
     decoder_model = None
-    if finetune_decoder and len(models_list) >= 2:
-        _, decoder_model, _ = models_list[-2]
+    if finetune_decoder and active_stage >= 1:
+        _, decoder_model, _ = models_list[active_stage - 1]
         decoder_model.requires_grad_(True)
         decoder_model.train()
         dec_params = sum(p.numel() for p in decoder_model.parameters()
                         if p.requires_grad)
-        print(f"  Finetuning decoder (stage {len(models_list)-2}): "
+        print(f"  Finetuning decoder (stage {active_stage - 1}): "
               f"{dec_params:,} trainable params")
 
     # -- Generator --
@@ -1544,6 +1566,27 @@ def train_refiner(args):
                             weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01)
+
+    # Load optimizer state if resuming
+    if resume_ckpt and not args.fresh_opt:
+        if resume_ckpt.get("optimizer"):
+            try:
+                opt.load_state_dict(resume_ckpt["optimizer"])
+            except Exception:
+                print("  Fresh optimizer (mismatch)")
+        if resume_ckpt.get("scheduler"):
+            sched.load_state_dict(resume_ckpt["scheduler"])
+        else:
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=args.total_steps, eta_min=float(args.lr) * 0.01,
+                last_epoch=start_step)
+
+    if args.fresh_opt and start_step > 0:
+        opt = torch.optim.AdamW(train_params, lr=float(args.lr),
+                                weight_decay=0.01)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=args.total_steps - start_step,
+            eta_min=float(args.lr) * 0.01)
 
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
                  "fp32": torch.float32}[args.precision]
@@ -1709,74 +1752,86 @@ def train_s2(args):
     logdir = pathlib.Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
-    if not args.input_ckpt:
-        raise ValueError("--input-ckpt required for s2 training")
+    # -- Load pipeline: from --resume (continue) or --input-ckpt (fresh S2) --
+    start_step = 0
+    resume_ckpt = None
 
-    print(f"Loading pipeline from {args.input_ckpt}...")
-    models_list, encode_fn, decode_fn, spatial_sizes, ckpt = \
-        _load_pipeline(args.input_ckpt, device)
+    if args.resume:
+        print(f"Resuming from {args.resume}...")
+        models_list, encode_fn, decode_fn, spatial_sizes, resume_ckpt = \
+            _load_pipeline(args.resume, device)
+        active_stage = resume_ckpt.get("active_stage", len(models_list) - 1)
+        start_step = resume_ckpt.get("global_step", 0)
+        for i, (mt, m, c) in enumerate(models_list):
+            if i == active_stage:
+                m.train()
+                m.requires_grad_(True)
+            else:
+                m.eval()
+                m.requires_grad_(False)
+        _, bottleneck, flatten_cfg = models_list[active_stage]
+        lat_ch = flatten_cfg.get("latent_channels", 3)
+        lat_H, lat_W = spatial_sizes[active_stage]
+        print(f"  Resumed S2 at step {start_step}")
 
-    # Freeze all existing stages
-    for mt, m, c in models_list:
-        m.eval()
-        m.requires_grad_(False)
+    elif args.input_ckpt:
+        print(f"Loading pipeline from {args.input_ckpt}...")
+        models_list, encode_fn, decode_fn, spatial_sizes, _ = \
+            _load_pipeline(args.input_ckpt, device)
 
-    # Print pipeline info
-    for i, (mt, m, c) in enumerate(models_list):
-        if mt in ("unrolled", "patch"):
-            pc = m.param_count()["total"]
-        elif mt == "refiner":
-            pc = m.param_count()
+        for mt, m, c in models_list:
+            m.eval()
+            m.requires_grad_(False)
+
+        last_mt, last_model, last_cfg = models_list[-1]
+        if last_mt in ("unrolled", "patch"):
+            lat_ch = last_model.latent_channels
+        elif last_mt == "refiner":
+            lat_ch = last_cfg.get("latent_channels", 3)
+        elif last_mt == "flatten":
+            lat_ch = last_cfg.get("bottleneck_channels", 6)
         else:
-            pc = m.param_count()
-        print(f"  Stage {i}: {mt}, {pc:,} params (frozen), "
-              f"spatial {spatial_sizes[i]} -> {spatial_sizes[i+1]}")
+            lat_ch = 3
+        lat_H, lat_W = spatial_sizes[-1]
 
-    # Determine latent dims
-    last_mt, last_model, last_cfg = models_list[-1]
-    if last_mt in ("unrolled", "patch"):
-        lat_ch = last_model.latent_channels
-    elif last_mt == "refiner":
-        lat_ch = last_cfg.get("latent_channels", 3)
-    elif last_mt == "flatten":
-        lat_ch = last_cfg.get("bottleneck_channels", 6)
+        print(f"  Upstream latent: ({lat_ch}, {lat_H}, {lat_W}) = "
+              f"{lat_ch * lat_H * lat_W} values")
+        print(f"  Bottleneck: {args.bottleneck_ch}ch x {lat_H * lat_W} positions "
+              f"= {args.bottleneck_ch * lat_H * lat_W} flat values")
+
+        bottleneck = FlattenDeflatten(
+            latent_channels=lat_ch,
+            bottleneck_channels=args.bottleneck_ch,
+            spatial_h=lat_H, spatial_w=lat_W,
+            walk_order=args.walk_order,
+            kernel_size=args.kernel_size,
+            deflatten_hidden=args.deflatten_hidden,
+        ).to(device)
+
+        flatten_cfg = {
+            "latent_channels": lat_ch,
+            "bottleneck_channels": args.bottleneck_ch,
+            "spatial_h": lat_H,
+            "spatial_w": lat_W,
+            "walk_order": args.walk_order,
+            "kernel_size": args.kernel_size,
+            "deflatten_hidden": args.deflatten_hidden,
+        }
+
+        active_stage = len(models_list)
+        models_list.append(("flatten", bottleneck, flatten_cfg))
+        spatial_sizes.append(spatial_sizes[-1])
     else:
-        lat_ch = 3
-    lat_H, lat_W = spatial_sizes[-1]
+        raise ValueError("Need --input-ckpt (fresh) or --resume (continue)")
 
-    print(f"  Upstream latent: ({lat_ch}, {lat_H}, {lat_W}) = "
-          f"{lat_ch * lat_H * lat_W} values")
-    print(f"  Bottleneck: {args.bottleneck_ch}ch x {lat_H * lat_W} positions "
-          f"= {args.bottleneck_ch * lat_H * lat_W} flat values")
-    print(f"  Compression: {lat_ch / args.bottleneck_ch:.1f}:1 channel")
-
-    # Create FlattenDeflatten
-    bottleneck = FlattenDeflatten(
-        latent_channels=lat_ch,
-        bottleneck_channels=args.bottleneck_ch,
-        spatial_h=lat_H, spatial_w=lat_W,
-        walk_order=args.walk_order,
-        kernel_size=args.kernel_size,
-        deflatten_hidden=args.deflatten_hidden,
-    ).to(device)
-
-    flatten_cfg = {
-        "latent_channels": lat_ch,
-        "bottleneck_channels": args.bottleneck_ch,
-        "spatial_h": lat_H,
-        "spatial_w": lat_W,
-        "walk_order": args.walk_order,
-        "kernel_size": args.kernel_size,
-        "deflatten_hidden": args.deflatten_hidden,
-    }
+    # Print pipeline
+    for i, (mt, m, c) in enumerate(models_list):
+        pc = m.param_count()["total"] if hasattr(m.param_count(), '__getitem__') else m.param_count()
+        frozen = "(frozen)" if i != active_stage else "(training)"
+        print(f"  Stage {i}: {mt}, {pc:,} params {frozen}")
 
     print(f"  Bottleneck: {bottleneck.param_count():,} params, "
-          f"walk={args.walk_order}")
-
-    # Append to pipeline
-    active_stage = len(models_list)
-    models_list.append(("flatten", bottleneck, flatten_cfg))
-    spatial_sizes.append(spatial_sizes[-1])
+          f"walk={flatten_cfg.get('walk_order', 'raster')}")
 
     # -- Generator --
     gen = VAEpp0rGenerator(
@@ -1790,6 +1845,14 @@ def train_s2(args):
     # -- Optimizer --
     opt = torch.optim.AdamW(bottleneck.parameters(), lr=float(args.lr),
                             weight_decay=0.01)
+
+    # Load optimizer state if resuming
+    if resume_ckpt and not args.fresh_opt:
+        if resume_ckpt.get("optimizer"):
+            try:
+                opt.load_state_dict(resume_ckpt["optimizer"])
+            except Exception:
+                print("  Fresh optimizer (mismatch)")
 
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
                  "fp32": torch.float32}[args.precision]
@@ -2152,6 +2215,8 @@ def main():
     sr.add_argument("--grad-accum", type=int, default=1)
     sr.add_argument("--seed", type=int, default=42)
     sr.add_argument("--device", default="cuda:0")
+    sr.add_argument("--resume", default=None,
+                    help="Resume refiner training from checkpoint")
     sr.add_argument("--fresh-opt", action="store_true")
     sr.add_argument("--logdir", default="cpu_vae_refiner_logs")
     sr.add_argument("--log-every", type=int, default=1)
@@ -2182,6 +2247,8 @@ def main():
     s2.add_argument("--grad-accum", type=int, default=1)
     s2.add_argument("--seed", type=int, default=42)
     s2.add_argument("--device", default="cuda:0")
+    s2.add_argument("--resume", default=None,
+                    help="Resume S2 training from checkpoint")
     s2.add_argument("--fresh-opt", action="store_true")
     s2.add_argument("--logdir", default="cpu_vae_flatten_logs")
     s2.add_argument("--log-every", type=int, default=1)
