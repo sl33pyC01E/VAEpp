@@ -1051,7 +1051,7 @@ def _convert_legacy(ckpt):
     }
 
 
-def _load_pipeline(ckpt_path, device):
+def _load_pipeline(ckpt_path, device, strict=True):
     """Load unified pipeline from checkpoint.
 
     Returns (models_list, encode_fn, decode_fn, spatial_sizes, ckpt)
@@ -1085,7 +1085,9 @@ def _load_pipeline(ckpt_path, device):
                 inner_dim=cfg.get("inner_dim", 64),
                 post_kernel=cfg.get("post_kernel", 0),
             ).to(device)
-            model.load_state_dict(sd)
+            missing, unexpected = model.load_state_dict(sd, strict=strict)
+            if missing and not strict:
+                print(f"    New layers: {missing}")
             models_list.append((stype, model, cfg))
 
         elif stype == "refiner":
@@ -1099,7 +1101,9 @@ def _load_pipeline(ckpt_path, device):
                 walk_order=cfg.get("walk_order", "hilbert"),
                 dropout=cfg.get("dropout", 0.0),
             ).to(device)
-            model.load_state_dict(sd)
+            missing, unexpected = model.load_state_dict(sd, strict=strict)
+            if missing and not strict:
+                print(f"    New layers: {missing}")
             models_list.append(("refiner", model, cfg))
 
         elif stype == "attention":
@@ -1114,7 +1118,9 @@ def _load_pipeline(ckpt_path, device):
                 patch_overlap=cfg.get("patch_overlap", 0),
                 dropout=cfg.get("dropout", 0.0),
             ).to(device)
-            model.load_state_dict(sd)
+            missing, unexpected = model.load_state_dict(sd, strict=strict)
+            if missing and not strict:
+                print(f"    New layers: {missing}")
             models_list.append(("attention", model, cfg))
 
         elif stype == "flatten":
@@ -1127,7 +1133,9 @@ def _load_pipeline(ckpt_path, device):
                 kernel_size=cfg.get("kernel_size", 1),
                 deflatten_hidden=cfg.get("deflatten_hidden", 0),
             ).to(device)
-            model.load_state_dict(sd)
+            missing, unexpected = model.load_state_dict(sd, strict=strict)
+            if missing and not strict:
+                print(f"    New layers: {missing}")
             models_list.append(("flatten", model, cfg))
 
     # Compute spatial sizes at each level
@@ -1364,7 +1372,8 @@ def train_s1(args):
             raise ValueError(f"--input-ckpt required for mode={mode}")
         print(f"Loading pipeline from {args.input_ckpt}...")
         models_list, upstream_encode_fn, upstream_decode_fn, spatial_sizes, ckpt = \
-            _load_pipeline(args.input_ckpt, device)
+            _load_pipeline(args.input_ckpt, device,
+                           strict=not getattr(args, 'loose_load', False))
         global_step = ckpt.get("global_step", 0)
         loaded_opt = ckpt.get("optimizer")
         loaded_sched = ckpt.get("scheduler")
@@ -1805,7 +1814,8 @@ def train_refiner(args):
         # Resume: load full pipeline (includes refiner as last stage)
         print(f"Resuming from {args.resume}...")
         models_list, encode_fn, decode_fn, spatial_sizes, resume_ckpt = \
-            _load_pipeline(args.resume, device)
+            _load_pipeline(args.resume, device,
+                           strict=not getattr(args, 'loose_load', False))
         active_stage = resume_ckpt.get("active_stage", len(models_list) - 1)
         start_step = resume_ckpt.get("global_step", 0)
         # The refiner is already in the pipeline as the last stage
@@ -1826,7 +1836,8 @@ def train_refiner(args):
         # Fresh refiner: load upstream pipeline, create new refiner
         print(f"Loading pipeline from {args.input_ckpt}...")
         models_list, encode_fn, decode_fn, spatial_sizes, _ = \
-            _load_pipeline(args.input_ckpt, device)
+            _load_pipeline(args.input_ckpt, device,
+                           strict=not getattr(args, 'loose_load', False))
 
         # Freeze all existing stages
         for mt, m, c in models_list:
@@ -2171,7 +2182,8 @@ def train_s2(args):
     if args.resume:
         print(f"Resuming from {args.resume}...")
         models_list, encode_fn, decode_fn, spatial_sizes, resume_ckpt = \
-            _load_pipeline(args.resume, device)
+            _load_pipeline(args.resume, device,
+                           strict=not getattr(args, 'loose_load', False))
         active_stage = resume_ckpt.get("active_stage", len(models_list) - 1)
         start_step = resume_ckpt.get("global_step", 0)
         for i, (mt, m, c) in enumerate(models_list):
@@ -2189,7 +2201,8 @@ def train_s2(args):
     elif args.input_ckpt:
         print(f"Loading pipeline from {args.input_ckpt}...")
         models_list, encode_fn, decode_fn, spatial_sizes, _ = \
-            _load_pipeline(args.input_ckpt, device)
+            _load_pipeline(args.input_ckpt, device,
+                           strict=not getattr(args, 'loose_load', False))
 
         for mt, m, c in models_list:
             m.eval()
@@ -2599,6 +2612,8 @@ def main():
     s1.add_argument("--seed", type=int, default=42)
     s1.add_argument("--device", default="cuda:0")
     s1.add_argument("--fresh-opt", action="store_true")
+    s1.add_argument("--loose-load", action="store_true",
+                    help="Allow missing/extra keys when loading (for adding new layers)")
     s1.add_argument("--logdir", default="cpu_vae_logs")
     s1.add_argument("--log-every", type=int, default=1)
     s1.add_argument("--save-every", type=int, default=5000)
