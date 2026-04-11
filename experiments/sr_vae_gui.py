@@ -54,7 +54,7 @@ class SRVAETab(tk.Frame):
                  font=FONT_SMALL).pack(anchor="w")
         self.down_var = tk.StringVar(value="area")
         down_menu = tk.OptionMenu(df, self.down_var,
-                                  "area", "bilinear", "bicubic", "learned")
+                                  "area", "bilinear", "bicubic", "lanczos", "learned")
         down_menu.config(bg=BG_INPUT, fg=FG, font=FONT_SMALL,
                          activebackground=BG_PANEL, activeforeground=FG,
                          highlightthickness=0, borderwidth=0)

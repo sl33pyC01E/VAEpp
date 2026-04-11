@@ -39,9 +39,26 @@ class FixedDownscaler(nn.Module):
     def __init__(self, scale, mode="area"):
         super().__init__()
         self.scale = scale
-        self.mode = mode  # area, bilinear, bicubic
+        self.mode = mode  # area, bilinear, bicubic, lanczos
 
     def forward(self, x):
+        if self.mode == "lanczos":
+            # PIL lanczos — process per image on CPU, return to device
+            from PIL import Image as PILImg
+            device = x.device
+            B, C, H, W = x.shape
+            tH, tW = H // self.scale, W // self.scale
+            out = []
+            for i in range(B):
+                img = x[i].float().cpu().clamp(0, 1)
+                # CHW -> HWC -> PIL
+                pil = PILImg.fromarray(
+                    (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8))
+                pil = pil.resize((tW, tH), PILImg.LANCZOS)
+                arr = torch.from_numpy(
+                    np.array(pil, dtype=np.float32) / 255.0).permute(2, 0, 1)
+                out.append(arr)
+            return torch.stack(out).to(device)
         return F.interpolate(x, scale_factor=1.0/self.scale, mode=self.mode)
 
     def param_count(self):
@@ -484,7 +501,7 @@ def main():
     p.add_argument("--scale", type=int, default=8,
                    help="Spatial scale factor (must be power of 2)")
     p.add_argument("--downscaler", default="area",
-                   choices=["area", "bilinear", "bicubic", "learned"],
+                   choices=["area", "bilinear", "bicubic", "lanczos", "learned"],
                    help="Downscale method")
     p.add_argument("--upscaler", default="espcn",
                    choices=["espcn", "simple"],
