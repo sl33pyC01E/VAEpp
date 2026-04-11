@@ -50,13 +50,13 @@ def save_preview(mini_vae, cpu_encode, cpu_decode, gen, logdir, step,
             ref_t = torch.from_numpy(ref_arr).permute(2, 0, 1).unsqueeze(0).to(device)
 
             with torch.amp.autocast(device.type, dtype=amp_dtype):
-                cpu_lat = cpu_encode(ref_t)
+                cpu_lat = normalize_latent(cpu_encode(ref_t))
                 cpu_lat_5d = cpu_lat.unsqueeze(1)  # (B, 1, C, H, W)
                 recon_lat, _ = mini_vae(cpu_lat_5d)
                 recon_lat = recon_lat[:, -1]  # (B, C, H, W)
                 # Crop to match
                 recon_lat = recon_lat[:, :, :cpu_lat.shape[2], :cpu_lat.shape[3]]
-                recon_rgb = cpu_decode(recon_lat)
+                recon_rgb = cpu_decode(denormalize_latent(recon_lat))
 
             ref_gt = (ref_arr * 255).clip(0, 255).astype(np.uint8)
             ref_rc = recon_rgb[0, :3, :H, :W].clamp(0, 1).float().cpu().numpy()
@@ -75,7 +75,7 @@ def save_preview(mini_vae, cpu_encode, cpu_decode, gen, logdir, step,
             recon_lat, _ = mini_vae(cpu_lat_5d)
             recon_lat = recon_lat[:, -1]
             recon_lat = recon_lat[:, :, :cpu_lat.shape[2], :cpu_lat.shape[3]]
-            recon_rgb = cpu_decode(recon_lat)
+            recon_rgb = cpu_decode(denormalize_latent(recon_lat))
 
         gt = images.cpu().numpy()
         rc = recon_rgb[:, :3, :H, :W].clamp(0, 1).float().cpu().numpy()
@@ -167,6 +167,29 @@ def train(args):
     print(f"  CPU VAE output: ({cpu_out_ch}, {cpu_out_H}, {cpu_out_W})")
     print(f"  Pipeline: {len(models_list)} stages, "
           f"{sum(sum(p.numel() for p in m.parameters()) for _, m, _ in models_list):,} params (frozen)")
+
+    # -- Probe CPU VAE output stats for normalization --
+    print("  Probing latent distribution...")
+    _probe_gen = VAEpp0rGenerator(
+        height=args.H, width=args.W, device=str(device),
+        bank_size=500, n_base_layers=64,
+    )
+    _probe_gen.build_banks()
+    with torch.no_grad():
+        _probe_imgs = _probe_gen.generate(16)
+        _probe_lat = cpu_encode(_probe_imgs)
+        lat_mean = _probe_lat.mean(dim=(0, 2, 3), keepdim=True)  # (1, C, 1, 1)
+        lat_std = _probe_lat.std(dim=(0, 2, 3), keepdim=True).clamp(min=1e-6)
+    del _probe_gen, _probe_imgs, _probe_lat
+    print(f"  Latent stats per channel:")
+    for c in range(cpu_out_ch):
+        print(f"    ch{c}: mean={lat_mean[0,c,0,0]:.3f}, std={lat_std[0,c,0,0]:.3f}")
+
+    def normalize_latent(lat):
+        return (lat - lat_mean) / lat_std
+
+    def denormalize_latent(lat):
+        return lat * lat_std + lat_mean
 
     # -- MiniVAE --
     enc_ch_str = args.enc_ch
@@ -338,11 +361,20 @@ def train(args):
                 "cpu_vae_ckpt": args.cpu_vae_ckpt,
                 "fusion": True,
             },
+            "lat_mean": lat_mean.cpu(),
+            "lat_std": lat_std.cpu(),
         }
+
+    # -- Wrap encode/decode with normalization for preview --
+    def norm_cpu_encode(x):
+        return normalize_latent(cpu_encode(x))
+
+    def norm_cpu_decode(x):
+        return cpu_decode(denormalize_latent(x))
 
     # -- Initial preview --
     preview_image = getattr(args, 'preview_image', None)
-    save_preview(model, cpu_encode, cpu_decode, gen, str(logdir),
+    save_preview(model, norm_cpu_encode, norm_cpu_decode, gen, str(logdir),
                  global_step, device, amp_dtype, preview_image=preview_image)
 
     # -- Loop --
@@ -379,7 +411,7 @@ def train(args):
             with torch.amp.autocast("cuda", dtype=amp_dtype):
                 # Encode through frozen CPU VAE
                 with torch.no_grad():
-                    cpu_lat = cpu_encode(images)  # (B, cpu_out_ch, cH, cW)
+                    cpu_lat = normalize_latent(cpu_encode(images))  # normalized
 
                 # MiniVAE forward (static: T=1)
                 cpu_lat_5d = cpu_lat.unsqueeze(1)  # (B, 1, C, H, W)
@@ -404,7 +436,7 @@ def train(args):
                 if args.w_pixel > 0:
                     with torch.no_grad():
                         pass  # images already on device
-                    recon_rgb = cpu_decode(recon)
+                    recon_rgb = cpu_decode(denormalize_latent(recon))
                     recon_rgb = recon_rgb[:, :3, :args.H, :args.W]
                     pixel_loss = F.l1_loss(recon_rgb, images[:, :3])
                     total = total + args.w_pixel * pixel_loss
@@ -413,7 +445,7 @@ def train(args):
                 # LPIPS (on RGB pixels)
                 if lpips_fn is not None:
                     if args.w_pixel <= 0:
-                        recon_rgb = cpu_decode(recon)
+                        recon_rgb = cpu_decode(denormalize_latent(recon))
                         recon_rgb = recon_rgb[:, :3, :args.H, :args.W]
                     rc_lp = recon_rgb * 2 - 1
                     gt_lp = images[:, :3] * 2 - 1
@@ -453,7 +485,7 @@ def train(args):
 
         # -- Preview --
         if global_step % args.preview_every == 0:
-            save_preview(model, cpu_encode, cpu_decode, gen, str(logdir),
+            save_preview(model, norm_cpu_encode, norm_cpu_decode, gen, str(logdir),
                          global_step, device, amp_dtype,
                          preview_image=preview_image)
 
