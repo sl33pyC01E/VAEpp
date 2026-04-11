@@ -395,6 +395,21 @@ def train(args):
             global_step = ckpt.get("global_step", 0)
         print(f"Resumed from {args.resume} at step {global_step}")
 
+    # -- Load independent components --
+    if args.load_downscaler:
+        ckpt_d = torch.load(args.load_downscaler, map_location="cpu",
+                            weights_only=False)
+        sd = ckpt_d.get("downscaler", ckpt_d.get("model", ckpt_d))
+        model.downscaler.load_state_dict(sd, strict=False)
+        print(f"Loaded downscaler from {args.load_downscaler}")
+
+    if args.load_upscaler:
+        ckpt_u = torch.load(args.load_upscaler, map_location="cpu",
+                            weights_only=False)
+        sd = ckpt_u.get("upscaler", ckpt_u.get("model", ckpt_u))
+        model.upscaler.load_state_dict(sd, strict=False)
+        print(f"Loaded upscaler from {args.load_upscaler}")
+
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
                  "fp32": torch.float32}[args.precision]
     scaler = torch.amp.GradScaler("cuda",
@@ -407,9 +422,18 @@ def train(args):
         steps_k = f"{step // 1000}k" if step >= 1000 else str(step)
         return f"srvae-{args.downscaler}-{args.upscaler}-{args.scale}x-h{args.up_hidden}-b{args.up_blocks}-{steps_k}.pt"
 
+    # -- Lanczos warmup target --
+    lanczos_target = None
+    if freeze_up_steps > 0 and args.downscaler == "learned":
+        lanczos_target = FixedDownscaler(args.scale, mode="lanczos")
+        print(f"Lanczos warmup: downscaler trained against lanczos targets "
+              f"for {freeze_up_steps} steps")
+
     def _make_ckpt():
         return {
             "model": model.state_dict(),
+            "downscaler": model.downscaler.state_dict(),
+            "upscaler": model.upscaler.state_dict(),
             "optimizer": opt.state_dict(),
             "global_step": global_step,
             "config": {
@@ -460,15 +484,26 @@ def train(args):
             recon, z = model(x)
 
             total = torch.tensor(0.0, device=device)
-            if args.w_l1 > 0:
-                l1 = F.l1_loss(recon, x)
-                total = total + args.w_l1 * l1
-                losses["l1"] = l1.item()
-            if args.w_mse > 0:
-                mse = F.mse_loss(recon, x)
-                total = total + args.w_mse * mse
-                losses["mse"] = mse.item()
-            if lpips_fn is not None:
+
+            # Lanczos warmup: train downscaler to match lanczos output
+            if lanczos_target is not None and global_step < freeze_up_steps:
+                with torch.no_grad():
+                    lanczos_out = lanczos_target(x)
+                down_loss = F.l1_loss(z, lanczos_out)
+                total = total + down_loss
+                losses["down"] = down_loss.item()
+            else:
+                # Normal end-to-end losses
+                if args.w_l1 > 0:
+                    l1 = F.l1_loss(recon, x)
+                    total = total + args.w_l1 * l1
+                    losses["l1"] = l1.item()
+                if args.w_mse > 0:
+                    mse = F.mse_loss(recon, x)
+                    total = total + args.w_mse * mse
+                    losses["mse"] = mse.item()
+
+            if lpips_fn is not None and global_step >= freeze_up_steps:
                 lp = lpips_fn(recon * 2 - 1, x * 2 - 1).mean()
                 total = total + args.w_lpips * lp
                 losses["lpips"] = lp.item()
@@ -544,6 +579,10 @@ def main():
     p.add_argument("--freeze-up-steps", type=int, default=0,
                    help="Freeze upscaler for N steps (learned downscaler warmup)")
     p.add_argument("--resume", default=None)
+    p.add_argument("--load-downscaler", default=None,
+                   help="Load downscaler weights independently")
+    p.add_argument("--load-upscaler", default=None,
+                   help="Load upscaler weights independently")
     p.add_argument("--logdir", default="sr_vae_logs")
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--save-every", type=int, default=5000)

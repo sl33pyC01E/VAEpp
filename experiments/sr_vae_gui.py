@@ -107,7 +107,11 @@ class SRVAETab(tk.Frame):
         f.pack(side="left", padx=(0, 10))
         f, self.freeze_up = make_spin(row3, "Freeze up steps", default=0)
         f.pack(side="left", padx=(0, 10))
-        f, self.resume_var = make_float(row3, "Resume", "", width=30)
+        f, self.resume_var = make_float(row3, "Resume", "", width=20)
+        f.pack(side="left", padx=(0, 10))
+        f, self.load_down_var = make_float(row3, "Load down", "", width=20)
+        f.pack(side="left", padx=(0, 10))
+        f, self.load_up_var = make_float(row3, "Load up", "", width=20)
         f.pack(side="left")
 
         # Preview image
@@ -171,6 +175,12 @@ class SRVAETab(tk.Frame):
         resume = self.resume_var.get().strip()
         if resume:
             cmd.extend(["--resume", resume])
+        load_down = self.load_down_var.get().strip()
+        if load_down:
+            cmd.extend(["--load-downscaler", load_down])
+        load_up = self.load_up_var.get().strip()
+        if load_up:
+            cmd.extend(["--load-upscaler", load_up])
         prev = self.preview_img_var.get().strip()
         if prev:
             cmd.extend(["--preview-image", prev])
