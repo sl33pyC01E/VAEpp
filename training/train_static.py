@@ -102,13 +102,13 @@ def train(args):
     logdir.mkdir(parents=True, exist_ok=True)
 
     # -- Model (read arch from checkpoint if resuming) --
-    enc_ch = args.enc_ch
+    enc_ch_str = args.enc_ch
     dec_ch = tuple(int(x) for x in args.dec_ch.split(","))
     latent_ch = args.latent_ch
     if args.resume:
         _peek = torch.load(args.resume, map_location="cpu", weights_only=False)
         _cfg = _peek.get("config", {})
-        enc_ch = _cfg.get("encoder_channels", enc_ch)
+        enc_ch_str = _cfg.get("encoder_channels", enc_ch_str)
         latent_ch = _cfg.get("latent_channels", latent_ch)
         dec_ch_str = _cfg.get("decoder_channels", args.dec_ch)
         if isinstance(dec_ch_str, str):
@@ -116,14 +116,24 @@ def train(args):
         elif isinstance(dec_ch_str, (list, tuple)):
             dec_ch = tuple(dec_ch_str)
         del _peek
+    # Parse encoder channels: int or comma-separated
+    if isinstance(enc_ch_str, int):
+        enc_ch = enc_ch_str
+    elif isinstance(enc_ch_str, str) and "," in enc_ch_str:
+        enc_ch = tuple(int(x) for x in enc_ch_str.split(","))
+    elif isinstance(enc_ch_str, (list, tuple)):
+        enc_ch = tuple(enc_ch_str)
+    else:
+        enc_ch = int(enc_ch_str)
+    n_stages = len(dec_ch)
     model = MiniVAE(
         latent_channels=latent_ch,
         image_channels=args.image_ch,
         output_channels=args.image_ch,
         encoder_channels=enc_ch,
         decoder_channels=dec_ch,
-        encoder_time_downscale=(False, False, False),
-        decoder_time_upscale=(False, False, False),
+        encoder_time_downscale=tuple([False] * n_stages),
+        decoder_time_upscale=tuple([False] * n_stages),
     ).to(device)
     if args.grad_checkpoint:
         model.use_checkpoint = True
@@ -238,7 +248,7 @@ def train(args):
                 "latent_channels": latent_ch,
                 "image_channels": args.image_ch,
                 "output_channels": args.image_ch,
-                "encoder_channels": enc_ch,
+                "encoder_channels": ",".join(str(x) for x in enc_ch) if isinstance(enc_ch, tuple) else enc_ch,
                 "decoder_channels": ",".join(str(x) for x in dec_ch),
                 "synthyper": True,
             },
@@ -365,8 +375,8 @@ def main():
     p.add_argument("--image-ch", type=int, default=3,
                    help="Input/output channels (3=RGB, 9=RGB+depth+flow+semantic)")
     p.add_argument("--latent-ch", type=int, default=32)
-    p.add_argument("--enc-ch", type=int, default=64,
-                   help="Encoder channel width")
+    p.add_argument("--enc-ch", default="64",
+                   help="Encoder channel width (int or comma-separated per stage)")
     p.add_argument("--dec-ch", default="256,128,64",
                    help="Decoder channel widths (comma-separated, 3 stages)")
     p.add_argument("--batch-size", type=int, default=4)

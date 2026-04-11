@@ -126,20 +126,39 @@ def train(args):
 
     # -- Model (3ch RGB, temporal ENABLED) --
     # Read encoder/decoder/latent config from checkpoint if resuming
-    enc_ch = 64
-    dec_ch = (256, 128, 64)
+    enc_ch_str = args.enc_ch
+    dec_ch = tuple(int(x) for x in args.dec_ch.split(","))
     latent_ch = args.latent_ch
     if args.resume:
         _ckpt_peek = torch.load(args.resume, map_location="cpu", weights_only=False)
         _cfg = _ckpt_peek.get("config", {})
-        enc_ch = _cfg.get("encoder_channels", 64)
+        enc_ch_str = _cfg.get("encoder_channels", enc_ch_str)
         latent_ch = _cfg.get("latent_channels", args.latent_ch)
-        dec_ch_str = _cfg.get("decoder_channels", "256,128,64")
+        dec_ch_str = _cfg.get("decoder_channels", args.dec_ch)
         if isinstance(dec_ch_str, str):
             dec_ch = tuple(int(x) for x in dec_ch_str.split(","))
         elif isinstance(dec_ch_str, (list, tuple)):
             dec_ch = tuple(dec_ch_str)
         del _ckpt_peek
+    # Parse encoder channels
+    if isinstance(enc_ch_str, int):
+        enc_ch = enc_ch_str
+    elif isinstance(enc_ch_str, str) and "," in enc_ch_str:
+        enc_ch = tuple(int(x) for x in enc_ch_str.split(","))
+    elif isinstance(enc_ch_str, (list, tuple)):
+        enc_ch = tuple(enc_ch_str)
+    else:
+        enc_ch = int(enc_ch_str)
+    n_stages = len(dec_ch)
+    # Parse temporal config
+    enc_t = tuple(x.strip().lower() in ("true", "1", "yes")
+                  for x in args.enc_time.split(","))
+    dec_t = tuple(x.strip().lower() in ("true", "1", "yes")
+                  for x in args.dec_time.split(","))
+    assert len(enc_t) == n_stages, \
+        f"--enc-time length {len(enc_t)} != {n_stages} stages"
+    assert len(dec_t) == n_stages, \
+        f"--dec-time length {len(dec_t)} != {n_stages} stages"
 
     model = MiniVAE(
         latent_channels=latent_ch,
@@ -147,8 +166,8 @@ def train(args):
         output_channels=3,
         encoder_channels=enc_ch,
         decoder_channels=dec_ch,
-        encoder_time_downscale=(True, True, False),
-        decoder_time_upscale=(False, True, True),
+        encoder_time_downscale=enc_t,
+        decoder_time_upscale=dec_t,
     ).to(device)
     if args.grad_checkpoint:
         model.use_checkpoint = True
@@ -281,8 +300,10 @@ def train(args):
                 "latent_channels": latent_ch,
                 "image_channels": 3,
                 "output_channels": 3,
-                "encoder_channels": enc_ch,
+                "encoder_channels": ",".join(str(x) for x in enc_ch) if isinstance(enc_ch, tuple) else enc_ch,
                 "decoder_channels": ",".join(str(x) for x in dec_ch),
+                "encoder_time_downscale": ",".join(str(x) for x in enc_t),
+                "decoder_time_upscale": ",".join(str(x) for x in dec_t),
                 "temporal": True,
                 "T": args.T,
                 "synthyper_stage": 2,
@@ -335,11 +356,16 @@ def train(args):
                 gt = x[:, T_in - T_match:]
                 rc = recon[:, T_out - T_match:]
 
-                # MSE loss
-                mse = F.mse_loss(rc, gt)
-                losses["mse"] = losses.get("mse", 0) + mse.item() / accum
-
-                total = args.w_mse * mse
+                # Reconstruction loss
+                total = torch.tensor(0.0, device=device)
+                if args.w_l1 > 0:
+                    l1 = F.l1_loss(rc, gt)
+                    total = total + args.w_l1 * l1
+                    losses["l1"] = losses.get("l1", 0) + l1.item() / accum
+                if args.w_mse > 0:
+                    mse = F.mse_loss(rc, gt)
+                    total = total + args.w_mse * mse
+                    losses["mse"] = losses.get("mse", 0) + mse.item() / accum
 
                 # Temporal consistency loss
                 if T_match >= 2:
@@ -423,6 +449,14 @@ def main():
     p.add_argument("--W", type=int, default=640)
     p.add_argument("--T", type=int, default=24)
     p.add_argument("--latent-ch", type=int, default=32)
+    p.add_argument("--enc-ch", default="64",
+                   help="Encoder channel width (int or comma-separated per stage)")
+    p.add_argument("--dec-ch", default="256,128,64",
+                   help="Decoder channel widths (comma-separated, one per stage)")
+    p.add_argument("--enc-time", default="true,true,false",
+                   help="Temporal downscale per encoder stage (comma-separated bools)")
+    p.add_argument("--dec-time", default="false,true,true",
+                   help="Temporal upscale per decoder stage (comma-separated bools)")
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", default="2e-4")
     p.add_argument("--total-steps", type=int, default=30000)
@@ -430,7 +464,8 @@ def main():
                    choices=["fp16", "bf16", "fp32"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--w-mse", type=float, default=1.0)
+    p.add_argument("--w-l1", type=float, default=1.0)
+    p.add_argument("--w-mse", type=float, default=0.0)
     p.add_argument("--w-lpips", type=float, default=0.5)
     p.add_argument("--w-temporal", type=float, default=2.0)
     p.add_argument("--bank-size", type=int, default=5000)

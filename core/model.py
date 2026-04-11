@@ -173,15 +173,27 @@ class MiniVAE(nn.Module):
         assert len(decoder_time_upscale) == n_stages, \
             f"decoder_time_upscale length {len(decoder_time_upscale)} != {n_stages} stages"
 
-        ec = encoder_channels
+        # Normalize encoder_channels to a tuple matching n_stages
+        if isinstance(encoder_channels, int):
+            ec = tuple([encoder_channels] * n_stages)
+        else:
+            ec = tuple(encoder_channels)
+            assert len(ec) == n_stages, \
+                f"encoder_channels length {len(ec)} != {n_stages} stages"
 
-        # Encoder: RGB -> latent (configurable number of stride-2 stages)
-        enc_layers = [conv(image_channels, ec), nn.ReLU(inplace=True)]
+        # Encoder: RGB -> latent (configurable channels per stage)
+        enc_layers = [conv(image_channels, ec[0]), nn.ReLU(inplace=True)]
         for i in range(n_stages):
-            enc_layers.append(TPool(ec, 2 if encoder_time_downscale[i] else 1))
-            enc_layers.append(conv(ec, ec, stride=2, bias=False))
-            enc_layers.extend([MemBlock(ec, ec), MemBlock(ec, ec), MemBlock(ec, ec)])
-        enc_layers.append(conv(ec, latent_channels))
+            prev_ch = ec[i - 1] if i > 0 else ec[0]
+            cur_ch = ec[i]
+            enc_layers.append(TPool(prev_ch, 2 if encoder_time_downscale[i] else 1))
+            enc_layers.append(conv(prev_ch, cur_ch, stride=2, bias=False))
+            enc_layers.extend([
+                MemBlock(cur_ch, cur_ch),
+                MemBlock(cur_ch, cur_ch),
+                MemBlock(cur_ch, cur_ch),
+            ])
+        enc_layers.append(conv(ec[-1], latent_channels))
         self.encoder = nn.Sequential(*enc_layers)
 
         # Decoder: latent -> multi-modal output (configurable stages)
