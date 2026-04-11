@@ -784,7 +784,8 @@ class InferenceTab(tk.Frame, PreviewWatcher):
                          "fp32": torch.float32}[prec]
             device = torch.device("cuda:0" if torch.cuda.is_available()
                                   else "cpu")
-            pipeline = _load_pipeline(ckpt_path, device)
+            models_list, encode_fn, decode_fn, spatial_sizes, ckpt = \
+                _load_pipeline(ckpt_path, device)
             print(f"Running on {len(paths)} real image(s)...", flush=True)
 
             from torchvision import transforms as T
@@ -804,8 +805,8 @@ class InferenceTab(tk.Frame, PreviewWatcher):
                 t0 = _time.perf_counter()
                 with torch.no_grad(), torch.amp.autocast(
                         device.type, dtype=amp_dtype):
-                    z = pipeline.encode(x)
-                    recon = pipeline.decode(z)
+                    z = encode_fn(x)
+                    recon = decode_fn(z)
                 dt = _time.perf_counter() - t0
                 print(f"  {os.path.basename(img_path)}: "
                       f"{dt*1000:.1f}ms  latent {list(z.shape)}", flush=True)
