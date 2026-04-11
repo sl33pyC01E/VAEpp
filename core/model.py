@@ -167,46 +167,40 @@ class MiniVAE(nn.Module):
         self.image_channels = image_channels
         self.output_channels = output_channels
 
+        n_stages = len(decoder_channels)
+        assert len(encoder_time_downscale) == n_stages, \
+            f"encoder_time_downscale length {len(encoder_time_downscale)} != {n_stages} stages"
+        assert len(decoder_time_upscale) == n_stages, \
+            f"decoder_time_upscale length {len(decoder_time_upscale)} != {n_stages} stages"
+
         ec = encoder_channels
 
-        # Encoder: RGB -> latent
-        self.encoder = nn.Sequential(
-            conv(image_channels, ec), nn.ReLU(inplace=True),
-            TPool(ec, 2 if encoder_time_downscale[0] else 1),
-            conv(ec, ec, stride=2, bias=False),
-            MemBlock(ec, ec), MemBlock(ec, ec), MemBlock(ec, ec),
-            TPool(ec, 2 if encoder_time_downscale[1] else 1),
-            conv(ec, ec, stride=2, bias=False),
-            MemBlock(ec, ec), MemBlock(ec, ec), MemBlock(ec, ec),
-            TPool(ec, 1 if not encoder_time_downscale[2] else 2),
-            conv(ec, ec, stride=2, bias=False),
-            MemBlock(ec, ec), MemBlock(ec, ec), MemBlock(ec, ec),
-            conv(ec, latent_channels),
-        )
+        # Encoder: RGB -> latent (configurable number of stride-2 stages)
+        enc_layers = [conv(image_channels, ec), nn.ReLU(inplace=True)]
+        for i in range(n_stages):
+            enc_layers.append(TPool(ec, 2 if encoder_time_downscale[i] else 1))
+            enc_layers.append(conv(ec, ec, stride=2, bias=False))
+            enc_layers.extend([MemBlock(ec, ec), MemBlock(ec, ec), MemBlock(ec, ec)])
+        enc_layers.append(conv(ec, latent_channels))
+        self.encoder = nn.Sequential(*enc_layers)
 
-        # Decoder: latent -> multi-modal output
-        n_f = list(decoder_channels)  # [192, 96, 64]
-        self.decoder = nn.Sequential(
-            Clamp(), conv(latent_channels, n_f[0]), nn.ReLU(inplace=True),
-            # Stage 1: bottleneck resolution (48x84)
-            MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]),
-            nn.Upsample(scale_factor=2),
-            TGrow(n_f[0], 2 if decoder_time_upscale[0] else 1),
-            conv(n_f[0], n_f[1], bias=False),
-            # Stage 2: mid resolution (96x168)
-            MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]),
-            nn.Upsample(scale_factor=2),
-            TGrow(n_f[1], 2 if decoder_time_upscale[1] else 1),
-            conv(n_f[1], n_f[2], bias=False),
-            # Stage 3: high resolution (192x336)
-            MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]),
-            nn.Upsample(scale_factor=2),
-            TGrow(n_f[2], 2 if decoder_time_upscale[2] else 1),
-            conv(n_f[2], n_f[2], bias=False),
-            # Output head (384x672)
-            nn.ReLU(inplace=True),
-            conv(n_f[2], output_channels),
-        )
+        # Decoder: latent -> multi-modal output (configurable stages)
+        n_f = list(decoder_channels)
+        dec_layers = [Clamp(), conv(latent_channels, n_f[0]), nn.ReLU(inplace=True)]
+        for i in range(n_stages):
+            dec_layers.extend([
+                MemBlock(n_f[i], n_f[i]),
+                MemBlock(n_f[i], n_f[i]),
+                MemBlock(n_f[i], n_f[i]),
+                nn.Upsample(scale_factor=2),
+                TGrow(n_f[i], 2 if decoder_time_upscale[i] else 1),
+            ])
+            if i < n_stages - 1:
+                dec_layers.append(conv(n_f[i], n_f[i + 1], bias=False))
+            else:
+                dec_layers.append(conv(n_f[i], n_f[i], bias=False))
+        dec_layers.extend([nn.ReLU(inplace=True), conv(n_f[-1], output_channels)])
+        self.decoder = nn.Sequential(*dec_layers)
 
         # Computed properties
         self.t_downscale = 1
