@@ -293,11 +293,14 @@ def train(args):
     opt_disc = None
     if args.w_gan > 0:
         disc = PatchDiscriminator(in_ch=3, nf=args.disc_nf).to(device)
-        opt_disc = torch.optim.Adam(disc.parameters(), lr=float(args.lr),
+        _disc_lr_str = args.disc_lr.strip() if args.disc_lr else "none"
+        _disc_lr = float(args.lr) * 0.5 if _disc_lr_str in ("none", "") else float(_disc_lr_str)
+        opt_disc = torch.optim.Adam(disc.parameters(), lr=_disc_lr,
                                     betas=(0.5, 0.999))
         pc_d = sum(p.numel() for p in disc.parameters())
         print(f"PatchGAN: nf={args.disc_nf}, {pc_d:,} params, "
-              f"w_gan={args.w_gan}, start_step={args.gan_start}")
+              f"w_gan={args.w_gan}, start_step={args.gan_start}, "
+              f"warmup={args.gan_warmup}, disc_lr={_disc_lr:.2e}")
 
     # -- LPIPS --
     lpips_fn = None
@@ -500,17 +503,23 @@ def train(args):
 
                 # GAN generator loss
                 if disc is not None and global_step >= args.gan_start:
-                    if haar_rounds > 0:
-                        rc_2d = rc[:, 0]  # (B, vae_ch, hH, hW)
-                        fake_rgb = haar_up_n(rc_2d, haar_rounds)[:, :3, :args.H, :args.W]
+                    _steps_since_start = global_step - args.gan_start
+                    if args.gan_warmup > 0:
+                        _eff_w_gan = args.w_gan * min(1.0, _steps_since_start / args.gan_warmup)
                     else:
-                        fake_rgb = rc[:, 0, :3, :args.H, :args.W]
-                    g_loss = hinge_g_loss(disc(fake_rgb * 2 - 1))
-                    total = total + args.w_gan * g_loss
-                    losses["g"] = losses.get("g", 0) + g_loss.item() / accum
-                    # Save detached copies for D update (last accum iter wins)
-                    _d_real = images[:, :3].detach()
-                    _d_fake = fake_rgb.detach()
+                        _eff_w_gan = args.w_gan
+                    if _eff_w_gan > 0:
+                        if haar_rounds > 0:
+                            rc_2d = rc[:, 0]  # (B, vae_ch, hH, hW)
+                            fake_rgb = haar_up_n(rc_2d, haar_rounds)[:, :3, :args.H, :args.W]
+                        else:
+                            fake_rgb = rc[:, 0, :3, :args.H, :args.W]
+                        g_loss = hinge_g_loss(disc(fake_rgb * 2 - 1))
+                        total = total + _eff_w_gan * g_loss
+                        losses["g"] = losses.get("g", 0) + g_loss.item() / accum
+                        # Save detached copies for D update (last accum iter wins)
+                        _d_real = images[:, :3].detach()
+                        _d_fake = fake_rgb.detach()
 
             if total.dim() > 0:
                 total = total.mean()
@@ -602,10 +611,14 @@ def main():
     p.add_argument("--w-l1", type=float, default=1.0)
     p.add_argument("--w-mse", type=float, default=0.0)
     p.add_argument("--w-lpips", type=float, default=0.5)
-    p.add_argument("--w-gan", type=float, default=0.0,
+    p.add_argument("--w-gan", type=float, default=0.1,
                    help="PatchGAN adversarial loss weight (0=disabled)")
     p.add_argument("--gan-start", type=int, default=1000,
                    help="Step to start GAN training (let recon stabilize first)")
+    p.add_argument("--gan-warmup", type=int, default=2000,
+                   help="Steps to linearly ramp gan weight from 0 to w_gan after gan_start (0=hard switch)")
+    p.add_argument("--disc-lr", type=str, default="none",
+                   help="Discriminator Adam LR. 'none' or empty = args.lr * 0.5")
     p.add_argument("--disc-nf", type=int, default=64,
                    help="PatchGAN base channel count")
     p.add_argument("--bank-size", type=int, default=500)

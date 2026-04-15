@@ -95,9 +95,13 @@ class TrainingTab(tk.Frame):
         f.pack(side="left", padx=(0, 10))
         f, self.w_lpips_var = make_float(row2, "w_lpips", 0.5)
         f.pack(side="left", padx=(0, 10))
-        f, self.w_gan_var = make_float(row2, "w_gan", 0.0)
+        f, self.w_gan_var = make_float(row2, "w_gan", 0.1)
         f.pack(side="left", padx=(0, 10))
         f, self.gan_start_var = make_spin(row2, "GAN start", default=1000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.gan_warmup_var = make_spin(row2, "GAN warmup", default=2000)
+        f.pack(side="left", padx=(0, 10))
+        f, self.disc_lr_var = make_float(row2, "disc_lr", "none")
         f.pack(side="left", padx=(0, 10))
         f, self.min_shapes_var = make_spin(row2, "Bank size", default=5000)
         f.pack(side="left", padx=(0, 10))
@@ -220,6 +224,8 @@ class TrainingTab(tk.Frame):
                "--w-lpips", self.w_lpips_var.get(),
                "--w-gan", self.w_gan_var.get(),
                "--gan-start", str(self.gan_start_var.get()),
+               "--gan-warmup", str(self.gan_warmup_var.get()),
+               "--disc-lr", self.disc_lr_var.get(),
                "--bank-size", str(self.min_shapes_var.get()),
                "--n-layers", str(self.max_shapes_var.get()),
                "--alpha", self.alpha_var.get(),
