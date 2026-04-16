@@ -30,6 +30,7 @@ from core.generator.signage import SignageMixin
 from core.generator.particles import ParticlesMixin
 from core.generator.raymarch import RaymarchMixin
 from core.generator.arcade import ArcadeMixin
+from core.generator.extras import ExtrasMixin
 
 
 class VAEpp0rGenerator(
@@ -45,6 +46,7 @@ class VAEpp0rGenerator(
     ParticlesMixin,
     RaymarchMixin,
     ArcadeMixin,
+    ExtrasMixin,
 ):
     """GPU-accelerated procedural image generator.
 
@@ -832,6 +834,20 @@ class VAEpp0rGenerator(
             ap = self._sample_arcade_recipe(
                 T=24, mode=str(getattr(self, "static_arcade_mode", "auto")))
             canvas = self._apply_arcade(canvas, 12, ap)
+
+        # --- Optional extras (fire / vortex / starfield / eq) ---
+        if getattr(self, "static_fire", False):
+            fp = self._sample_fire_recipe(T=1, intensity=0.8)
+            canvas = self._apply_fire(canvas, 0, fp)
+        if getattr(self, "static_vortex", False):
+            vp = self._sample_vortex_recipe(T=1, strength=0.6)
+            canvas = self._apply_vortex(canvas, 0, vp)
+        if getattr(self, "static_starfield", False):
+            sf = self._sample_starfield_recipe(T=24, n_stars=150)
+            canvas = self._apply_starfield(canvas, 12, sf)
+        if getattr(self, "static_eq", False):
+            ep = self._sample_eq_recipe(T=1, n_bars=24)
+            canvas = self._apply_eq_bars(canvas, 0, ep)
 
         return canvas.clamp(0, 1)
 

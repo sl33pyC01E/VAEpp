@@ -217,7 +217,11 @@ class MotionMixin:
                            use_glitch=False, glitch_n=2,
                            use_chromatic=False, chromatic_strength=0.01,
                            use_scanlines=False, scanline_intensity=0.25,
-                           grain_strength=0.05):
+                           grain_strength=0.05,
+                           use_fire=False, fire_intensity=0.8,
+                           use_vortex=False, vortex_strength=0.6,
+                           use_starfield=False, starfield_n=150,
+                           use_eq=False, eq_n_bars=24):
         """Generate animated clips with physics, viewport effects, and fluid motion.
 
         Returns: (B, T, 3, H, W) tensor in [0, 1] on self.device.
@@ -544,6 +548,12 @@ class MotionMixin:
                 intensity=scanline_intensity if use_scanlines else 0.0,
                 grain_strength=grain_strength)
 
+        # Extras (fire / vortex / starfield / eq)
+        fire_params = self._sample_fire_recipe(T=T, intensity=fire_intensity) if use_fire else None
+        vortex_params = self._sample_vortex_recipe(T=T, strength=vortex_strength) if use_vortex else None
+        starfield_params = self._sample_starfield_recipe(T=T, n_stars=starfield_n) if use_starfield else None
+        eq_params = self._sample_eq_recipe(T=T, n_bars=eq_n_bars) if use_eq else None
+
         # Pre-render scene template once (templates use random values internally,
         # so calling per-frame would cause flickering)
         template_canvas = None
@@ -753,6 +763,16 @@ class MotionMixin:
             # Scanlines + film grain
             if scanline_params is not None:
                 canvas = self._apply_scanlines(canvas, ti, scanline_params)
+
+            # Extras
+            if fire_params is not None:
+                canvas = self._apply_fire(canvas, ti, fire_params)
+            if vortex_params is not None:
+                canvas = self._apply_vortex(canvas, ti, vortex_params)
+            if starfield_params is not None:
+                canvas = self._apply_starfield(canvas, ti, starfield_params)
+            if eq_params is not None:
+                canvas = self._apply_eq_bars(canvas, ti, eq_params)
 
             # Post-processing (consistent params across frames)
             canvas = canvas.clamp(1e-6, 1).pow(pp_gamma)

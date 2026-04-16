@@ -254,6 +254,30 @@ class GeneratorTab(tk.Frame):
                       "auto", "pong", "breakout", "invaders",
                       "snake", "tetris", "asteroids").pack(side="left", padx=(0, 6))
 
+        # Extras (Phase 10) - static
+        tk.Label(L, text="Extras", bg=BG_PANEL, fg=ACCENT,
+                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
+        br_ex = tk.Frame(L, bg=BG_PANEL)
+        br_ex.pack(fill="x", pady=2)
+        self.fire_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_ex, text="Fire", variable=self.fire_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.vortex_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_ex, text="Vortex", variable=self.vortex_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        br_ex2 = tk.Frame(L, bg=BG_PANEL)
+        br_ex2.pack(fill="x", pady=2)
+        self.starfield_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_ex2, text="Starfield", variable=self.starfield_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.eq_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_ex2, text="EQ bars", variable=self.eq_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -455,6 +479,10 @@ class GeneratorTab(tk.Frame):
         gen.static_raymarch_steps = int(self.raymarch_steps.get())
         gen.static_arcade = bool(self.arcade_var.get())
         gen.static_arcade_mode = self.arcade_mode_var.get()
+        gen.static_fire = bool(self.fire_var.get())
+        gen.static_vortex = bool(self.vortex_var.get())
+        gen.static_starfield = bool(self.starfield_var.get())
+        gen.static_eq = bool(self.eq_var.get())
 
     def gen_sample(self):
         gen = self._get_gen()
@@ -927,6 +955,26 @@ class VideoGenTab(tk.Frame):
         f, self.grain_str = make_slider(row2p, "Film grain", 0, 0.2, 0.05)
         f.pack(side="left")
 
+        # Extras (Phase 10): fire / vortex / starfield / eq
+        row2q = tk.Frame(top, bg=BG_PANEL)
+        row2q.pack(fill="x", pady=(2, 0))
+        self.fire_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2q, text="Fire", variable=self.fire_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.vortex_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2q, text="Vortex", variable=self.vortex_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.starfield_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2q, text="Starfield", variable=self.starfield_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.eq_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2q, text="EQ bars", variable=self.eq_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+
         # Buttons
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
@@ -1053,6 +1101,14 @@ class VideoGenTab(tk.Frame):
             use_scanlines=self.scanlines_var.get(),
             scanline_intensity=0.25,
             grain_strength=float(self.grain_str.get()),
+            use_fire=self.fire_var.get(),
+            fire_intensity=0.8,
+            use_vortex=self.vortex_var.get(),
+            vortex_strength=0.6,
+            use_starfield=self.starfield_var.get(),
+            starfield_n=150,
+            use_eq=self.eq_var.get(),
+            eq_n_bars=24,
         )
 
     def build_pool(self):

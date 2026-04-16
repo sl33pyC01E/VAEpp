@@ -172,6 +172,19 @@ class RecipesMixin:
                     if seq_kwargs.get("use_scanlines", False) else 0.0,
                 grain_strength=float(seq_kwargs.get("grain_strength", 0.0)),
             )
+        # Optional Phase-10 extras
+        if seq_kwargs.get("use_fire", False):
+            recipe["fire"] = self._sample_fire_recipe(
+                T=T, intensity=float(seq_kwargs.get("fire_intensity", 0.8)))
+        if seq_kwargs.get("use_vortex", False):
+            recipe["vortex"] = self._sample_vortex_recipe(
+                T=T, strength=float(seq_kwargs.get("vortex_strength", 0.6)))
+        if seq_kwargs.get("use_starfield", False):
+            recipe["starfield"] = self._sample_starfield_recipe(
+                T=T, n_stars=int(seq_kwargs.get("starfield_n", 150)))
+        if seq_kwargs.get("use_eq", False):
+            recipe["eq"] = self._sample_eq_recipe(
+                T=T, n_bars=int(seq_kwargs.get("eq_n_bars", 24)))
         return recipe
 
     def build_motion_pool(self, n_clips=200, T=8, **seq_kwargs):
@@ -498,6 +511,20 @@ class RecipesMixin:
             sc = recipe.get("scanline")
             if sc is not None and sc.get("enable", False):
                 canvas = self._apply_scanlines(canvas, ti, sc)
+
+            # Phase-10 extras
+            fr = recipe.get("fire")
+            if fr is not None and fr.get("enable", False):
+                canvas = self._apply_fire(canvas, ti, fr)
+            vx = recipe.get("vortex")
+            if vx is not None and vx.get("enable", False):
+                canvas = self._apply_vortex(canvas, ti, vx)
+            sf = recipe.get("starfield")
+            if sf is not None and sf.get("enable", False):
+                canvas = self._apply_starfield(canvas, ti, sf)
+            eq = recipe.get("eq")
+            if eq is not None and eq.get("enable", False):
+                canvas = self._apply_eq_bars(canvas, ti, eq)
 
             # Post-processing
             canvas = canvas.clamp(1e-6, 1).pow(gamma)
