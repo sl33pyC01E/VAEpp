@@ -25,6 +25,7 @@ from core.generator.recipes import RecipesMixin
 from core.generator.io import IOMixin
 from core.generator.fluid import FluidMixin
 from core.generator.effects import EffectsMixin
+from core.generator.text import TextMixin
 
 
 class VAEpp0rGenerator(
@@ -35,6 +36,7 @@ class VAEpp0rGenerator(
     IOMixin,
     FluidMixin,
     EffectsMixin,
+    TextMixin,
 ):
     """GPU-accelerated procedural image generator.
 
@@ -774,6 +776,18 @@ class VAEpp0rGenerator(
             if fp.get("flashes"):
                 fp["flashes"][0]["t"] = 0
             canvas = self._apply_flash(canvas, 0, fp)
+
+        # --- Optional text overlay (single frozen frame) ---
+        if getattr(self, "static_text", False):
+            tp = self._sample_text_recipe(
+                T=1,
+                mode=str(getattr(self, "static_text_mode", "typing")),
+                language=str(getattr(self, "static_text_lang", "mixed")),
+                font_size=int(getattr(self, "static_text_size", 24)),
+                cps=float(getattr(self, "static_text_cps", 12.0)),
+            )
+            # For static typing: show the fully typed string at ti=0
+            canvas = self._apply_text(canvas, 0, tp)
 
         return canvas.clamp(0, 1)
 

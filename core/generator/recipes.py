@@ -113,6 +113,16 @@ class RecipesMixin:
                 T=T, speed_range=(speed, speed),
                 sat_boost=float(seq_kwargs.get("palette_sat_boost", 1.0)),
             )
+        # Optional text overlay (typing / scrolling)
+        if seq_kwargs.get("use_text", False):
+            recipe["text"] = self._sample_text_recipe(
+                T=T,
+                mode=str(seq_kwargs.get("text_mode", "typing")),
+                language=str(seq_kwargs.get("text_language", "mixed")),
+                font_size=int(seq_kwargs.get("text_font_size", 24)),
+                cps=float(seq_kwargs.get("text_cps", 12.0)),
+                scroll_pxpf=float(seq_kwargs.get("text_scroll_pxpf", 8.0)),
+            )
         return recipe
 
     def build_motion_pool(self, n_clips=200, T=8, **seq_kwargs):
@@ -399,6 +409,11 @@ class RecipesMixin:
             fl = recipe.get("flash")
             if fl is not None and fl.get("enable", False):
                 canvas = self._apply_flash(canvas, ti, fl)
+
+            # Text overlay (typing / scrolling)
+            tx = recipe.get("text")
+            if tx is not None and tx.get("enable", False):
+                canvas = self._apply_text(canvas, ti, tx)
 
             # Post-processing
             canvas = canvas.clamp(1e-6, 1).pow(gamma)

@@ -202,7 +202,10 @@ class MotionMixin:
                            use_flash=False, flash_n=2,
                            strobe_rate=0.0, strobe_strength=0.3,
                            use_palette_cycle=False,
-                           palette_speed=0.05, palette_sat_boost=1.0):
+                           palette_speed=0.05, palette_sat_boost=1.0,
+                           use_text=False, text_mode="typing",
+                           text_language="mixed", text_font_size=24,
+                           text_cps=12.0, text_scroll_pxpf=8.0):
         """Generate animated clips with physics, viewport effects, and fluid motion.
 
         Returns: (B, T, 3, H, W) tensor in [0, 1] on self.device.
@@ -480,6 +483,14 @@ class MotionMixin:
                 T, speed_range=(palette_speed, palette_speed),
                 sat_boost=palette_sat_boost)
 
+        # Text overlay params
+        text_params = None
+        if use_text:
+            text_params = self._sample_text_recipe(
+                T=T, mode=text_mode, language=text_language,
+                font_size=text_font_size, cps=text_cps,
+                scroll_pxpf=text_scroll_pxpf)
+
         # Pre-render scene template once (templates use random values internally,
         # so calling per-frame would cause flickering)
         template_canvas = None
@@ -657,6 +668,10 @@ class MotionMixin:
             # Flash frames / strobe (pointwise)
             if flash_params is not None:
                 canvas = self._apply_flash(canvas, ti, flash_params)
+
+            # Text overlay (alpha composite)
+            if text_params is not None:
+                canvas = self._apply_text(canvas, ti, text_params)
 
             # Post-processing (consistent params across frames)
             canvas = canvas.clamp(1e-6, 1).pow(pp_gamma)

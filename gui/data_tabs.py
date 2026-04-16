@@ -169,6 +169,24 @@ class GeneratorTab(tk.Frame):
         f, self.palette_speed = make_slider(br_eff4, "Palette shift amt", 0, 1, 0.25)
         f.pack(side="left")
 
+        # Text overlay (Phase 4)
+        tk.Label(L, text="Text", bg=BG_PANEL, fg=ACCENT,
+                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
+        br_txt = tk.Frame(L, bg=BG_PANEL)
+        br_txt.pack(fill="x", pady=2)
+        self.text_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_txt, text="Enable", variable=self.text_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.text_lang_var = tk.StringVar(value="mixed")
+        tk.OptionMenu(br_txt, self.text_lang_var,
+                      "mixed", "latin", "cyrillic", "greek",
+                      "hebrew", "arabic", "digits").pack(side="left", padx=(0, 6))
+        br_txt2 = tk.Frame(L, bg=BG_PANEL)
+        br_txt2.pack(fill="x", pady=2)
+        f, self.text_size = make_slider(br_txt2, "Font size", 8, 64, 24)
+        f.pack(side="left")
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -354,6 +372,11 @@ class GeneratorTab(tk.Frame):
         gen.static_flash = bool(self.flash_var.get())
         gen.static_palette = bool(self.palette_var.get())
         gen.static_palette_shift = float(self.palette_speed.get())
+        gen.static_text = bool(self.text_var.get())
+        gen.static_text_mode = "typing"
+        gen.static_text_lang = self.text_lang_var.get()
+        gen.static_text_size = int(self.text_size.get())
+        gen.static_text_cps = 12.0
 
     def gen_sample(self):
         gen = self._get_gen()
@@ -721,6 +744,30 @@ class VideoGenTab(tk.Frame):
         f, self.palette_speed = make_slider(row2h, "Palette speed", 0, 0.2, 0.05)
         f.pack(side="left")
 
+        # Text overlay (Phase 4)
+        row2i = tk.Frame(top, bg=BG_PANEL)
+        row2i.pack(fill="x", pady=(2, 0))
+        self.text_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2i, text="Text", variable=self.text_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.text_mode_var = tk.StringVar(value="typing")
+        tk.OptionMenu(row2i, self.text_mode_var,
+                      "typing", "scroll_left", "scroll_right").pack(side="left", padx=(0, 6))
+        self.text_lang_var = tk.StringVar(value="mixed")
+        tk.OptionMenu(row2i, self.text_lang_var,
+                      "mixed", "latin", "cyrillic", "greek",
+                      "hebrew", "arabic", "digits").pack(side="left", padx=(0, 6))
+
+        row2j = tk.Frame(top, bg=BG_PANEL)
+        row2j.pack(fill="x", pady=(2, 0))
+        f, self.text_size = make_slider(row2j, "Font size", 8, 64, 24)
+        f.pack(side="left", padx=(0, 5))
+        f, self.text_cps = make_slider(row2j, "Typing CPS", 1, 40, 12)
+        f.pack(side="left", padx=(0, 5))
+        f, self.text_scroll = make_slider(row2j, "Scroll px/f", 1, 40, 8)
+        f.pack(side="left")
+
         # Buttons
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
@@ -820,6 +867,12 @@ class VideoGenTab(tk.Frame):
             use_palette_cycle=self.palette_var.get(),
             palette_speed=self.palette_speed.get(),
             palette_sat_boost=1.0,
+            use_text=self.text_var.get(),
+            text_mode=self.text_mode_var.get(),
+            text_language=self.text_lang_var.get(),
+            text_font_size=int(self.text_size.get()),
+            text_cps=float(self.text_cps.get()),
+            text_scroll_pxpf=float(self.text_scroll.get()),
         )
 
     def build_pool(self):
