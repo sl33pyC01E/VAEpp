@@ -156,7 +156,8 @@ class SignageMixin:
         rgb = rgb * dot_mask.unsqueeze(0)
         alpha_b = alpha.unsqueeze(0)
         rgb_b = rgb.unsqueeze(0)
-        return canvas * (1 - alpha_b) + rgb_b * alpha_b
+        # rgb_b is pre-multiplied (color * alpha from _rasterize_text)
+        return canvas * (1 - alpha_b) + rgb_b
 
     def _render_seven_seg(self, canvas, ti, sp):
         # Compute the displayed number
@@ -217,7 +218,8 @@ class SignageMixin:
         rgb = color.expand(3, H, W) * alpha
         alpha_b = alpha.unsqueeze(0)
         rgb_b = rgb.unsqueeze(0)
-        return canvas * (1 - alpha_b) + rgb_b * alpha_b
+        # rgb_b is pre-multiplied (color * alpha from _rasterize_text)
+        return canvas * (1 - alpha_b) + rgb_b
 
     def _render_marquee(self, canvas, ti, sp):
         # Scrolling text inside a dark panel with border
@@ -245,7 +247,8 @@ class SignageMixin:
         # Clip text to panel
         alpha = alpha * panel_alpha
         rgb = rgb * panel_alpha
-        return canvas * (1 - alpha.unsqueeze(0)) + rgb.unsqueeze(0) * alpha.unsqueeze(0)
+        # rgb is pre-multiplied (color * alpha from _rasterize_text)
+        return canvas * (1 - alpha.unsqueeze(0)) + rgb.unsqueeze(0)
 
     def _render_neon(self, canvas, ti, sp):
         # Render text, build a gaussian glow, pulse intensity over time
@@ -275,7 +278,8 @@ class SignageMixin:
         out = canvas + glow_rgb * 0.8
         a_b = alpha.unsqueeze(0)
         r_b = rgb.unsqueeze(0)
-        out = out * (1 - a_b) + r_b * a_b
+        # r_b is pre-multiplied
+        out = out * (1 - a_b) + r_b
         return out.clamp(0, 1)
 
     def _render_ticker(self, canvas, ti, sp):
@@ -301,7 +305,8 @@ class SignageMixin:
         band[:, :, max(0, oy - 6):min(self.H, oy + band_h)] = 1.0
         band_rgb = torch.zeros(1, 3, self.H, self.W, device=self.device)
         canvas = canvas * (1 - band * 0.7) + band_rgb * (band * 0.7)
-        return canvas * (1 - a_b) + r_b * a_b
+        # r_b is pre-multiplied (color * alpha from _rasterize_text)
+        return canvas * (1 - a_b) + r_b
 
     def _render_warning(self, canvas, ti, sp):
         # Full-field alternation at hz between two colors + pattern overlay
@@ -368,8 +373,8 @@ class SignageMixin:
         fill_x2 = min(x2, x1 + int(bar_w * progress))
         frame[:, :, y1:y2, x1:fill_x2] = 1.0
         col = torch.tensor(sp["color"], device=self.device).view(1, 3, 1, 1)
-        fill_rgb = col * frame
-        return out * (1 - frame) + fill_rgb * frame
+        fill_rgb = col * frame  # pre-multiplied
+        return out * (1 - frame) + fill_rgb
 
 
 # ---------------------------------------------------------------------------

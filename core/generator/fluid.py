@@ -184,9 +184,14 @@ class FluidMixin:
         warp_strength = float(fluid_params.get("warp_strength", 8.0))
         border_atten = float(fluid_params.get("border_atten", 0.15))
 
-        # Convert pixel displacement to normalized-UV: u_norm = u_px / (W/2), etc.
-        u = dx * (warp_strength / max(W * 0.5, 1.0))
-        v = dy * (warp_strength / max(H * 0.5, 1.0))
+        # dx/dy are finite-difference gradients of h in units of "h-delta per
+        # pixel". We want the effective pixel-space shift to scale with
+        # `warp_strength`, then convert to normalized-UV for grid_sample.
+        # A shift of K pixels -> K / (W/2) in normalized coords, so:
+        #   u_norm = (dx * warp_strength * W/2) / (W/2) = dx * warp_strength
+        # The earlier extra /(W/2) factor made displacement ~300x too small.
+        u = dx * warp_strength
+        v = dy * warp_strength
 
         # Border attenuation to prevent reflection-mode seams.
         # border_mask ∈ [0, 1]; shape (H, W). We blend toward zero displacement

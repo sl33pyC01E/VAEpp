@@ -110,22 +110,27 @@ class RaymarchMixin:
     def _sample_raymarch_recipe(self, T, n_spheres=2, n_boxes=0, n_tori=0,
                                 march_steps=24, sphere_dip=False):
         """Sample primitive positions + velocities + colors.
-        Each primitive has (x0, y0, z0, vx, vy, vz, gravity, color)."""
+        Each primitive has (x0, y0, z0, vx, vy, vz, gravity, color).
+
+        Primitives spawn close to the camera with large radii so they
+        cover a visually-obvious portion of the frame. At z=0.3 with
+        radius 0.5, a sphere projects to roughly 60% of the canvas
+        height — unmistakable."""
         rng_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
         rng = __import__("random").Random(rng_seed)
         prims = []
         for _ in range(n_spheres):
             prims.append({
                 "kind": "sphere",
-                "radius": rng.uniform(0.15, 0.4),
-                "x0": rng.uniform(-0.8, 0.8),
-                "y0": rng.uniform(-0.6, 0.6),
-                "z0": rng.uniform(0.5, 2.5),
+                "radius": rng.uniform(0.35, 0.75),
+                "x0": rng.uniform(-0.5, 0.5),
+                "y0": rng.uniform(-0.4, 0.4),
+                "z0": rng.uniform(-0.2, 0.6),
                 "vx": rng.uniform(-0.02, 0.02),
                 "vy": rng.uniform(-0.02, 0.02),
                 "vz": rng.uniform(-0.03, 0.03),
                 "gravity": 0.0,
-                "color": [rng.uniform(0.3, 1), rng.uniform(0.3, 1), rng.uniform(0.3, 1)],
+                "color": [rng.uniform(0.4, 1), rng.uniform(0.4, 1), rng.uniform(0.4, 1)],
             })
         for _ in range(n_boxes):
             prims.append({

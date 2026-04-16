@@ -603,58 +603,71 @@ class VAEpp0rGenerator(
             c3 = self._post_process(c3)
             canvas[q3_mask] = c3.clamp(0, 1)
 
-        # Q4-Q7: apply the existing q2/q3-style base composite, then
-        # layer a Phase 1-10 effect on top. All use ti=0 since static.
-        def _base_scene(n):
-            bg = self._sample_colors(n)
+        # Q4-Q7: For each new class, build a MINIMAL base so the signature
+        # effect dominates. Full-noise base drowns signage/raymarch/arcade
+        # out and makes the class read as another "dense random". Instead,
+        # each uses a simpler backdrop tuned for its hero effect.
+        def _soft_scene(n, darken=0.4):
+            """Single base layer + mild post. Keeps some texture but far
+            less chaotic than _generate_disco Q2."""
+            bg = self._sample_colors(n) * darken
             c = bg.view(n, 3, 1, 1).expand(n, 3, H, W).clone()
-            template = self._pick_template()
-            if template != "random":
-                c = self._apply_scene_template(c, template, n)
-            c = self._overlay_shapes_on_canvas(c, n,
-                                                n_stamps_range=(3, 8),
-                                                n_micro_range=(20, 60))
-            return self._post_process(c).clamp(0, 1)
+            layer_idx = torch.randint(0, self.base_layers.shape[0],
+                                       (n,), device=self.device)
+            layer = self.base_layers[layer_idx].clone()
+            opacity = 0.35
+            c = c * (1 - opacity) + layer * opacity
+            return c.clamp(0, 1)
 
-        # Q4: fluid (ripple + raindrops)
+        # Q4: fluid ripple — needs texture to warp, keep soft base
         q4_mask = (quadrants == 4)
         n4 = q4_mask.sum().item()
         if n4 > 0:
-            c4 = _base_scene(n4)
-            fp = self._sample_fluid_recipe(T=1, n_drops=3, warp_strength=8.0)
+            c4 = _soft_scene(n4, darken=0.7)
+            # Crank up warp so ripples are visible in a single frame
+            fp = self._sample_fluid_recipe(
+                T=1, n_drops=4,
+                warp_strength=16.0,                         # bigger displacement
+                amp_range=(0.03, 0.08),                     # bigger impact amps
+                gerstner_amp_range=(0.015, 0.04),           # bigger standing waves
+            )
             c4 = self._apply_ripples(c4, 0, 1, fp)
             canvas[q4_mask] = c4.clamp(0, 1)
 
-        # Q5: 3D raymarched primitives
+        # Q5: raymarched spheres — dark backdrop so spheres pop
         q5_mask = (quadrants == 5)
         n5 = q5_mask.sum().item()
         if n5 > 0:
-            c5 = _base_scene(n5)
-            rm = self._sample_raymarch_recipe(T=1, n_spheres=2, march_steps=24)
+            # Gradient sky backdrop: top dark, bottom a subtle color
+            y = torch.linspace(0, 1, H, device=self.device).view(1, 1, H, 1)
+            bg_top = torch.tensor([0.02, 0.03, 0.08], device=self.device).view(1, 3, 1, 1)
+            bg_bot = torch.tensor([0.10, 0.05, 0.15], device=self.device).view(1, 3, 1, 1)
+            c5 = (bg_top * (1 - y) + bg_bot * y).expand(n5, 3, H, W).clone()
+            rm = self._sample_raymarch_recipe(T=1, n_spheres=3, march_steps=28)
             c5 = self._apply_raymarch(c5, 0, rm)
             canvas[q5_mask] = c5.clamp(0, 1)
 
-        # Q6: arcade scenes
+        # Q6: arcade — arcade itself dims its own background, so a soft
+        # underlying base + arcade overlay looks "game-over-scene" correctly
         q6_mask = (quadrants == 6)
         n6 = q6_mask.sum().item()
         if n6 > 0:
-            c6 = _base_scene(n6)
+            c6 = _soft_scene(n6, darken=0.25)
             ap = self._sample_arcade_recipe(T=24, mode="auto")
             c6 = self._apply_arcade(c6, 12, ap)
             canvas[q6_mask] = c6.clamp(0, 1)
 
-        # Q7: signage + text
+        # Q7: signage + text — dark base so the readable overlay stands out
         q7_mask = (quadrants == 7)
         n7 = q7_mask.sum().item()
         if n7 > 0:
-            c7 = _base_scene(n7)
-            # 50/50 between signage and text
+            c7 = _soft_scene(n7, darken=0.2)
             if torch.rand(1).item() < 0.5:
-                sp = self._sample_signage_recipe(T=1, mode="auto", font_size=32)
+                sp = self._sample_signage_recipe(T=1, mode="auto", font_size=36)
                 c7 = self._apply_signage(c7, 0, sp)
             else:
                 tp = self._sample_text_recipe(
-                    T=1, mode="typing", language="mixed", font_size=24, cps=12.0)
+                    T=1, mode="typing", language="mixed", font_size=32, cps=12.0)
                 c7 = self._apply_text(c7, 0, tp)
             canvas[q7_mask] = c7.clamp(0, 1)
 

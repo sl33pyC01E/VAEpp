@@ -232,7 +232,11 @@ class TextMixin:
         else:
             return canvas
 
-        # Alpha-composite onto each batch item
+        # Alpha-composite onto each batch item. `rgb` is already
+        # pre-multiplied (rgb = color * alpha from _rasterize_text), so
+        # the composite is canvas*(1-alpha) + rgb (NOT rgb*alpha — that
+        # would double-premultiply and make anti-aliased edges near-
+        # invisible).
         alpha = alpha.unsqueeze(0)  # (1, 1, H, W)
         rgb = rgb.unsqueeze(0)      # (1, 3, H, W)
-        return canvas * (1 - alpha) + rgb * alpha
+        return canvas * (1 - alpha) + rgb
