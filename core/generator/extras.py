@@ -143,12 +143,16 @@ class ExtrasMixin:
         rng = random.Random(int(torch.randint(0, 2**31 - 1, (1,)).item()))
         phases = [rng.uniform(0, 2 * math.pi) for _ in range(n_bars)]
         freqs = [rng.uniform(0.1, 0.4) for _ in range(n_bars)]
+        # Random orientation — bars can grow up, down, left, or right.
+        # 0 = bottom-up (default), 1 = top-down, 2 = left-to-right, 3 = right-to-left
+        orientation = rng.randint(0, 3)
         return {
             "enable": True,
             "n_bars": int(n_bars),
             "phases": phases,
             "freqs": freqs,
             "color": [float(torch.empty(1).uniform_(0.4, 1.0).item()) for _ in range(3)],
+            "orientation": orientation,
         }
 
     def _apply_eq_bars(self, canvas, ti, ep):
@@ -156,20 +160,39 @@ class ExtrasMixin:
             return canvas
         H, W = self.H, self.W
         n = int(ep["n_bars"])
-        bar_w = W // n
-        gap = 2
-        origin_y = H - 20
-        out = canvas
         color = ep["color"]
+        out = canvas
+        orient = int(ep.get("orientation", 0))
+        # Heights in fractional [0, 1] for this frame
+        heights = []
         for i in range(n):
-            # Height from sinusoid + random modulation
             phase = ep["phases"][i]
             freq = ep["freqs"][i]
             amp = 0.5 + 0.5 * math.sin(freq * ti + phase)
-            # Plus higher-freq shiver
             shiver = 0.15 * math.sin(freq * 3.1 * ti + phase * 1.7)
-            height = int(max(0.05, min(1.0, amp + shiver)) * (H * 0.5))
-            x = i * bar_w + gap
-            y = origin_y - height
-            self._draw_rect(out, x, y, bar_w - gap * 2, height, color)
+            heights.append(max(0.05, min(1.0, amp + shiver)))
+
+        gap = 2
+        if orient in (0, 1):  # vertical bars along x-axis
+            bar_w = W // n
+            max_h = int(H * 0.5)
+            for i, h_frac in enumerate(heights):
+                height = int(h_frac * max_h)
+                x = i * bar_w + gap
+                if orient == 0:  # bottom-up
+                    y = H - 20 - height
+                else:            # top-down
+                    y = 20
+                self._draw_rect(out, x, y, bar_w - gap * 2, height, color)
+        else:  # horizontal bars along y-axis (orient 2/3)
+            bar_h = H // n
+            max_w = int(W * 0.5)
+            for i, h_frac in enumerate(heights):
+                width = int(h_frac * max_w)
+                y = i * bar_h + gap
+                if orient == 2:  # left-to-right
+                    x = 20
+                else:            # right-to-left
+                    x = W - 20 - width
+                self._draw_rect(out, x, y, width, bar_h - gap * 2, color)
         return out

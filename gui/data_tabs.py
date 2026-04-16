@@ -739,7 +739,13 @@ class VideoGenTab(tk.Frame):
             side="left", padx=(0, 5))
         make_btn(btn_row, "Generate 8 Grid", self.gen_grid, ACCENT).pack(
             side="left", padx=(0, 5))
+        make_btn(btn_row, "Disco 1", self.gen_disco_video, "#dd44dd").pack(
+            side="left", padx=(0, 5))
+        make_btn(btn_row, "Disco 8 Grid", self.gen_disco_grid, "#dd44dd").pack(
+            side="left", padx=(0, 10))
         make_btn(btn_row, "Build Banks", self.build_banks, BLUE).pack(
+            side="left", padx=(0, 5))
+        make_btn(btn_row, "Delete Banks", self.delete_banks, RED).pack(
             side="left", padx=(0, 10))
         make_btn(btn_row, "Build Pool", self.build_pool, GREEN).pack(
             side="left", padx=(0, 5))
@@ -1072,6 +1078,28 @@ class VideoGenTab(tk.Frame):
             self.status.config(text=f"Banks ready: {gen.bank_size} shapes")
         run_with_log(self, gen.build_banks, on_done=_done)
 
+    def delete_banks(self):
+        """Clear stale shape + layer banks (memory) and drop disk bank files.
+        Next Generate/Build will rebuild from scratch."""
+        bank_dir = os.path.join(PROJECT_ROOT, "bank")
+        removed = 0
+        if os.path.isdir(bank_dir):
+            for f in os.listdir(bank_dir):
+                fp = os.path.join(bank_dir, f)
+                if os.path.isfile(fp):
+                    try:
+                        os.remove(fp)
+                        removed += 1
+                    except OSError:
+                        pass
+        if self.gen is not None:
+            self.gen.shape_bank = None
+            self.gen.base_layers = None
+            self.gen.bank_size = 0
+            if hasattr(self.gen, "_recipe_pool"):
+                self.gen._recipe_pool = []
+        self.status.config(text=f"Banks cleared ({removed} files removed)")
+
     def _get_seq_kwargs(self):
         kw = self._get_seq_kwargs_raw()
         # "Random mix" drops each enabled overlay/effect with 50% probability
@@ -1338,6 +1366,98 @@ class VideoGenTab(tk.Frame):
                                      BILINEAR)
                 frames_pil.append(pil)
             self.after(0, lambda: self._show_frames(frames_pil, T))
+
+        run_with_log(self, _gen)
+
+    # ------------------------------------------------------------------
+    # Disco variants — force disco_quadrant for the call. Grid version
+    # pins one sample per quadrant so all 8 classes are always present.
+    # ------------------------------------------------------------------
+    def gen_disco_video(self):
+        self._video_playing = False
+        gen = self._get_gen()
+        T = self.T_var.get()
+        seq_kw = self._get_seq_kwargs()
+        prev_disco = gen.disco_quadrant
+        gen.disco_quadrant = True
+        self.status.config(text=f"Disco clip T={T}...")
+        self.update()
+
+        def _gen():
+            try:
+                if gen.base_layers is None:
+                    gen.build_base_layers()
+                with torch.no_grad():
+                    clip = gen.generate_sequence(1, T=T, **seq_kw)
+                frames_np = []
+                scale = min(700 / gen.W, 400 / gen.H, 1.0)
+                for t in range(T):
+                    arr = (clip[0, t].permute(1, 2, 0).cpu().numpy() * 255
+                           ).clip(0, 255).astype(np.uint8)
+                    pil = Image.fromarray(arr)
+                    if scale < 1.0:
+                        pil = pil.resize((int(gen.W * scale), int(gen.H * scale)),
+                                         BILINEAR)
+                    frames_np.append(pil)
+                self.after(0, lambda: self._show_frames(frames_np, T))
+            finally:
+                gen.disco_quadrant = prev_disco
+
+        run_with_log(self, _gen)
+
+    def gen_disco_grid(self):
+        """8 clips, one per disco quadrant. Every quadrant always present."""
+        self._video_playing = False
+        gen = self._get_gen()
+        T = self.T_var.get()
+        seq_kw = self._get_seq_kwargs()
+        prev_disco = gen.disco_quadrant
+        prev_weights = gen._disco_weights.clone()
+        gen.disco_quadrant = True
+        self.status.config(text=f"Disco grid T={T} (1 per quadrant)...")
+        self.update()
+
+        def _gen():
+            try:
+                if gen.base_layers is None:
+                    gen.build_base_layers()
+                n_q = int(prev_weights.shape[0])
+                with torch.no_grad():
+                    clip_list = []
+                    for q in range(min(8, n_q)):
+                        # Pin weights to a single quadrant for this sample
+                        w = torch.zeros_like(prev_weights)
+                        w[q] = 1.0
+                        gen._disco_weights = w
+                        clip_list.append(gen.generate_sequence(1, T=T, **seq_kw)[0])
+                clips = torch.stack(clip_list, dim=0)
+                H, W = gen.H, gen.W
+                sh, sw = H // 2, W // 2
+                gap = 2
+                grid_w = sw * 4 + gap * 3
+                grid_h = sh * 2 + gap
+                frames_pil = []
+                for ti in range(T):
+                    grid = np.full((grid_h, grid_w, 3), 14, dtype=np.uint8)
+                    for ci in range(min(8, clips.shape[0])):
+                        frame = (clips[ci, ti].permute(1, 2, 0).cpu().numpy()
+                                 * 255).clip(0, 255).astype(np.uint8)
+                        small = np.array(Image.fromarray(frame).resize(
+                            (sw, sh), BILINEAR))
+                        r, c = ci // 4, ci % 4
+                        y = r * (sh + gap)
+                        x = c * (sw + gap)
+                        grid[y:y+sh, x:x+sw] = small
+                    pil = Image.fromarray(grid)
+                    scale = min(700 / grid_w, 400 / grid_h, 1.0)
+                    if scale < 1.0:
+                        pil = pil.resize((int(grid_w * scale), int(grid_h * scale)),
+                                         BILINEAR)
+                    frames_pil.append(pil)
+                self.after(0, lambda: self._show_frames(frames_pil, T))
+            finally:
+                gen.disco_quadrant = prev_disco
+                gen._disco_weights = prev_weights
 
         run_with_log(self, _gen)
 
