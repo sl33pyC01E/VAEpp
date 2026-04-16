@@ -133,6 +133,26 @@ class GeneratorTab(tk.Frame):
         f, self.ripple_drops = make_slider(br_rip2, "Drops", 0, 12, 3)
         f.pack(side="left")
 
+        # Effects (Phase 2): shake + kaleidoscope for static
+        tk.Label(L, text="Effects", bg=BG_PANEL, fg=ACCENT,
+                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
+        br_eff = tk.Frame(L, bg=BG_PANEL)
+        br_eff.pack(fill="x", pady=2)
+        self.shake_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_eff, text="Shake", variable=self.shake_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.kaleido_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_eff, text="Kaleidoscope", variable=self.kaleido_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        br_eff2 = tk.Frame(L, bg=BG_PANEL)
+        br_eff2.pack(fill="x", pady=2)
+        f, self.shake_amp = make_slider(br_eff2, "Shake amp", 0, 0.15, 0.02)
+        f.pack(side="left", padx=(0, 4))
+        f, self.kaleido_slices = make_slider(br_eff2, "Slices", 2, 16, 6)
+        f.pack(side="left")
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -305,10 +325,16 @@ class GeneratorTab(tk.Frame):
         run_with_log(self, gen.refresh_base_layers, on_done=self._update_stats)
 
     def _apply_ripple_settings(self, gen):
-        """Push GUI ripple toggle/sliders onto the generator instance."""
+        """Push GUI ripple/shake/kaleido toggles onto the generator instance."""
         gen.static_ripple = bool(self.ripple_var.get())
         gen.static_ripple_warp_strength = float(self.ripple_warp.get())
         gen.static_ripple_n_drops = int(self.ripple_drops.get())
+        gen.static_shake = bool(self.shake_var.get())
+        gen.static_shake_amp_xy = float(self.shake_amp.get())
+        gen.static_shake_amp_rot = float(self.shake_amp.get())
+        gen.static_shake_mode = "vibrate"
+        gen.static_kaleido = bool(self.kaleido_var.get())
+        gen.static_kaleido_slices = int(self.kaleido_slices.get())
 
     def gen_sample(self):
         gen = self._get_gen()
@@ -625,6 +651,37 @@ class VideoGenTab(tk.Frame):
         f, self.ripple_drops = make_slider(row2d, "Raindrops", 0, 12, 3)
         f.pack(side="left")
 
+        # Effects row (Phase 2): shake, kaleidoscope, fast transforms
+        row2e = tk.Frame(top, bg=BG_PANEL)
+        row2e.pack(fill="x", pady=(2, 0))
+        self.shake_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2e, text="Shake",
+                       variable=self.shake_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, font=FONT).pack(side="left")
+        self.shake_mode_var = tk.StringVar(value="vibrate")
+        tk.OptionMenu(row2e, self.shake_mode_var,
+                      "vibrate", "earthquake", "handheld").pack(side="left", padx=(0, 6))
+        self.kaleido_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2e, text="Kaleidoscope",
+                       variable=self.kaleido_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, font=FONT).pack(side="left")
+        self.fast_tx_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2e, text="Fast transforms",
+                       variable=self.fast_tx_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, font=FONT).pack(side="left")
+
+        # Effects sliders row
+        row2f = tk.Frame(top, bg=BG_PANEL)
+        row2f.pack(fill="x", pady=(2, 0))
+        f, self.shake_amp = make_slider(row2f, "Shake amp", 0, 0.15, 0.02)
+        f.pack(side="left", padx=(0, 5))
+        f, self.kaleido_slices = make_slider(row2f, "Kaleido slices", 2, 16, 6)
+        f.pack(side="left", padx=(0, 5))
+        f, self.kaleido_rot = make_slider(row2f, "Kaleido rot/frame", 0, 0.2, 0.03)
+        f.pack(side="left", padx=(0, 5))
+        f, self.fast_scale = make_slider(row2f, "Fast scale", 1, 10, 4.0)
+        f.pack(side="left")
+
         # Buttons
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
@@ -708,6 +765,15 @@ class VideoGenTab(tk.Frame):
             use_ripple=self.ripple_var.get(),
             ripple_warp_strength=self.ripple_warp.get(),
             ripple_n_drops=int(self.ripple_drops.get()),
+            use_shake=self.shake_var.get(),
+            shake_mode=self.shake_mode_var.get(),
+            shake_amp_xy=self.shake_amp.get(),
+            shake_amp_rot=self.shake_amp.get(),
+            use_kaleido=self.kaleido_var.get(),
+            kaleido_slices=int(self.kaleido_slices.get()),
+            kaleido_rot_per_frame=self.kaleido_rot.get(),
+            fast_transform=self.fast_tx_var.get(),
+            fast_scale=self.fast_scale.get(),
         )
 
     def build_pool(self):

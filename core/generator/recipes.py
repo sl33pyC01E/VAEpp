@@ -18,6 +18,10 @@ class RecipesMixin:
         A recipe stores which shapes/layers to use and how they move,
         NOT the rendered pixels. ~1KB per recipe vs ~9MB per rendered clip.
         """
+        # Fast-transform preset: scale motion knobs up at sample time so
+        # viewport/layer/stamp motion is all larger/faster. Pure multiplier,
+        # no runtime branch needed elsewhere.
+        seq_kwargs = self._fast_transform_scale(seq_kwargs)
         H, W = self.H, self.W
         n_layers = torch.randint(
             self.layers_per_image[0], self.layers_per_image[1] + 1, (1,)).item()
@@ -78,6 +82,20 @@ class RecipesMixin:
                 T=T,
                 n_drops=int(seq_kwargs.get("ripple_n_drops", 3)),
                 warp_strength=float(seq_kwargs.get("ripple_warp_strength", 8.0)),
+            )
+        # Optional camera shake / vibration
+        if seq_kwargs.get("use_shake", False):
+            recipe["shake"] = self._sample_shake_recipe(
+                T=T,
+                amp_xy=float(seq_kwargs.get("shake_amp_xy", 0.02)),
+                amp_rot=float(seq_kwargs.get("shake_amp_rot", 0.02)),
+                mode=str(seq_kwargs.get("shake_mode", "vibrate")),
+            )
+        # Optional whole-image kaleidoscope
+        if seq_kwargs.get("use_kaleido", False):
+            recipe["kaleido"] = self._sample_kaleido_recipe(
+                n_slices=int(seq_kwargs.get("kaleido_slices", 6)),
+                rot_per_frame=float(seq_kwargs.get("kaleido_rot_per_frame", 0.03)),
             )
         return recipe
 
@@ -345,6 +363,16 @@ class RecipesMixin:
             fp = recipe.get("fluid")
             if fp is not None and fp.get("enable", False):
                 canvas = self._apply_ripples(canvas, ti, T, fp)
+
+            # Camera shake (optional, from recipe["shake"])
+            sp = recipe.get("shake")
+            if sp is not None and sp.get("enable", False):
+                canvas = self._apply_camera_shake(canvas, ti, sp)
+
+            # Whole-image kaleidoscope (optional, from recipe["kaleido"])
+            kp = recipe.get("kaleido")
+            if kp is not None and kp.get("enable", False):
+                canvas = self._apply_kaleidoscope(canvas, ti, kp)
 
             # Post-processing
             canvas = canvas.clamp(1e-6, 1).pow(gamma)

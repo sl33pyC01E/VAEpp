@@ -24,6 +24,7 @@ from core.generator.motion import MotionMixin
 from core.generator.recipes import RecipesMixin
 from core.generator.io import IOMixin
 from core.generator.fluid import FluidMixin
+from core.generator.effects import EffectsMixin
 
 
 class VAEpp0rGenerator(
@@ -33,6 +34,7 @@ class VAEpp0rGenerator(
     RecipesMixin,
     IOMixin,
     FluidMixin,
+    EffectsMixin,
 ):
     """GPU-accelerated procedural image generator.
 
@@ -738,6 +740,24 @@ class VAEpp0rGenerator(
                 warp_strength=float(getattr(self, "static_ripple_warp_strength", 8.0)),
             )
             canvas = self._apply_ripples(canvas, 0, 1, fp)
+
+        # --- Optional camera shake (frozen single frame) ---
+        if getattr(self, "static_shake", False):
+            sp = self._sample_shake_recipe(
+                T=1,
+                amp_xy=float(getattr(self, "static_shake_amp_xy", 0.02)),
+                amp_rot=float(getattr(self, "static_shake_amp_rot", 0.02)),
+                mode=str(getattr(self, "static_shake_mode", "vibrate")),
+            )
+            canvas = self._apply_camera_shake(canvas, 0, sp)
+
+        # --- Optional kaleidoscope (frozen single frame) ---
+        if getattr(self, "static_kaleido", False):
+            kp = self._sample_kaleido_recipe(
+                n_slices=int(getattr(self, "static_kaleido_slices", 6)),
+                rot_per_frame=0.0,  # static: no rotation
+            )
+            canvas = self._apply_kaleidoscope(canvas, 0, kp)
 
         return canvas.clamp(0, 1)
 

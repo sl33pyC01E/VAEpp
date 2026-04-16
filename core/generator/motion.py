@@ -193,7 +193,12 @@ class MotionMixin:
                            viewport_pan=0.3, viewport_zoom=0.15,
                            viewport_rotation=0.2, fluid_strength=1.0,
                            use_ripple=False, ripple_warp_strength=8.0,
-                           ripple_n_drops=3):
+                           ripple_n_drops=3,
+                           use_shake=False, shake_mode="vibrate",
+                           shake_amp_xy=0.02, shake_amp_rot=0.02,
+                           use_kaleido=False, kaleido_slices=6,
+                           kaleido_rot_per_frame=0.03,
+                           fast_transform=False, fast_scale=4.0):
         """Generate animated clips with physics, viewport effects, and fluid motion.
 
         Returns: (B, T, 3, H, W) tensor in [0, 1] on self.device.
@@ -201,6 +206,13 @@ class MotionMixin:
         if self.base_layers is None:
             self.build_base_layers()
         self._maybe_refresh_dynamic()
+
+        # Fast-transform preset: multiply transform knobs before anything uses them.
+        if fast_transform:
+            pan_strength = pan_strength * fast_scale
+            viewport_pan = viewport_pan * fast_scale
+            viewport_zoom = viewport_zoom * fast_scale
+            viewport_rotation = viewport_rotation * fast_scale
 
         B = batch_size
         H, W = self.H, self.W
@@ -436,6 +448,20 @@ class MotionMixin:
                 T, n_drops=ripple_n_drops,
                 warp_strength=ripple_warp_strength)
 
+        # Camera shake params
+        shake_params = None
+        if use_shake:
+            shake_params = self._sample_shake_recipe(
+                T, amp_xy=shake_amp_xy, amp_rot=shake_amp_rot,
+                mode=shake_mode)
+
+        # Kaleidoscope params
+        kaleido_params = None
+        if use_kaleido:
+            kaleido_params = self._sample_kaleido_recipe(
+                n_slices=kaleido_slices,
+                rot_per_frame=kaleido_rot_per_frame)
+
         # Pre-render scene template once (templates use random values internally,
         # so calling per-frame would cause flickering)
         template_canvas = None
@@ -597,6 +623,14 @@ class MotionMixin:
             # Ripple-surface warp (height-field based)
             if fluid_params is not None:
                 canvas = self._apply_ripples(canvas, ti, T, fluid_params)
+
+            # Camera shake (small extra affine)
+            if shake_params is not None:
+                canvas = self._apply_camera_shake(canvas, ti, shake_params)
+
+            # Whole-image kaleidoscope (polar fold)
+            if kaleido_params is not None:
+                canvas = self._apply_kaleidoscope(canvas, ti, kaleido_params)
 
             # Post-processing (consistent params across frames)
             canvas = canvas.clamp(1e-6, 1).pow(pp_gamma)
