@@ -23,6 +23,7 @@ from core.generator.templates import TemplateMixin
 from core.generator.motion import MotionMixin
 from core.generator.recipes import RecipesMixin
 from core.generator.io import IOMixin
+from core.generator.fluid import FluidMixin
 
 
 class VAEpp0rGenerator(
@@ -31,6 +32,7 @@ class VAEpp0rGenerator(
     MotionMixin,
     RecipesMixin,
     IOMixin,
+    FluidMixin,
 ):
     """GPU-accelerated procedural image generator.
 
@@ -727,6 +729,15 @@ class VAEpp0rGenerator(
 
         # --- Post-processing mutations ---
         canvas = self._post_process(canvas)
+
+        # --- Optional fluid ripple (static: frozen snapshot of ti=0) ---
+        if getattr(self, "static_ripple", False):
+            fp = self._sample_fluid_recipe(
+                T=1,
+                n_drops=int(getattr(self, "static_ripple_n_drops", 3)),
+                warp_strength=float(getattr(self, "static_ripple_warp_strength", 8.0)),
+            )
+            canvas = self._apply_ripples(canvas, 0, 1, fp)
 
         return canvas.clamp(0, 1)
 

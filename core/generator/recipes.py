@@ -72,6 +72,13 @@ class RecipesMixin:
             "gamma": torch.rand(1).item() * 0.7 + 0.7,
             "seq_kwargs": seq_kwargs,
         }
+        # Optional fluid (ripple + raindrops) block — additive, off by default
+        if seq_kwargs.get("use_ripple", False):
+            recipe["fluid"] = self._sample_fluid_recipe(
+                T=T,
+                n_drops=int(seq_kwargs.get("ripple_n_drops", 3)),
+                warp_strength=float(seq_kwargs.get("ripple_warp_strength", 8.0)),
+            )
         return recipe
 
     def build_motion_pool(self, n_clips=200, T=8, **seq_kwargs):
@@ -333,6 +340,11 @@ class RecipesMixin:
                                           vp_pan.unsqueeze(0),
                                           torch.tensor([vp_zoom], device=dev),
                                           vp_rot.unsqueeze(0))
+
+            # Ripple-surface warp (optional, from recipe["fluid"])
+            fp = recipe.get("fluid")
+            if fp is not None and fp.get("enable", False):
+                canvas = self._apply_ripples(canvas, ti, T, fp)
 
             # Post-processing
             canvas = canvas.clamp(1e-6, 1).pow(gamma)

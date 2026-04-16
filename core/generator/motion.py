@@ -191,7 +191,9 @@ class MotionMixin:
                            use_viewport=True, use_fluid=False,
                            pan_strength=0.5, motion_strength=0.4,
                            viewport_pan=0.3, viewport_zoom=0.15,
-                           viewport_rotation=0.2, fluid_strength=1.0):
+                           viewport_rotation=0.2, fluid_strength=1.0,
+                           use_ripple=False, ripple_warp_strength=8.0,
+                           ripple_n_drops=3):
         """Generate animated clips with physics, viewport effects, and fluid motion.
 
         Returns: (B, T, 3, H, W) tensor in [0, 1] on self.device.
@@ -427,6 +429,13 @@ class MotionMixin:
         if use_fluid:
             flow_fields = self._generate_flow_field(B, T) * fluid_strength
 
+        # Ripple-surface params (sampled once per clip, shared across batch)
+        fluid_params = None
+        if use_ripple:
+            fluid_params = self._sample_fluid_recipe(
+                T, n_drops=ripple_n_drops,
+                warp_strength=ripple_warp_strength)
+
         # Pre-render scene template once (templates use random values internally,
         # so calling per-frame would cause flickering)
         template_canvas = None
@@ -584,6 +593,10 @@ class MotionMixin:
             # Fluid advection
             if flow_fields is not None:
                 canvas = self._apply_fluid(canvas, flow_fields[:, ti])
+
+            # Ripple-surface warp (height-field based)
+            if fluid_params is not None:
+                canvas = self._apply_ripples(canvas, ti, T, fluid_params)
 
             # Post-processing (consistent params across frames)
             canvas = canvas.clamp(1e-6, 1).pow(pp_gamma)

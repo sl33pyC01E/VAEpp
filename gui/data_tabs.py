@@ -117,6 +117,22 @@ class GeneratorTab(tk.Frame):
         br5.pack(fill="x", pady=2)
         make_btn(br5, "Empty Banks", self.empty_banks, RED, 12).pack(side="left")
 
+        # Ripple (fluid-surface) controls for static snapshots
+        tk.Label(L, text="Ripple (liquid surface)", bg=BG_PANEL, fg=ACCENT,
+                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
+        br_rip = tk.Frame(L, bg=BG_PANEL)
+        br_rip.pack(fill="x", pady=2)
+        self.ripple_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_rip, text="Enable", variable=self.ripple_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        br_rip2 = tk.Frame(L, bg=BG_PANEL)
+        br_rip2.pack(fill="x", pady=2)
+        f, self.ripple_warp = make_slider(br_rip2, "Warp", 0, 20, 8.0)
+        f.pack(side="left", padx=(0, 4))
+        f, self.ripple_drops = make_slider(br_rip2, "Drops", 0, 12, 3)
+        f.pack(side="left")
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -288,11 +304,18 @@ class GeneratorTab(tk.Frame):
         self.update()
         run_with_log(self, gen.refresh_base_layers, on_done=self._update_stats)
 
+    def _apply_ripple_settings(self, gen):
+        """Push GUI ripple toggle/sliders onto the generator instance."""
+        gen.static_ripple = bool(self.ripple_var.get())
+        gen.static_ripple_warp_strength = float(self.ripple_warp.get())
+        gen.static_ripple_n_drops = int(self.ripple_drops.get())
+
     def gen_sample(self):
         gen = self._get_gen()
         if gen.base_layers is None:
             self.build_banks()
             return
+        self._apply_ripple_settings(gen)
         with torch.no_grad():
             batch = gen.generate(1)
         img = (batch[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -303,6 +326,7 @@ class GeneratorTab(tk.Frame):
         if gen.base_layers is None:
             self.build_banks()
             return
+        self._apply_ripple_settings(gen)
         with torch.no_grad():
             batch = gen.generate(8)
         imgs = [(batch[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -576,6 +600,10 @@ class VideoGenTab(tk.Frame):
         tk.Checkbutton(row2b, text="Fluid",
                        variable=self.fluid_var, bg=BG_PANEL, fg=FG,
                        selectcolor=BG_INPUT, font=FONT).pack(side="left")
+        self.ripple_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2b, text="Ripple",
+                       variable=self.ripple_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, font=FONT).pack(side="left")
 
         # Viewport + fluid sliders
         row2c = tk.Frame(top, bg=BG_PANEL)
@@ -587,6 +615,14 @@ class VideoGenTab(tk.Frame):
         f, self.vp_rot_str = make_slider(row2c, "VP Rot", 0, 1, 0.2)
         f.pack(side="left", padx=(0, 5))
         f, self.fluid_str = make_slider(row2c, "Fluid", 0, 3, 1.0)
+        f.pack(side="left")
+
+        # Ripple (liquid-surface) sliders
+        row2d = tk.Frame(top, bg=BG_PANEL)
+        row2d.pack(fill="x", pady=(2, 0))
+        f, self.ripple_warp = make_slider(row2d, "Ripple warp", 0, 20, 8.0)
+        f.pack(side="left", padx=(0, 5))
+        f, self.ripple_drops = make_slider(row2d, "Raindrops", 0, 12, 3)
         f.pack(side="left")
 
         # Buttons
@@ -669,6 +705,9 @@ class VideoGenTab(tk.Frame):
             viewport_zoom=self.vp_zoom_str.get(),
             viewport_rotation=self.vp_rot_str.get(),
             fluid_strength=self.fluid_str.get(),
+            use_ripple=self.ripple_var.get(),
+            ripple_warp_strength=self.ripple_warp.get(),
+            ripple_n_drops=int(self.ripple_drops.get()),
         )
 
     def build_pool(self):
