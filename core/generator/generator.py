@@ -153,10 +153,21 @@ class VAEpp0rGenerator(
 
         # Pattern bank for structured pattern generation
         self.pattern_bank = PatternBank(height, width, device, self._sample_colors)
-        # Disco quadrant mode: 0=pure pattern, 1=pattern+shapes, 2=dense random, 3=structured
+        # Disco quadrant mode: 8 classes weighted for latency balance rather
+        # than uniform distribution. All classes stay at >= 6% so every
+        # motion family is seen during training, but cheap classes get
+        # more budget so average-throughput stays high.
+        #   Q0 pure pattern                    (cheap)   0.15
+        #   Q1 pattern+collage+shapes          (cheap)   0.14
+        #   Q2 dense random compositing        (medium)  0.10
+        #   Q3 structured scenes               (medium)  0.13
+        #   Q4 fluid (ripples + raindrops)     (medium)  0.13
+        #   Q5 3D raymarch                     (expens)  0.06
+        #   Q6 arcade scenes                   (cheap)   0.14
+        #   Q7 signage + text                  (medium)  0.15
         self.disco_quadrant = False
-        self._disco_weights = torch.tensor([0.25, 0.25, 0.25, 0.25],
-                                            device=device)
+        self._disco_weights = torch.tensor(
+            [0.15, 0.14, 0.10, 0.13, 0.13, 0.06, 0.14, 0.15], device=device)
 
     # ------------------------------------------------------------------
     # Perlin noise bank
@@ -591,6 +602,61 @@ class VAEpp0rGenerator(
                                                  n_micro_range=(10, 30))
             c3 = self._post_process(c3)
             canvas[q3_mask] = c3.clamp(0, 1)
+
+        # Q4-Q7: apply the existing q2/q3-style base composite, then
+        # layer a Phase 1-10 effect on top. All use ti=0 since static.
+        def _base_scene(n):
+            bg = self._sample_colors(n)
+            c = bg.view(n, 3, 1, 1).expand(n, 3, H, W).clone()
+            template = self._pick_template()
+            if template != "random":
+                c = self._apply_scene_template(c, template, n)
+            c = self._overlay_shapes_on_canvas(c, n,
+                                                n_stamps_range=(3, 8),
+                                                n_micro_range=(20, 60))
+            return self._post_process(c).clamp(0, 1)
+
+        # Q4: fluid (ripple + raindrops)
+        q4_mask = (quadrants == 4)
+        n4 = q4_mask.sum().item()
+        if n4 > 0:
+            c4 = _base_scene(n4)
+            fp = self._sample_fluid_recipe(T=1, n_drops=3, warp_strength=8.0)
+            c4 = self._apply_ripples(c4, 0, 1, fp)
+            canvas[q4_mask] = c4.clamp(0, 1)
+
+        # Q5: 3D raymarched primitives
+        q5_mask = (quadrants == 5)
+        n5 = q5_mask.sum().item()
+        if n5 > 0:
+            c5 = _base_scene(n5)
+            rm = self._sample_raymarch_recipe(T=1, n_spheres=2, march_steps=24)
+            c5 = self._apply_raymarch(c5, 0, rm)
+            canvas[q5_mask] = c5.clamp(0, 1)
+
+        # Q6: arcade scenes
+        q6_mask = (quadrants == 6)
+        n6 = q6_mask.sum().item()
+        if n6 > 0:
+            c6 = _base_scene(n6)
+            ap = self._sample_arcade_recipe(T=24, mode="auto")
+            c6 = self._apply_arcade(c6, 12, ap)
+            canvas[q6_mask] = c6.clamp(0, 1)
+
+        # Q7: signage + text
+        q7_mask = (quadrants == 7)
+        n7 = q7_mask.sum().item()
+        if n7 > 0:
+            c7 = _base_scene(n7)
+            # 50/50 between signage and text
+            if torch.rand(1).item() < 0.5:
+                sp = self._sample_signage_recipe(T=1, mode="auto", font_size=32)
+                c7 = self._apply_signage(c7, 0, sp)
+            else:
+                tp = self._sample_text_recipe(
+                    T=1, mode="typing", language="mixed", font_size=24, cps=12.0)
+                c7 = self._apply_text(c7, 0, tp)
+            canvas[q7_mask] = c7.clamp(0, 1)
 
         return canvas.clamp(0, 1)
 
