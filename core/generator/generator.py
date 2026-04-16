@@ -26,6 +26,7 @@ from core.generator.io import IOMixin
 from core.generator.fluid import FluidMixin
 from core.generator.effects import EffectsMixin
 from core.generator.text import TextMixin
+from core.generator.signage import SignageMixin
 
 
 class VAEpp0rGenerator(
@@ -37,6 +38,7 @@ class VAEpp0rGenerator(
     FluidMixin,
     EffectsMixin,
     TextMixin,
+    SignageMixin,
 ):
     """GPU-accelerated procedural image generator.
 
@@ -788,6 +790,15 @@ class VAEpp0rGenerator(
             )
             # For static typing: show the fully typed string at ti=0
             canvas = self._apply_text(canvas, 0, tp)
+
+        # --- Optional signage overlay (single frozen frame) ---
+        if getattr(self, "static_signage", False):
+            sp = self._sample_signage_recipe(
+                T=1,
+                mode=str(getattr(self, "static_signage_mode", "auto")),
+                font_size=int(getattr(self, "static_signage_size", 32)),
+            )
+            canvas = self._apply_signage(canvas, 0, sp)
 
         return canvas.clamp(0, 1)
 

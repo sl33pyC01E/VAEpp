@@ -187,6 +187,25 @@ class GeneratorTab(tk.Frame):
         f, self.text_size = make_slider(br_txt2, "Font size", 8, 64, 24)
         f.pack(side="left")
 
+        # Signage (Phase 5) - static variants
+        tk.Label(L, text="Signage", bg=BG_PANEL, fg=ACCENT,
+                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
+        br_sig = tk.Frame(L, bg=BG_PANEL)
+        br_sig.pack(fill="x", pady=2)
+        self.signage_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_sig, text="Enable", variable=self.signage_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.signage_mode_var = tk.StringVar(value="auto")
+        tk.OptionMenu(br_sig, self.signage_mode_var,
+                      "auto", "led_matrix", "seven_seg", "marquee",
+                      "neon", "ticker", "warning", "test_card",
+                      "loading").pack(side="left", padx=(0, 6))
+        br_sig2 = tk.Frame(L, bg=BG_PANEL)
+        br_sig2.pack(fill="x", pady=2)
+        f, self.signage_size = make_slider(br_sig2, "Signage size", 8, 72, 32)
+        f.pack(side="left")
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -377,6 +396,9 @@ class GeneratorTab(tk.Frame):
         gen.static_text_lang = self.text_lang_var.get()
         gen.static_text_size = int(self.text_size.get())
         gen.static_text_cps = 12.0
+        gen.static_signage = bool(self.signage_var.get())
+        gen.static_signage_mode = self.signage_mode_var.get()
+        gen.static_signage_size = int(self.signage_size.get())
 
     def gen_sample(self):
         gen = self._get_gen()
@@ -768,6 +790,21 @@ class VideoGenTab(tk.Frame):
         f, self.text_scroll = make_slider(row2j, "Scroll px/f", 1, 40, 8)
         f.pack(side="left")
 
+        # Signage (Phase 5)
+        row2k = tk.Frame(top, bg=BG_PANEL)
+        row2k.pack(fill="x", pady=(2, 0))
+        self.signage_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2k, text="Signage", variable=self.signage_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.signage_mode_var = tk.StringVar(value="auto")
+        tk.OptionMenu(row2k, self.signage_mode_var,
+                      "auto", "led_matrix", "seven_seg", "marquee",
+                      "neon", "ticker", "warning", "test_card",
+                      "loading").pack(side="left", padx=(0, 6))
+        f, self.signage_size = make_slider(row2k, "Signage size", 8, 72, 32)
+        f.pack(side="left")
+
         # Buttons
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
@@ -873,6 +910,9 @@ class VideoGenTab(tk.Frame):
             text_font_size=int(self.text_size.get()),
             text_cps=float(self.text_cps.get()),
             text_scroll_pxpf=float(self.text_scroll.get()),
+            use_signage=self.signage_var.get(),
+            signage_mode=self.signage_mode_var.get(),
+            signage_font_size=int(self.signage_size.get()),
         )
 
     def build_pool(self):

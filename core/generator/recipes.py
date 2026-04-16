@@ -123,6 +123,13 @@ class RecipesMixin:
                 cps=float(seq_kwargs.get("text_cps", 12.0)),
                 scroll_pxpf=float(seq_kwargs.get("text_scroll_pxpf", 8.0)),
             )
+        # Optional signage overlay
+        if seq_kwargs.get("use_signage", False):
+            recipe["signage"] = self._sample_signage_recipe(
+                T=T,
+                mode=str(seq_kwargs.get("signage_mode", "auto")),
+                font_size=int(seq_kwargs.get("signage_font_size", 32)),
+            )
         return recipe
 
     def build_motion_pool(self, n_clips=200, T=8, **seq_kwargs):
@@ -414,6 +421,11 @@ class RecipesMixin:
             tx = recipe.get("text")
             if tx is not None and tx.get("enable", False):
                 canvas = self._apply_text(canvas, ti, tx)
+
+            # Signage overlay
+            sg = recipe.get("signage")
+            if sg is not None and sg.get("enable", False):
+                canvas = self._apply_signage(canvas, ti, sg)
 
             # Post-processing
             canvas = canvas.clamp(1e-6, 1).pow(gamma)
