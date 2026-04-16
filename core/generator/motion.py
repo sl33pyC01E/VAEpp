@@ -212,7 +212,8 @@ class MotionMixin:
                            particles_n=200,
                            use_raymarch=False, raymarch_spheres=2,
                            raymarch_boxes=0, raymarch_tori=0,
-                           raymarch_steps=24, sphere_dip=False):
+                           raymarch_steps=24, sphere_dip=False,
+                           use_arcade=False, arcade_mode="auto"):
         """Generate animated clips with physics, viewport effects, and fluid motion.
 
         Returns: (B, T, 3, H, W) tensor in [0, 1] on self.device.
@@ -519,6 +520,11 @@ class MotionMixin:
                 march_steps=raymarch_steps, sphere_dip=sphere_dip)
             fluid_params = self._dip_impact_to_fluid(raymarch_params, fluid_params)
 
+        # Arcade scene params
+        arcade_params = None
+        if use_arcade:
+            arcade_params = self._sample_arcade_recipe(T=T, mode=arcade_mode)
+
         # Pre-render scene template once (templates use random values internally,
         # so calling per-frame would cause flickering)
         template_canvas = None
@@ -712,6 +718,10 @@ class MotionMixin:
             # Raymarched 3D primitives (depth-composited over 2D canvas)
             if raymarch_params is not None:
                 canvas = self._apply_raymarch(canvas, ti, raymarch_params)
+
+            # Arcade scene overlay
+            if arcade_params is not None:
+                canvas = self._apply_arcade(canvas, ti, arcade_params)
 
             # Post-processing (consistent params across frames)
             canvas = canvas.clamp(1e-6, 1).pow(pp_gamma)

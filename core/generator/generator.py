@@ -29,6 +29,7 @@ from core.generator.text import TextMixin
 from core.generator.signage import SignageMixin
 from core.generator.particles import ParticlesMixin
 from core.generator.raymarch import RaymarchMixin
+from core.generator.arcade import ArcadeMixin
 
 
 class VAEpp0rGenerator(
@@ -43,6 +44,7 @@ class VAEpp0rGenerator(
     SignageMixin,
     ParticlesMixin,
     RaymarchMixin,
+    ArcadeMixin,
 ):
     """GPU-accelerated procedural image generator.
 
@@ -824,6 +826,12 @@ class VAEpp0rGenerator(
                 march_steps=int(getattr(self, "static_raymarch_steps", 24)),
             )
             canvas = self._apply_raymarch(canvas, 0, rm)
+
+        # --- Optional arcade scene (single frozen frame at ti=0) ---
+        if getattr(self, "static_arcade", False):
+            ap = self._sample_arcade_recipe(
+                T=24, mode=str(getattr(self, "static_arcade_mode", "auto")))
+            canvas = self._apply_arcade(canvas, 12, ap)
 
         return canvas.clamp(0, 1)
 

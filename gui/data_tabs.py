@@ -240,6 +240,20 @@ class GeneratorTab(tk.Frame):
         f, self.raymarch_steps = make_slider(br_rm2, "Steps", 8, 48, 24)
         f.pack(side="left")
 
+        # Arcade (Phase 8) - static
+        tk.Label(L, text="Arcade", bg=BG_PANEL, fg=ACCENT,
+                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
+        br_ar = tk.Frame(L, bg=BG_PANEL)
+        br_ar.pack(fill="x", pady=2)
+        self.arcade_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_ar, text="Enable", variable=self.arcade_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.arcade_mode_var = tk.StringVar(value="auto")
+        tk.OptionMenu(br_ar, self.arcade_mode_var,
+                      "auto", "pong", "breakout", "invaders",
+                      "snake", "tetris", "asteroids").pack(side="left", padx=(0, 6))
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -439,6 +453,8 @@ class GeneratorTab(tk.Frame):
         gen.static_raymarch = bool(self.raymarch_var.get())
         gen.static_raymarch_spheres = int(self.raymarch_spheres.get())
         gen.static_raymarch_steps = int(self.raymarch_steps.get())
+        gen.static_arcade = bool(self.arcade_var.get())
+        gen.static_arcade_mode = self.arcade_mode_var.get()
 
     def gen_sample(self):
         gen = self._get_gen()
@@ -875,6 +891,18 @@ class VideoGenTab(tk.Frame):
         f, self.raymarch_steps = make_slider(row2m, "March steps", 8, 48, 24)
         f.pack(side="left")
 
+        # Arcade (Phase 8)
+        row2n = tk.Frame(top, bg=BG_PANEL)
+        row2n.pack(fill="x", pady=(2, 0))
+        self.arcade_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2n, text="Arcade", variable=self.arcade_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.arcade_mode_var = tk.StringVar(value="auto")
+        tk.OptionMenu(row2n, self.arcade_mode_var,
+                      "auto", "pong", "breakout", "invaders",
+                      "snake", "tetris", "asteroids").pack(side="left", padx=(0, 6))
+
         # Buttons
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
@@ -992,6 +1020,8 @@ class VideoGenTab(tk.Frame):
             raymarch_tori=0,
             raymarch_steps=int(self.raymarch_steps.get()),
             sphere_dip=self.sphere_dip_var.get(),
+            use_arcade=self.arcade_var.get(),
+            arcade_mode=self.arcade_mode_var.get(),
         )
 
     def build_pool(self):

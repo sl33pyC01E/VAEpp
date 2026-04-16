@@ -152,6 +152,10 @@ class RecipesMixin:
             if rm.get("sphere_dip"):
                 recipe["fluid"] = self._dip_impact_to_fluid(
                     rm, recipe.get("fluid"))
+        # Optional arcade scene
+        if seq_kwargs.get("use_arcade", False):
+            recipe["arcade"] = self._sample_arcade_recipe(
+                T=T, mode=str(seq_kwargs.get("arcade_mode", "auto")))
         return recipe
 
     def build_motion_pool(self, n_clips=200, T=8, **seq_kwargs):
@@ -458,6 +462,11 @@ class RecipesMixin:
             rm = recipe.get("raymarch")
             if rm is not None and rm.get("enable", False):
                 canvas = self._apply_raymarch(canvas, ti, rm)
+
+            # Arcade scene overlay
+            ar = recipe.get("arcade")
+            if ar is not None and ar.get("enable", False):
+                canvas = self._apply_arcade(canvas, ti, ar)
 
             # Post-processing
             canvas = canvas.clamp(1e-6, 1).pow(gamma)
