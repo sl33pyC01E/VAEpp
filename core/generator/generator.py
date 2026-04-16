@@ -27,6 +27,7 @@ from core.generator.fluid import FluidMixin
 from core.generator.effects import EffectsMixin
 from core.generator.text import TextMixin
 from core.generator.signage import SignageMixin
+from core.generator.particles import ParticlesMixin
 
 
 class VAEpp0rGenerator(
@@ -39,6 +40,7 @@ class VAEpp0rGenerator(
     EffectsMixin,
     TextMixin,
     SignageMixin,
+    ParticlesMixin,
 ):
     """GPU-accelerated procedural image generator.
 
@@ -799,6 +801,16 @@ class VAEpp0rGenerator(
                 font_size=int(getattr(self, "static_signage_size", 32)),
             )
             canvas = self._apply_signage(canvas, 0, sp)
+
+        # --- Optional particles (frozen single frame) ---
+        if getattr(self, "static_particles", False):
+            pp = self._sample_particles_recipe(
+                T=16,
+                preset=str(getattr(self, "static_particles_preset", "auto")),
+                n_particles=int(getattr(self, "static_particles_n", 200)),
+            )
+            # Sample at mid-life so particles are distributed
+            canvas = self._apply_particles(canvas, 8, pp)
 
         return canvas.clamp(0, 1)
 

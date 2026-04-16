@@ -206,6 +206,24 @@ class GeneratorTab(tk.Frame):
         f, self.signage_size = make_slider(br_sig2, "Signage size", 8, 72, 32)
         f.pack(side="left")
 
+        # Particles (Phase 6) - static snapshot at mid-life
+        tk.Label(L, text="Particles", bg=BG_PANEL, fg=ACCENT,
+                 font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
+        br_par = tk.Frame(L, bg=BG_PANEL)
+        br_par.pack(fill="x", pady=2)
+        self.particles_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_par, text="Enable", variable=self.particles_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.particles_preset_var = tk.StringVar(value="auto")
+        tk.OptionMenu(br_par, self.particles_preset_var,
+                      "auto", "confetti", "fireworks", "sparks",
+                      "snow", "rain", "embers").pack(side="left", padx=(0, 6))
+        br_par2 = tk.Frame(L, bg=BG_PANEL)
+        br_par2.pack(fill="x", pady=2)
+        f, self.particles_n = make_slider(br_par2, "Count", 20, 1500, 200)
+        f.pack(side="left")
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -399,6 +417,9 @@ class GeneratorTab(tk.Frame):
         gen.static_signage = bool(self.signage_var.get())
         gen.static_signage_mode = self.signage_mode_var.get()
         gen.static_signage_size = int(self.signage_size.get())
+        gen.static_particles = bool(self.particles_var.get())
+        gen.static_particles_preset = self.particles_preset_var.get()
+        gen.static_particles_n = int(self.particles_n.get())
 
     def gen_sample(self):
         gen = self._get_gen()
@@ -805,6 +826,20 @@ class VideoGenTab(tk.Frame):
         f, self.signage_size = make_slider(row2k, "Signage size", 8, 72, 32)
         f.pack(side="left")
 
+        # Particles (Phase 6)
+        row2l = tk.Frame(top, bg=BG_PANEL)
+        row2l.pack(fill="x", pady=(2, 0))
+        self.particles_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2l, text="Particles", variable=self.particles_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.particles_preset_var = tk.StringVar(value="auto")
+        tk.OptionMenu(row2l, self.particles_preset_var,
+                      "auto", "confetti", "fireworks", "sparks",
+                      "snow", "rain", "embers").pack(side="left", padx=(0, 6))
+        f, self.particles_n = make_slider(row2l, "Particle count", 20, 1500, 200)
+        f.pack(side="left")
+
         # Buttons
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
@@ -913,6 +948,9 @@ class VideoGenTab(tk.Frame):
             use_signage=self.signage_var.get(),
             signage_mode=self.signage_mode_var.get(),
             signage_font_size=int(self.signage_size.get()),
+            use_particles=self.particles_var.get(),
+            particles_preset=self.particles_preset_var.get(),
+            particles_n=int(self.particles_n.get()),
         )
 
     def build_pool(self):

@@ -130,6 +130,13 @@ class RecipesMixin:
                 mode=str(seq_kwargs.get("signage_mode", "auto")),
                 font_size=int(seq_kwargs.get("signage_font_size", 32)),
             )
+        # Optional particles
+        if seq_kwargs.get("use_particles", False):
+            recipe["particles"] = self._sample_particles_recipe(
+                T=T,
+                preset=str(seq_kwargs.get("particles_preset", "auto")),
+                n_particles=int(seq_kwargs.get("particles_n", 200)),
+            )
         return recipe
 
     def build_motion_pool(self, n_clips=200, T=8, **seq_kwargs):
@@ -426,6 +433,11 @@ class RecipesMixin:
             sg = recipe.get("signage")
             if sg is not None and sg.get("enable", False):
                 canvas = self._apply_signage(canvas, ti, sg)
+
+            # Particles
+            par = recipe.get("particles")
+            if par is not None and par.get("enable", False):
+                canvas = self._apply_particles(canvas, ti, par)
 
             # Post-processing
             canvas = canvas.clamp(1e-6, 1).pow(gamma)

@@ -207,7 +207,9 @@ class MotionMixin:
                            text_language="mixed", text_font_size=24,
                            text_cps=12.0, text_scroll_pxpf=8.0,
                            use_signage=False, signage_mode="auto",
-                           signage_font_size=32):
+                           signage_font_size=32,
+                           use_particles=False, particles_preset="auto",
+                           particles_n=200):
         """Generate animated clips with physics, viewport effects, and fluid motion.
 
         Returns: (B, T, 3, H, W) tensor in [0, 1] on self.device.
@@ -499,6 +501,12 @@ class MotionMixin:
             signage_params = self._sample_signage_recipe(
                 T=T, mode=signage_mode, font_size=signage_font_size)
 
+        # Particles params
+        particles_params = None
+        if use_particles:
+            particles_params = self._sample_particles_recipe(
+                T=T, preset=particles_preset, n_particles=particles_n)
+
         # Pre-render scene template once (templates use random values internally,
         # so calling per-frame would cause flickering)
         template_canvas = None
@@ -684,6 +692,10 @@ class MotionMixin:
             # Signage overlay (LED / 7-seg / marquee / neon / etc)
             if signage_params is not None:
                 canvas = self._apply_signage(canvas, ti, signage_params)
+
+            # Particles (confetti, fireworks, rain, snow, sparks, embers)
+            if particles_params is not None:
+                canvas = self._apply_particles(canvas, ti, particles_params)
 
             # Post-processing (consistent params across frames)
             canvas = canvas.clamp(1e-6, 1).pow(pp_gamma)
