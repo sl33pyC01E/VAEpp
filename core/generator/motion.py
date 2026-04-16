@@ -198,7 +198,11 @@ class MotionMixin:
                            shake_amp_xy=0.02, shake_amp_rot=0.02,
                            use_kaleido=False, kaleido_slices=6,
                            kaleido_rot_per_frame=0.03,
-                           fast_transform=False, fast_scale=4.0):
+                           fast_transform=False, fast_scale=4.0,
+                           use_flash=False, flash_n=2,
+                           strobe_rate=0.0, strobe_strength=0.3,
+                           use_palette_cycle=False,
+                           palette_speed=0.05, palette_sat_boost=1.0):
         """Generate animated clips with physics, viewport effects, and fluid motion.
 
         Returns: (B, T, 3, H, W) tensor in [0, 1] on self.device.
@@ -462,6 +466,20 @@ class MotionMixin:
                 n_slices=kaleido_slices,
                 rot_per_frame=kaleido_rot_per_frame)
 
+        # Flash / strobe params
+        flash_params = None
+        if use_flash or strobe_rate > 0:
+            flash_params = self._sample_flash_recipe(
+                T, n_flashes=flash_n if use_flash else 0,
+                strobe_rate=strobe_rate, strobe_strength=strobe_strength)
+
+        # Palette cycle params
+        palette_params = None
+        if use_palette_cycle:
+            palette_params = self._sample_palette_recipe(
+                T, speed_range=(palette_speed, palette_speed),
+                sat_boost=palette_sat_boost)
+
         # Pre-render scene template once (templates use random values internally,
         # so calling per-frame would cause flickering)
         template_canvas = None
@@ -631,6 +649,14 @@ class MotionMixin:
             # Whole-image kaleidoscope (polar fold)
             if kaleido_params is not None:
                 canvas = self._apply_kaleidoscope(canvas, ti, kaleido_params)
+
+            # Palette hue rotation (time-varying)
+            if palette_params is not None:
+                canvas = self._apply_palette_cycle(canvas, ti, palette_params)
+
+            # Flash frames / strobe (pointwise)
+            if flash_params is not None:
+                canvas = self._apply_flash(canvas, ti, flash_params)
 
             # Post-processing (consistent params across frames)
             canvas = canvas.clamp(1e-6, 1).pow(pp_gamma)

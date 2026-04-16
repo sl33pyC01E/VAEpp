@@ -759,6 +759,22 @@ class VAEpp0rGenerator(
             )
             canvas = self._apply_kaleidoscope(canvas, 0, kp)
 
+        # --- Optional palette shift (frozen single hue rotation) ---
+        if getattr(self, "static_palette", False):
+            shift = float(getattr(self, "static_palette_shift", 0.25))
+            # Build a trivial recipe with speed=0 and phase=shift so ti=0 applies the shift once
+            pp = {"enable": True, "speed": 0.0, "phase0": shift, "sat_boost": 1.0}
+            canvas = self._apply_palette_cycle(canvas, 0, pp)
+
+        # --- Optional one-off flash (forces a flash at ti=0) ---
+        if getattr(self, "static_flash", False):
+            fp = self._sample_flash_recipe(T=1, n_flashes=1,
+                                            strobe_rate=0.0, strobe_strength=0.0)
+            # Force event to ti=0 so the single-frame path always triggers
+            if fp.get("flashes"):
+                fp["flashes"][0]["t"] = 0
+            canvas = self._apply_flash(canvas, 0, fp)
+
         return canvas.clamp(0, 1)
 
     # ------------------------------------------------------------------

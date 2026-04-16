@@ -97,6 +97,22 @@ class RecipesMixin:
                 n_slices=int(seq_kwargs.get("kaleido_slices", 6)),
                 rot_per_frame=float(seq_kwargs.get("kaleido_rot_per_frame", 0.03)),
             )
+        # Optional flash frames + strobe
+        if seq_kwargs.get("use_flash", False) or seq_kwargs.get("strobe_rate", 0.0) > 0:
+            recipe["flash"] = self._sample_flash_recipe(
+                T=T,
+                n_flashes=int(seq_kwargs.get("flash_n", 2))
+                    if seq_kwargs.get("use_flash", False) else 0,
+                strobe_rate=float(seq_kwargs.get("strobe_rate", 0.0)),
+                strobe_strength=float(seq_kwargs.get("strobe_strength", 0.3)),
+            )
+        # Optional palette cycle
+        if seq_kwargs.get("use_palette_cycle", False):
+            speed = float(seq_kwargs.get("palette_speed", 0.05))
+            recipe["palette"] = self._sample_palette_recipe(
+                T=T, speed_range=(speed, speed),
+                sat_boost=float(seq_kwargs.get("palette_sat_boost", 1.0)),
+            )
         return recipe
 
     def build_motion_pool(self, n_clips=200, T=8, **seq_kwargs):
@@ -373,6 +389,16 @@ class RecipesMixin:
             kp = recipe.get("kaleido")
             if kp is not None and kp.get("enable", False):
                 canvas = self._apply_kaleidoscope(canvas, ti, kp)
+
+            # Palette hue rotation
+            pp = recipe.get("palette")
+            if pp is not None and pp.get("enable", False):
+                canvas = self._apply_palette_cycle(canvas, ti, pp)
+
+            # Flash / strobe
+            fl = recipe.get("flash")
+            if fl is not None and fl.get("enable", False):
+                canvas = self._apply_flash(canvas, ti, fl)
 
             # Post-processing
             canvas = canvas.clamp(1e-6, 1).pow(gamma)

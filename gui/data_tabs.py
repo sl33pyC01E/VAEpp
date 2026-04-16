@@ -153,6 +153,22 @@ class GeneratorTab(tk.Frame):
         f, self.kaleido_slices = make_slider(br_eff2, "Slices", 2, 16, 6)
         f.pack(side="left")
 
+        # Flash + palette static toggles (Phase 3)
+        br_eff3 = tk.Frame(L, bg=BG_PANEL)
+        br_eff3.pack(fill="x", pady=2)
+        self.flash_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_eff3, text="Flash", variable=self.flash_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.palette_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(br_eff3, text="Palette shift", variable=self.palette_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        br_eff4 = tk.Frame(L, bg=BG_PANEL)
+        br_eff4.pack(fill="x", pady=2)
+        f, self.palette_speed = make_slider(br_eff4, "Palette shift amt", 0, 1, 0.25)
+        f.pack(side="left")
+
         # -- Bank settings --
         tk.Label(L, text="Bank", bg=BG_PANEL, fg=ACCENT,
                  font=FONT_BOLD).pack(anchor="w", pady=(10, 0))
@@ -335,6 +351,9 @@ class GeneratorTab(tk.Frame):
         gen.static_shake_mode = "vibrate"
         gen.static_kaleido = bool(self.kaleido_var.get())
         gen.static_kaleido_slices = int(self.kaleido_slices.get())
+        gen.static_flash = bool(self.flash_var.get())
+        gen.static_palette = bool(self.palette_var.get())
+        gen.static_palette_shift = float(self.palette_speed.get())
 
     def gen_sample(self):
         gen = self._get_gen()
@@ -682,6 +701,26 @@ class VideoGenTab(tk.Frame):
         f, self.fast_scale = make_slider(row2f, "Fast scale", 1, 10, 4.0)
         f.pack(side="left")
 
+        # Flash / strobe / palette row (Phase 3)
+        row2g = tk.Frame(top, bg=BG_PANEL)
+        row2g.pack(fill="x", pady=(2, 0))
+        self.flash_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2g, text="Flash", variable=self.flash_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        self.palette_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row2g, text="Palette cycle", variable=self.palette_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT).pack(side="left")
+        row2h = tk.Frame(top, bg=BG_PANEL)
+        row2h.pack(fill="x", pady=(2, 0))
+        f, self.flash_n = make_slider(row2h, "Flash count", 0, 10, 2)
+        f.pack(side="left", padx=(0, 5))
+        f, self.strobe_rate = make_slider(row2h, "Strobe rate (0=off)", 0, 12, 0)
+        f.pack(side="left", padx=(0, 5))
+        f, self.palette_speed = make_slider(row2h, "Palette speed", 0, 0.2, 0.05)
+        f.pack(side="left")
+
         # Buttons
         row3 = tk.Frame(top, bg=BG_PANEL)
         row3.pack(fill="x", pady=(5, 0))
@@ -774,6 +813,13 @@ class VideoGenTab(tk.Frame):
             kaleido_rot_per_frame=self.kaleido_rot.get(),
             fast_transform=self.fast_tx_var.get(),
             fast_scale=self.fast_scale.get(),
+            use_flash=self.flash_var.get(),
+            flash_n=int(self.flash_n.get()),
+            strobe_rate=float(self.strobe_rate.get()),
+            strobe_strength=0.3,
+            use_palette_cycle=self.palette_var.get(),
+            palette_speed=self.palette_speed.get(),
+            palette_sat_boost=1.0,
         )
 
     def build_pool(self):

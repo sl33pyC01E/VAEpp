@@ -207,3 +207,135 @@ class EffectsMixin:
                            ("viewport_rotation", 0.2)]:
             out[k] = float(out.get(k, default)) * scale
         return out
+
+    # ------------------------------------------------------------------
+    # Flash frames + strobe
+    # ------------------------------------------------------------------
+    def _sample_flash_recipe(self, T, n_flashes=2,
+                             strobe_rate=0.0, strobe_strength=0.3):
+        """Schedule occasional full-frame flashes and optional strobe.
+
+        Flashes: at a few random frames, multiply brightness toward a color
+        (white/black/inverted/random). Cheap — just a per-frame scalar lookup.
+        Strobe: if strobe_rate > 0, every Nth frame gets a uniform brightness
+        boost/dip (e.g. rate=4 means every 4th frame flashes).
+        """
+        flash_modes = ["white", "black", "invert", "color"]
+        flashes = []
+        n_flashes = int(max(0, n_flashes))
+        for _ in range(n_flashes):
+            flashes.append({
+                "t": int(torch.randint(0, max(T, 1), (1,)).item()),
+                "mode": flash_modes[int(torch.randint(0, len(flash_modes), (1,)).item())],
+                "strength": float(torch.empty(1).uniform_(0.4, 1.0).item()),
+                "color": torch.rand(3).tolist(),
+            })
+        return {
+            "enable": True,
+            "flashes": flashes,
+            "strobe_rate": float(strobe_rate),      # 0 disables strobe
+            "strobe_strength": float(strobe_strength),
+        }
+
+    def _apply_flash(self, canvas, ti, flash_params):
+        """Apply any flash events active at frame ti, plus optional strobe.
+        canvas: (B, 3, H, W) in [0, 1]. Returns same shape."""
+        if flash_params is None or not flash_params.get("enable", False):
+            return canvas
+        dev = canvas.device
+        out = canvas
+        for fl in flash_params.get("flashes", []):
+            if int(fl["t"]) != ti:
+                continue
+            s = float(fl["strength"])
+            mode = fl["mode"]
+            if mode == "white":
+                out = out * (1 - s) + s
+            elif mode == "black":
+                out = out * (1 - s)
+            elif mode == "invert":
+                out = out * (1 - s) + (1 - out) * s
+            elif mode == "color":
+                c = torch.tensor(fl["color"], device=dev).view(1, 3, 1, 1)
+                out = out * (1 - s) + c * s
+        rate = float(flash_params.get("strobe_rate", 0.0))
+        if rate > 0:
+            # rate is frames-per-flash; every ceil(rate) frames alternate
+            period = max(int(round(rate)), 2)
+            if ti % period == 0:
+                s = float(flash_params.get("strobe_strength", 0.3))
+                out = out * (1 - s) + s  # white strobe
+        return out.clamp(0, 1)
+
+    # ------------------------------------------------------------------
+    # Palette cycle (HSV hue rotation advancing with ti)
+    # ------------------------------------------------------------------
+    def _sample_palette_recipe(self, T, speed_range=(0.02, 0.12), sat_boost=1.0):
+        """Hue-rotation cycle. Speed is in hue-units-per-frame ([0, 1] cycle)."""
+        return {
+            "enable": True,
+            "speed": float(torch.empty(1).uniform_(*speed_range).item()),
+            "phase0": float(torch.empty(1).uniform_(0, 1).item()),
+            "sat_boost": float(sat_boost),
+        }
+
+    @staticmethod
+    def _rgb_to_hsv_image(rgb):
+        """rgb: (B, 3, H, W) in [0, 1]. Returns (h, s, v) each (B, 1, H, W)."""
+        r, g, b = rgb[:, 0:1], rgb[:, 1:2], rgb[:, 2:3]
+        max_c, _ = rgb.max(dim=1, keepdim=True)
+        min_c, _ = rgb.min(dim=1, keepdim=True)
+        delta = (max_c - min_c).clamp_min(1e-8)
+        # Hue
+        rc = (max_c - r) / delta
+        gc = (max_c - g) / delta
+        bc = (max_c - b) / delta
+        h = torch.where(max_c == r, bc - gc,
+              torch.where(max_c == g, 2.0 + rc - bc, 4.0 + gc - rc))
+        h = (h / 6.0) % 1.0
+        # If max==min (gray), hue undefined → 0
+        h = torch.where(delta < 1e-7, torch.zeros_like(h), h)
+        s = torch.where(max_c < 1e-7, torch.zeros_like(max_c), delta / max_c)
+        v = max_c
+        return h, s, v
+
+    @staticmethod
+    def _hsv_to_rgb_image(h, s, v):
+        """h, s, v each (B, 1, H, W). Returns (B, 3, H, W)."""
+        h6 = (h % 1.0) * 6.0
+        i = h6.floor()
+        f = h6 - i
+        p = v * (1 - s)
+        q = v * (1 - s * f)
+        t = v * (1 - s * (1 - f))
+        i = i.long() % 6
+        # Assemble by case
+        out = torch.zeros(h.shape[0], 3, h.shape[2], h.shape[3], device=h.device, dtype=h.dtype)
+        sel = i.squeeze(1)
+        # For each of 6 hue regions:
+        masks = [(sel == k) for k in range(6)]
+        rgb_by_case = [
+            (v, t, p), (q, v, p), (p, v, t),
+            (p, q, v), (t, p, v), (v, p, q),
+        ]
+        for k in range(6):
+            m = masks[k].unsqueeze(1).float()
+            rr, gg, bb = rgb_by_case[k]
+            out[:, 0:1] = out[:, 0:1] + rr * m
+            out[:, 1:2] = out[:, 1:2] + gg * m
+            out[:, 2:3] = out[:, 2:3] + bb * m
+        return out.clamp(0, 1)
+
+    def _apply_palette_cycle(self, canvas, ti, palette_params):
+        """Rotate hue by speed*ti + phase0. canvas: (B, 3, H, W)."""
+        if palette_params is None or not palette_params.get("enable", False):
+            return canvas
+        speed = float(palette_params["speed"])
+        phase = float(palette_params["phase0"])
+        shift = (speed * ti + phase) % 1.0
+        sat_boost = float(palette_params.get("sat_boost", 1.0))
+        h, s, v = self._rgb_to_hsv_image(canvas)
+        h = (h + shift) % 1.0
+        if sat_boost != 1.0:
+            s = (s * sat_boost).clamp(0, 1)
+        return self._hsv_to_rgb_image(h, s, v)
