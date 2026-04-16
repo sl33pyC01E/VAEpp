@@ -37,6 +37,11 @@ class ArcadeMixin:
             "bg_color": [float(torch.empty(1).uniform_(0.0, 0.08).item()) for _ in range(3)],
             "fg_color": [float(torch.empty(1).uniform_(0.7, 1.0).item()) for _ in range(3)],
             "accent": [float(torch.empty(1).uniform_(0.5, 1.0).item()) for _ in range(3)],
+            # Randomize which way is "down" per scene — flips the rendered
+            # output horizontally and/or vertically at composite time, so
+            # pong / tetris / breakout etc don't always orient the same way.
+            "flip_x": bool(torch.rand(1).item() < 0.5),
+            "flip_y": bool(torch.rand(1).item() < 0.5),
         }
 
     # ------------------------------------------------------------------
@@ -58,7 +63,14 @@ class ArcadeMixin:
             "asteroids": self._arcade_asteroids,
         }
         fn = dispatch.get(mode, self._arcade_pong)
-        return fn(canvas, ti, ap)
+        out = fn(canvas, ti, ap)
+        # Per-scene orientation — mirrors "down" direction, drops the
+        # always-looks-the-same bias.
+        if ap.get("flip_x", False):
+            out = out.flip(-1)
+        if ap.get("flip_y", False):
+            out = out.flip(-2)
+        return out
 
     # ------------------------------------------------------------------
     # Rect fill helper (in-place on an alpha layer) + composite utility

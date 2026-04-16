@@ -207,6 +207,21 @@ class ParticlesMixin:
         else:
             return {"enable": False}
 
+        # Randomize scene orientation by flipping the whole trajectory set
+        # (initial positions, velocities, and gravity). Gives 4 equally-
+        # likely variants per sample: normal / mirror-x / flip-y / both.
+        H_, W_ = self.H, self.W
+        flip_x = rng.random() < 0.5
+        flip_y = rng.random() < 0.5
+        if flip_x:
+            xs = [W_ - x for x in xs]
+            vxs = [-vx for vx in vxs]
+            params["wind"] = -params.get("wind", 0.0)
+        if flip_y:
+            ys = [H_ - y for y in ys]
+            vys = [-vy for vy in vys]
+            params["gravity"] = -params.get("gravity", 0.0)
+
         return {
             "enable": True,
             "preset": preset,
@@ -214,6 +229,7 @@ class ParticlesMixin:
             "xs": xs, "ys": ys, "vxs": vxs, "vys": vys,
             "lives": lives, "sizes": sizes, "colors": colors,
             "params": params,
+            "flip_x": flip_x, "flip_y": flip_y,
         }
 
     # ------------------------------------------------------------------

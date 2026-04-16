@@ -26,16 +26,27 @@ class MotionMixin:
         """
         H, W = self.H, self.W
 
-        # Initial positions
-        x = torch.rand(B, M, device=self.device) * W
-        y = torch.rand(B, M, device=self.device) * H * 0.5  # start upper half
+        # Per-(batch, stamp) "down" direction: gravity vector is (gx, gy) with
+        # |g|=gravity_mag and angle picked uniformly. Same initial-position
+        # convention by rotating spawn region accordingly.
+        grav_angle = torch.rand(B, M, device=self.device) * 2 * math.pi
+        grav_mag = torch.rand(B, M, device=self.device) * 3 + 1  # pixels/frame^2
+        gx = grav_mag * torch.cos(grav_angle)
+        gy = grav_mag * torch.sin(grav_angle)
+
+        # Initial positions spawned on the "up" side of the gravity vector —
+        # i.e. offset in the -g direction from canvas center, so particles
+        # still travel across the scene.
+        cx, cy = W * 0.5, H * 0.5
+        spread = 0.35 * min(H, W)
+        x = cx - gx / grav_mag.clamp(min=1e-3) * spread + (torch.rand(B, M, device=self.device) - 0.5) * W
+        y = cy - gy / grav_mag.clamp(min=1e-3) * spread + (torch.rand(B, M, device=self.device) - 0.5) * H
+        x = x.clamp(0, W)
+        y = y.clamp(0, H)
 
         # Initial velocities (pixels per frame)
         vx = (torch.rand(B, M, device=self.device) - 0.5) * 15
         vy = (torch.rand(B, M, device=self.device) - 0.5) * 5
-
-        # Gravity
-        gravity = torch.rand(B, M, device=self.device) * 3 + 1  # pixels/frame^2
 
         # Scale: start + oscillation
         scale_base = torch.rand(B, M, device=self.device) * 1.0 + 0.3
@@ -57,8 +68,9 @@ class MotionMixin:
             trajectories[:, :, ti, 2] = scale_t
             trajectories[:, :, ti, 3] = rot
 
-            # Update physics
-            vy = vy + gravity  # gravity pulls down
+            # Update physics with per-stamp gravity vector (not axis-locked)
+            vx = vx + gx
+            vy = vy + gy
             x = x + vx
             y = y + vy
             rot = rot + rot_speed
