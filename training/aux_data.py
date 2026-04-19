@@ -327,7 +327,7 @@ class AuxVideoDataset(IterableDataset):
                                       self.T, self.W, self.H)
                 if arr is not None:
                     # (T, H, W, 3) uint8 -> (T, 3, H, W) uint8
-                    t = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
+                    t = torch.from_numpy(arr.copy()).permute(0, 3, 1, 2).contiguous()
                     yield t
                     break
                 retry += 1

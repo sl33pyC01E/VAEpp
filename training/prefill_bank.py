@@ -136,13 +136,16 @@ class PrefillBank:
             n = len(raw) // frame_bytes
             if n < self.T:
                 return None
+            start = random.randint(0, n - self.T) if n > self.T else 0
+            offset = start * frame_bytes
             arr = np.frombuffer(
                 raw, dtype=np.uint8,
-                count=self.T * frame_bytes).reshape(
+                count=self.T * frame_bytes,
+                offset=offset).reshape(
                     self.T, self.H, self.W, 3)
             # (T, H, W, 3) -> (T, 3, H, W)
             return torch.from_numpy(
-                arr).permute(0, 3, 1, 2).contiguous()
+                arr.copy()).permute(0, 3, 1, 2).contiguous()
         except Exception:
             return None
 
