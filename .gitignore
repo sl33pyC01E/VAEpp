@@ -35,3 +35,8 @@ _portable/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local tooling / generated
+.claude/
+prefill_banks/
+trainingdata/

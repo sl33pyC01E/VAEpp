@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from gui.common import BG, BG_PANEL, FG, ACCENT, FONT_BOLD
-from gui.data_tabs import GeneratorTab, VideoGenTab
+from gui.data_tabs import GeneratorTab, VideoGenTab, PrefillBankTab
 from gui.models_tabs import (
     TrainingTab, InferenceTab, ConvertTab, VideoTrainTab, VideoTrain3DTab,
     VideoInferenceTab,
@@ -49,6 +49,7 @@ class App(tk.Tk):
         data_nb.pack(fill="both", expand=True)
         data_nb.add(GeneratorTab(data_nb), text="Static Gen")
         data_nb.add(VideoGenTab(data_nb), text="Video Gen")
+        data_nb.add(PrefillBankTab(data_nb), text="Prefill Bank")
         nb.add(data_frame, text="Data")
 
         # -- Models --

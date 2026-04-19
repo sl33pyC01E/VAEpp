@@ -55,6 +55,14 @@ class ProcRunner:
         return self._thread is not None and self._thread.is_alive()
 
     def run(self, cmd, cwd=None):
+        # If a previous thread is still alive, give it up to 2 s to
+        # finish — this covers the common "just killed, subprocess is
+        # dying, reader thread is draining stdout" window. Earlier
+        # check used `self.proc is None` which only becomes true
+        # AFTER the finally block runs, so it never matched during
+        # the window it was meant to catch.
+        if self.running:
+            self._thread.join(timeout=2.0)
         if self.running:
             self._append("[Already running]\n")
             return
@@ -96,11 +104,27 @@ class ProcRunner:
     def kill(self):
         proc = self.proc  # snapshot to avoid race with finally block
         if proc:
+            if sys.platform == "win32":
+                # Tree-kill: taskkill /F /T hits the entire process
+                # tree so DataLoader workers, ffmpeg subprocesses,
+                # etc. die atomically with the parent. Without this,
+                # children hold stdout open and our reader thread
+                # hangs, making the next Run spuriously fire
+                # "[Already running]".
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        capture_output=True, timeout=5)
+                except Exception:
+                    pass
+            # Belt + suspenders: proc.kill() in case taskkill missed
+            # (wrong PATH, access denied, etc.) or the platform isn't
+            # Windows. Idempotent if already dead.
             try:
                 proc.kill()
-                self._append("\n[Killed]\n")
             except (ProcessLookupError, OSError):
                 pass
+            self._append("\n[Killed]\n")
 
     def _append(self, text):
         self.log.after(0, self._do_append, text)

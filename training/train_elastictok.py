@@ -344,7 +344,9 @@ def save_preview(model, gen, logdir, step, device, pT, keeps, patch_size,
                   max_toks, block_size,
                   preview_image=None, preview_frame_skip=0,
                   overfit_clip=None, H=None, W=None,
-                  haar_levels: int = 0):
+                  haar_levels: int = 0,
+                  overfit_video_path: str = None,
+                  overfit_frame_skip: int = 0):
     """Preview MP4 with optional ref video row + 2 synth clips row.
 
     If `overfit_clip` (1, T, 3, H, W in [0,1]) is provided, it replaces
@@ -374,7 +376,29 @@ def save_preview(model, gen, logdir, step, device, pT, keeps, patch_size,
         if overfit_clip is not None:
             # Use the same clip twice; the recon difference will come
             # from stochastic tail-drop at preview time (if keeps differ).
-            clips = overfit_clip[:1].repeat(2, 1, 1, 1, 1)
+            # If the cached training tensor is shorter than pT (training
+            # uses args.T frames, preview wants pT), re-decode pT frames
+            # from the source path — same pattern the ref-video branch
+            # uses. The model recon chunks via _reconstruct_at_keep so
+            # pT > max_sequence_length is already handled.
+            if (overfit_video_path and
+                    overfit_clip.shape[1] < pT and
+                    os.path.exists(overfit_video_path)):
+                frames = _decode_video_frames(
+                    overfit_video_path, int(overfit_frame_skip or 0),
+                    pT, W, H)
+                if frames:
+                    while len(frames) < pT:
+                        frames.append(frames[-1])
+                    arr = (np.stack(frames[:pT]).astype(np.float32)
+                           / 255.0)  # (pT, H, W, 3)
+                    big = torch.from_numpy(arr).permute(
+                        0, 3, 1, 2).unsqueeze(0).to(device)  # (1, pT, 3, H, W)
+                    clips = big.repeat(2, 1, 1, 1, 1)
+                else:
+                    clips = overfit_clip[:1].repeat(2, 1, 1, 1, 1)
+            else:
+                clips = overfit_clip[:1].repeat(2, 1, 1, 1, 1)
         else:
             has_pool = (hasattr(gen, "_recipe_pool") and gen._recipe_pool
                         and getattr(gen, "_motion_pool_T", None) == pT)
@@ -706,12 +730,54 @@ def train(args):
             f"Pick H/W/patch_size/haar so the token grid is a multiple of "
             f"max_toks, or set --max-toks={L_train}.")
     n_blocks = L_train // cfg.max_toks
+    # Effective per-block keep upper bound. Defaults to block size
+    # (cfg.max_toks) for backward-compatible behaviour; --keep-upper
+    # lets you pin a smaller value (e.g. fixed keep=256 with block=3680
+    # when L=3680 isn't divisible by 256).
+    keep_upper_eff = (int(args.keep_upper)
+                      if int(args.keep_upper) > 0
+                      else cfg.max_toks)
+    if not (cfg.min_toks <= keep_upper_eff <= cfg.max_toks):
+        raise SystemExit(
+            f"keep_upper={keep_upper_eff} must satisfy "
+            f"min_toks ({cfg.min_toks}) <= keep_upper <= "
+            f"max_toks ({cfg.max_toks}).")
     haar_tag = (f" [Haar {haar_levels}x: {args.H}x{args.W} "
                 f"-> {H_post}x{W_post}, 3ch -> "
                 f"{3 * (4**haar_levels)}ch]") if haar_levels > 0 else ""
+    keep_tag = (f"  keep/block in [{cfg.min_toks}, {keep_upper_eff}]"
+                + ("" if keep_upper_eff == cfg.max_toks
+                   else f" (< block_size={cfg.max_toks})"))
     print(f"  grid (train T={args.T}): ({nT_train}, {nH}, {nW})  "
           f"L={L_train}  n_blocks={n_blocks}  "
-          f"block_size={cfg.max_toks}{haar_tag}", flush=True)
+          f"block_size={cfg.max_toks}{haar_tag}{keep_tag}", flush=True)
+
+    # Arch-tagged checkpoint filenames, same convention as
+    # train_video3d: the name carries enough arch info that you can
+    # eyeball it and know what config produced the weights. Plus a
+    # matching glob so we only prune checkpoints FROM THIS RUN's arch
+    # tag — runs with different patch/bottleneck/etc. settings kept
+    # side-by-side in the same logdir survive.
+    Tp_tag, Hp_tag, Wp_tag = patch_size
+    _patch_tag = f"p{Tp_tag}x{Hp_tag}x{Wp_tag}"
+    _mt_tag = f"mt{cfg.max_toks}"
+    _min_tag = f"kmin{cfg.min_toks}"
+    _ku_tag = (f"-ku{keep_upper_eff}"
+               if keep_upper_eff != cfg.max_toks else "")
+    if args.bottleneck_type == "vae":
+        _bn_tag = f"bn{int(args.vae_bottleneck_dim)}"
+    else:
+        _bn_tag = f"fsq{len(args.fsq_levels.split(','))}"
+    _haar_tag_f = f"-h{haar_levels}" if haar_levels > 0 else ""
+    _arch_stem = (f"elastictok-{args.config_name}-{_patch_tag}-"
+                  f"{_mt_tag}-{_min_tag}{_ku_tag}-{_bn_tag}"
+                  f"{_haar_tag_f}")
+
+    def _ckpt_name(step):
+        steps_k = f"{step // 1000}k" if step >= 1000 else str(step)
+        return f"{_arch_stem}-{steps_k}.pt"
+
+    _run_glob = f"{_arch_stem}-*.pt"
     preview_T_eff = int(args.preview_T) if args.preview_T else args.T
     if preview_T_eff != args.T:
         L_prev = (preview_T_eff // patch_size[0]) * nH * nW
@@ -851,7 +917,88 @@ def train(args):
                      preview_frame_skip=int(args.preview_frame_skip),
                      overfit_clip=overfit_clip,
                      H=args.H, W=args.W,
-                     haar_levels=haar_levels)
+                     haar_levels=haar_levels,
+                     overfit_video_path=args.overfit_video,
+                     overfit_frame_skip=int(args.overfit_frame_skip))
+
+    # -- Auxiliary real-video dataset (optional) --
+    # If --aux-data-dir is set, build an iterable DataLoader that
+    # streams random T-frame windows in parallel via ffmpeg. One
+    # single-clip stream that training consumes `batch_size` times per
+    # step; DataLoader(num_workers=K) parallelizes decode.
+    # Skipped entirely in overfit mode — the overfit clip overrides
+    # all other data sources, so there's no point probing / loading
+    # the aux dataset.
+    aux_iter = None
+    aux_frac = 0.0
+    if overfit_clip is not None and args.aux_data_dir:
+        print(f"  [aux-data] skipped: overfit mode active",
+              flush=True)
+    elif args.aux_data_dir and os.path.isdir(args.aux_data_dir):
+        from training.aux_data import (
+            AuxVideoDataset, aux_single_collate)
+        aux_ds = AuxVideoDataset(
+            args.aux_data_dir, H=args.H, W=args.W, T=args.T,
+            recursive=bool(int(args.aux_data_recursive)))
+        aux_loader = torch.utils.data.DataLoader(
+            aux_ds, batch_size=1,
+            num_workers=int(args.aux_data_workers),
+            persistent_workers=(int(args.aux_data_workers) > 0),
+            collate_fn=aux_single_collate)
+        aux_iter = iter(aux_loader)
+        aux_frac = max(0.0, min(1.0, float(args.aux_data_mix)))
+        n_aux = int(args.batch_size * aux_frac)
+        print(f"  [aux-data] enabled: mix={aux_frac:.2f} "
+              f"-> {n_aux}/{args.batch_size} clips/step from aux, "
+              f"workers={args.aux_data_workers}", flush=True)
+    elif args.aux_data_dir:
+        print(f"  [aux-data] WARNING: --aux-data-dir="
+              f"{args.aux_data_dir} not a directory — ignored",
+              flush=True)
+
+    # -- Prefill bank (read-only) --
+    # The training tab only CONSUMES a pre-built bank. Building /
+    # growing the bank happens in the Data -> Prefill Bank tab
+    # (subprocess: training.build_prefill). If the dir has no clips,
+    # we warn and disable. Skipped in overfit mode for the same
+    # reason the aux path is — overfit overrides all batch sources.
+    prefill_bank = None
+    prefill_frac = 0.0
+    if overfit_clip is not None and args.prefill_dir:
+        print(f"  [prefill] skipped: overfit mode active",
+              flush=True)
+    elif args.prefill_dir:
+        pfdir = args.prefill_dir
+        if not os.path.isabs(pfdir):
+            pfdir = str(logdir / pfdir)
+        if os.path.isdir(pfdir):
+            from training.prefill_bank import PrefillBank
+            prefill_bank = PrefillBank(
+                pfdir, H=args.H, W=args.W, T=args.T, verbose=False)
+            n_in_bank = prefill_bank.count()
+            if n_in_bank == 0:
+                print(f"  [prefill] WARNING: dir {pfdir} is empty. "
+                      f"Build the bank via the Prefill Bank tab first.",
+                      flush=True)
+                prefill_bank = None
+            else:
+                prefill_frac = max(
+                    0.0, min(1.0, float(args.prefill_mix)))
+                if aux_frac + prefill_frac > 1.0:
+                    over = aux_frac + prefill_frac
+                    print(f"  [prefill] WARN: aux_mix({aux_frac:.2f}) + "
+                          f"prefill_mix({prefill_frac:.2f}) = "
+                          f"{over:.2f} > 1.0. Clamping prefill to "
+                          f"{1.0 - aux_frac:.2f}.", flush=True)
+                    prefill_frac = max(0.0, 1.0 - aux_frac)
+                n_prefill = int(args.batch_size * prefill_frac)
+                print(f"  [prefill] enabled: dir={pfdir}  "
+                      f"mix={prefill_frac:.2f} -> {n_prefill}/"
+                      f"{args.batch_size} clips/step  "
+                      f"(bank has {n_in_bank} clips)", flush=True)
+        else:
+            print(f"  [prefill] WARNING: --prefill-dir={pfdir} is not "
+                  f"a directory — prefill disabled.", flush=True)
 
     # -- Training loop --
     model.train()
@@ -875,22 +1022,41 @@ def train(args):
                 pass
             break
 
-        # -- Data: overfit clip OR generator --
-        # Unified path for both disco/non-disco: always render from the
-        # pool. `_render_recipe` reads `gen.disco_quadrant` at render
-        # time, so disco gets applied correctly without bypassing the
-        # pool (which is what train_video3d.py does). The old
-        # "if disco: generate_sequence(**pool_kwargs)" branch was
-        # buggy because `pool_kwargs` only holds the effect-toggle
-        # flags — every OTHER kwarg in `generate_sequence` (physics,
-        # rotation, zoom, fade, viewport, pan/motion/viewport
-        # strengths, etc.) silently defaulted, so "disco" training
-        # saw a different data distribution than the pool and the
-        # preview. Single path = single distribution.
+        # -- Data: overfit > aux + prefill + generator pool mix --
+        # Overfit wins unconditionally. Otherwise the batch is a blend:
+        #   n_aux     clips from aux-data loader
+        #   n_prefill clips from prefill bank
+        #   n_gen     clips from gen.generate_from_pool (honors disco)
+        # Shares come from --aux-data-mix / --prefill-mix; generator
+        # gets whatever's left. Allocation is integer so we use floor
+        # and give the remainder to the generator.
         if overfit_clip is not None:
             clips = overfit_clip
         else:
-            clips = gen.generate_from_pool(args.batch_size).to(device)
+            B = args.batch_size
+            n_aux = int(B * aux_frac) if aux_iter is not None else 0
+            n_prefill = (int(B * prefill_frac)
+                         if prefill_bank is not None else 0)
+            # Clamp if mixes overallocate (shouldn't happen post-
+            # clamping earlier, but be safe).
+            if n_aux + n_prefill > B:
+                n_prefill = max(0, B - n_aux)
+            n_gen = B - n_aux - n_prefill
+            parts = []
+            if n_aux > 0:
+                aux_parts = [next(aux_iter) for _ in range(n_aux)]
+                parts.append(
+                    (torch.stack(aux_parts).float() / 255.0).to(device))
+            if n_prefill > 0:
+                pf = prefill_bank.sample_batch(n_prefill)
+                if pf is None:
+                    # Bank emptied mid-run (unlikely); fall back to gen.
+                    n_gen += n_prefill
+                else:
+                    parts.append(pf.to(device))
+            if n_gen > 0:
+                parts.append(gen.generate_from_pool(n_gen).to(device))
+            clips = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
 
         # [0,1] -> [-1,1]  (ref train.py: batch/127.5 - 1 from uint8)
         clip_m11 = clips * 2 - 1
@@ -910,9 +1076,12 @@ def train(args):
         B = vision.shape[0]
         L = vision.shape[1]
 
-        # Elastic tail-drop mask
+        # Elastic tail-drop mask. block_size = cfg.max_toks (required by
+        # the model's block-causal attention); keep upper bound is the
+        # separately-configurable keep_upper_eff (defaults to block size
+        # unless --keep-upper was set).
         enc_mask = elastic_mask(B, L, cfg.max_toks,
-                                 cfg.min_toks, cfg.max_toks, device)
+                                 cfg.min_toks, keep_upper_eff, device)
         att_mask = torch.ones(B, L, dtype=torch.bool, device=device)
         seg_ids = torch.zeros(B, L, dtype=torch.long, device=device)
         pos_ids = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
@@ -991,7 +1160,9 @@ def train(args):
                          preview_frame_skip=int(args.preview_frame_skip),
                          overfit_clip=overfit_clip,
                          H=args.H, W=args.W,
-                         haar_levels=haar_levels)
+                         haar_levels=haar_levels,
+                         overfit_video_path=args.overfit_video,
+                         overfit_frame_skip=int(args.overfit_frame_skip))
 
         if (args.save_every > 0 and step % args.save_every == 0
                 and step != start_step):
@@ -1000,9 +1171,17 @@ def train(args):
                       scheduler=sched.state_dict(),
                       step=step + 1, args=vars(args),
                       config=cfg.to_dict())
-            torch.save(d, str(logdir / f"elastictok_{step:06d}.pt"))
+            named = _ckpt_name(step)
+            torch.save(d, str(logdir / named))
             torch.save(d, str(logdir / "latest.pt"))
-            print(f"  checkpoint saved at step {step}", flush=True)
+            print(f"  saved {named}", flush=True)
+            # Prune older stepped ckpts matching THIS run's arch glob.
+            ckpts = sorted(
+                [f for f in logdir.glob(_run_glob)
+                 if f.name != "latest.pt"],
+                key=lambda p: p.stat().st_mtime)
+            while len(ckpts) > 10:
+                ckpts.pop(0).unlink(missing_ok=True)
 
         # Track resume point AFTER the iteration body completes.
         # If the loop is interrupted, `next_step` holds the last finished
@@ -1020,9 +1199,11 @@ def train(args):
               scheduler=sched.state_dict(),
               step=next_step, args=vars(args),
               config=cfg.to_dict())
+    named_final = _ckpt_name(next_step)
+    torch.save(d, str(logdir / named_final))
     torch.save(d, str(logdir / "latest.pt"))
     print(f"Done at step {next_step}/{args.total_steps}.  "
-          f"final ema={loss_ema}", flush=True)
+          f"saved {named_final}  final ema={loss_ema}", flush=True)
 
 
 def main():
@@ -1048,6 +1229,12 @@ def main():
     p.add_argument("--max-sequence-length", type=int, default=4096)
     p.add_argument("--max-toks", type=int, default=3680)
     p.add_argument("--min-toks", type=int, default=128)
+    p.add_argument("--keep-upper", type=int, default=0,
+                   help="Per-block keep upper bound. 0 (default) uses "
+                        "max_toks. Decouples elastic-mask range from the "
+                        "attention block size so you can train with a "
+                        "fixed small keep (min_toks=keep_upper) even when "
+                        "L is not divisible by that keep value.")
     p.add_argument("--frames-per-block", type=int, default=4)
     p.add_argument("--lpips-loss-ratio", type=float, default=0.1)
     # Clip geometry
@@ -1092,6 +1279,31 @@ def main():
                         "pool setup is skipped.")
     p.add_argument("--overfit-frame-skip", type=int, default=0,
                    help="Starting frame offset in --overfit-video.")
+    # Auxiliary real-video dataset. Walks a directory for video files,
+    # samples random T-frame windows stretched to (W, H). Fully
+    # replaces the generator when --aux-data-mix == 1.0; partially
+    # mixes otherwise (first floor(B*mix) of each batch from aux,
+    # remainder from generator).
+    p.add_argument("--aux-data-dir", default="",
+                   help="Directory of real video files to train on. "
+                        "Empty string disables.")
+    p.add_argument("--aux-data-mix", type=float, default=1.0,
+                   help="Fraction of each batch drawn from aux-data "
+                        "vs generator. 1.0 = all aux, 0.0 = none.")
+    p.add_argument("--aux-data-workers", type=int, default=4,
+                   help="DataLoader num_workers for parallel ffmpeg "
+                        "decode of aux clips.")
+    p.add_argument("--aux-data-recursive", type=int, default=1,
+                   help="If 1, recurse subdirectories of --aux-data-dir.")
+    # Prefill bank: READ-ONLY from the training script's POV.
+    # Build/grow/trim the bank via the Prefill Bank tab (Data ->
+    # Prefill Bank), which subprocesses training.build_prefill.
+    p.add_argument("--prefill-dir", default="",
+                   help="Directory containing a pre-built clip bank. "
+                        "Empty = off.")
+    p.add_argument("--prefill-mix", type=float, default=0.5,
+                   help="Fraction of each batch drawn from the prefill "
+                        "bank. 1.0 = all prefill, 0.0 = off.")
     args = p.parse_args()
     train(args)
 

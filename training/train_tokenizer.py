@@ -467,6 +467,21 @@ def train(args):
     keeps = sorted({min(int(k), args.n_queries) for k in args.keeps.split(",")})
     print(f"  preview keeps = {keeps}", flush=True)
 
+    # Arch-tagged checkpoint filenames. Same convention as
+    # train_video3d / train_elastictok: name carries enough info to
+    # identify the arch, and a run-scoped glob lets multiple runs in
+    # the same logdir live side-by-side without stepping on each
+    # other's prune.
+    _arch_stem = (f"tokenizer-q{args.n_queries}-kmin{args.min_keep}"
+                  f"-d{args.dim}x{args.depth}h{args.heads}"
+                  f"-bn{args.d_bottleneck}")
+
+    def _ckpt_name(step):
+        steps_k = f"{step // 1000}k" if step >= 1000 else str(step)
+        return f"{_arch_stem}-{steps_k}.pt"
+
+    _run_glob = f"{_arch_stem}-*.pt"
+
     # -- Training loop --
     tok.train()
     t0 = time.time()
@@ -550,15 +565,24 @@ def train(args):
         if args.save_every > 0 and step % args.save_every == 0 \
                 and step != start_step:
             d = _make_ckpt(tok, opt, sched, step, args)
-            torch.save(d, str(logdir / f"tokenizer_{step:06d}.pt"))
+            named = _ckpt_name(step)
+            torch.save(d, str(logdir / named))
             torch.save(d, str(logdir / "latest.pt"))
-            print(f"  checkpoint saved at step {step}", flush=True)
+            print(f"  saved {named}", flush=True)
+            # Prune older stepped ckpts matching THIS run's arch glob.
+            ckpts = sorted(
+                [f for f in logdir.glob(_run_glob)
+                 if f.name != "latest.pt"],
+                key=lambda p: p.stat().st_mtime)
+            while len(ckpts) > 10:
+                ckpts.pop(0).unlink(missing_ok=True)
 
     # Final save
     d = _make_ckpt(tok, opt, sched, args.total_steps, args)
+    named_final = _ckpt_name(args.total_steps)
+    torch.save(d, str(logdir / named_final))
     torch.save(d, str(logdir / "latest.pt"))
-    torch.save(d, str(logdir / f"tokenizer_{args.total_steps:06d}.pt"))
-    print(f"Done. Final loss_ema={loss_ema}", flush=True)
+    print(f"Done. saved {named_final}  final loss_ema={loss_ema}", flush=True)
 
 
 def _make_ckpt(tok, opt, sched, step, args):

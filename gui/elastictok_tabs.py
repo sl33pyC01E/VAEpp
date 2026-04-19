@@ -203,7 +203,7 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
 
         # Overfit-mode toggle row (left column).
         ov_row = tk.Frame(cfg_left, bg=BG_PANEL)
-        ov_row.pack(fill="x", pady=(5, 0))
+        ov_row.pack(fill="x", pady=(3, 0))
         self.overfit_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
             ov_row, text="Overfit on single video (instead of generator):",
@@ -224,9 +224,41 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
             ov_row, "Skip frames", default=0, width=5)
         f.pack(side="left")
 
+        # Aux real-video dataset row (left column). Walks a directory
+        # for video files, streams random T-frame windows via DataLoader
+        # workers. Overfit wins over this; mix < 1.0 blends with
+        # generator clips.
+        aux_row = tk.Frame(cfg_left, bg=BG_PANEL)
+        aux_row.pack(fill="x", pady=(3, 0))
+        tk.Label(aux_row, text="Aux dataset dir:",
+                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(
+                     side="left", padx=(0, 4))
+        self.aux_dir_var = tk.StringVar(
+            value=os.path.join(PROJECT_ROOT, "trainingdata", "frames"))
+        tk.Entry(aux_row, textvariable=self.aux_dir_var,
+                 bg=BG_INPUT, fg=FG, insertbackground=FG,
+                 font=FONT_SMALL).pack(
+                     side="left", fill="x", expand=True, padx=(0, 4))
+        make_btn(aux_row, "Browse", self._pick_aux_dir, BLUE, 8).pack(
+            side="left", padx=(0, 4))
+        make_btn(aux_row, "Clear",
+                 lambda: self.aux_dir_var.set(""), RED, 6).pack(
+                     side="left", padx=(0, 8))
+        f, self.aux_mix_var = make_float(
+            aux_row, "mix", "1.0", width=5)
+        f.pack(side="left", padx=(0, 8))
+        f, self.aux_workers_var = make_spin(
+            aux_row, "workers", default=4, width=4)
+        f.pack(side="left", padx=(0, 8))
+        self.aux_recursive_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(aux_row, text="recursive",
+                       variable=self.aux_recursive_var,
+                       bg=BG_PANEL, fg=FG, selectcolor=BG_INPUT,
+                       font=FONT_SMALL).pack(side="left")
+
         # Arch (left column)
         arch_row = tk.Frame(cfg_left, bg=BG_PANEL)
-        arch_row.pack(fill="x", pady=(5, 0))
+        arch_row.pack(fill="x", pady=(3, 0))
         self.cfg_var = tk.StringVar(value="debug")
         tk.Label(arch_row, text="config", bg=BG_PANEL, fg=FG_DIM,
                  font=FONT_SMALL).pack(side="left", padx=(0, 4))
@@ -247,7 +279,7 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
 
         # Sequence / mask / loss (left column)
         seq_row = tk.Frame(cfg_left, bg=BG_PANEL)
-        seq_row.pack(fill="x", pady=(5, 0))
+        seq_row.pack(fill="x", pady=(3, 0))
         f, self.max_seq_var = make_spin(
             seq_row, "max_sequence_length", default=4096, width=7)
         f.pack(side="left", padx=(0, 10))
@@ -256,6 +288,12 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
         f.pack(side="left", padx=(0, 10))
         f, self.min_toks_var = make_spin(
             seq_row, "min_toks", default=128, width=6)
+        f.pack(side="left", padx=(0, 10))
+        # keep_upper decouples the per-block keep upper bound from the
+        # attention block size. 0 = use max_toks (backward compat).
+        # Set equal to min_toks for fixed-K training at any K ≤ block.
+        f, self.keep_upper_var = make_spin(
+            seq_row, "keep_upper (0=max_toks)", default=0, width=7)
         f.pack(side="left", padx=(0, 10))
         f, self.fpb_var = make_spin(
             seq_row, "frames_per_block", default=4, width=5)
@@ -266,7 +304,7 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
 
         # Optim (left column)
         opt_row = tk.Frame(cfg_left, bg=BG_PANEL)
-        opt_row.pack(fill="x", pady=(5, 0))
+        opt_row.pack(fill="x", pady=(3, 0))
         f, self.lr_var = make_float(opt_row, "LR", "1e-4")
         f.pack(side="left", padx=(0, 10))
         f, self.end_lr_var = make_float(opt_row, "end_LR", "1e-4")
@@ -288,9 +326,33 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
         f.pack(side="left")
 
         # --- Right column ---
+        # Prefill bank (read-only here; build/grow in Data -> Prefill
+        # Bank). Loads clips from the dir + mixes them in at the given
+        # ratio. aux_mix + prefill_mix cap at 1.0; remainder = live gen.
+        pf_row = tk.Frame(cfg_right, bg=BG_PANEL)
+        pf_row.pack(fill="x", pady=(0, 0))
+        tk.Label(pf_row, text="Prefill bank dir:",
+                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(
+                     side="left", padx=(0, 4))
+        self.prefill_dir_var = tk.StringVar(
+            value=os.path.join(
+                PROJECT_ROOT, "prefill_banks", "default"))
+        tk.Entry(pf_row, textvariable=self.prefill_dir_var,
+                 bg=BG_INPUT, fg=FG, insertbackground=FG,
+                 font=FONT_SMALL).pack(
+                     side="left", fill="x", expand=True, padx=(0, 4))
+        make_btn(pf_row, "Browse", self._pick_prefill_dir,
+                 BLUE, 8).pack(side="left", padx=(0, 4))
+        make_btn(pf_row, "Clear",
+                 lambda: self.prefill_dir_var.set(""), RED, 6).pack(
+                     side="left", padx=(0, 8))
+        f, self.prefill_mix_var = make_float(
+            pf_row, "mix", "0.5", width=5)
+        f.pack(side="left")
+
         # Data
         data_row = tk.Frame(cfg_right, bg=BG_PANEL)
-        data_row.pack(fill="x", pady=(0, 0))
+        data_row.pack(fill="x", pady=(3, 0))
         f, self.bank_var = make_spin(data_row, "bank", default=5000, width=6)
         f.pack(side="left", padx=(0, 10))
         f, self.layers_var = make_spin(
@@ -306,7 +368,7 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
 
         # I/O (right column)
         io_row = tk.Frame(cfg_right, bg=BG_PANEL)
-        io_row.pack(fill="x", pady=(5, 0))
+        io_row.pack(fill="x", pady=(3, 0))
         f, self.log_every_var = make_spin(
             io_row, "log_every", default=1, width=4)
         f.pack(side="left", padx=(0, 10))
@@ -325,7 +387,7 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
 
         # Preview ref (right column)
         pimg_row = tk.Frame(cfg_right, bg=BG_PANEL)
-        pimg_row.pack(fill="x", pady=(5, 0))
+        pimg_row.pack(fill="x", pady=(3, 0))
         tk.Label(pimg_row, text="Preview video (optional):",
                  bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(
                      side="left", padx=(0, 4))
@@ -348,14 +410,14 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
 
         # Resume (right column)
         res_row = tk.Frame(cfg_right, bg=BG_PANEL)
-        res_row.pack(fill="x", pady=(5, 0))
+        res_row.pack(fill="x", pady=(3, 0))
         f, self.resume_var = make_float(
             res_row, "Resume",
             os.path.join(PROJECT_ROOT, "synthyper_elastictok_logs",
                          "latest.pt"), width=60)
         f.pack(side="left")
         chk = tk.Frame(cfg_right, bg=BG_PANEL)
-        chk.pack(fill="x", pady=(5, 0))
+        chk.pack(fill="x", pady=(3, 0))
         self.use_latest_var = tk.BooleanVar(value=False)
         tk.Checkbutton(chk, text="Resume from latest.pt",
                        variable=self.use_latest_var, bg=BG_PANEL, fg=FG,
@@ -381,7 +443,7 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
         # correct (no frame-misalignment scroll), fill=both on the
         # label is safe and gives the preview room to breathe.
         self.log = make_log(self)
-        self.log.configure(height=10)
+        self.log.configure(height=8)
         self.log.pack(side="bottom", fill="x", padx=5, pady=5)
         self.preview_label = tk.Label(self, bg=BG)
         self.preview_label.pack(fill="both", expand=True, pady=5)
@@ -389,7 +451,8 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
 
         for v in (self.H_var, self.W_var, self.T_var, self.patch_var,
                   self.haar_var, self.max_seq_var,
-                  self.max_toks_var, self.min_toks_var, self.bt_var,
+                  self.max_toks_var, self.min_toks_var,
+                  self.keep_upper_var, self.bt_var,
                   self.vae_bn_var, self.fsq_var, self.keeps_var,
                   self.cfg_var):
             try:
@@ -420,6 +483,12 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
             L = nT * nH * nW
             max_toks = int(self.max_toks_var.get())
             min_toks = int(self.min_toks_var.get())
+            try:
+                keep_upper_raw = int(self.keep_upper_var.get())
+            except Exception:
+                keep_upper_raw = 0
+            keep_upper = (keep_upper_raw if keep_upper_raw > 0
+                          else max_toks)
             n_blocks = L // max_toks if max_toks > 0 else 0
             bt = self.bt_var.get()
 
@@ -458,10 +527,13 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
             except Exception:
                 p_tag = ""
 
+            keep_tag = (f"tail-drop keep in [{min_toks}, {keep_upper}]"
+                        + (f" (< block {max_toks})"
+                           if keep_upper != max_toks else ""))
             head = (f"[{self.cfg_var.get()}]  "
                     f"grid ({nT},{nH},{nW})  L={L}  "
                     f"max_toks={max_toks}  n_blocks={n_blocks}  "
-                    f"tail-drop keep in [{min_toks}, {max_toks}]  "
+                    f"{keep_tag}  "
                     f"bottleneck={bt} ({tok_tag})"
                     f"{haar_tag}"
                     f"  | raw clip = {raw_floats:,} floats"
@@ -521,6 +593,18 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
         if path:
             self.overfit_vid_var.set(path)
 
+    def _pick_aux_dir(self):
+        path = filedialog.askdirectory(
+            title="Select aux dataset directory")
+        if path:
+            self.aux_dir_var.set(path)
+
+    def _pick_prefill_dir(self):
+        path = filedialog.askdirectory(
+            title="Select prefill bank directory")
+        if path:
+            self.prefill_dir_var.set(path)
+
     def start(self):
         cmd = [VENV_PYTHON, "-m",
                "training.train_elastictok",
@@ -533,6 +617,7 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
                "--max-sequence-length", str(self.max_seq_var.get()),
                "--max-toks", str(self.max_toks_var.get()),
                "--min-toks", str(self.min_toks_var.get()),
+               "--keep-upper", str(self.keep_upper_var.get()),
                "--frames-per-block", str(self.fpb_var.get()),
                "--lpips-loss-ratio", str(self.w_lpips_var.get()),
                "--T", str(self.T_var.get()),
@@ -564,6 +649,20 @@ class ElasticTokTrainTab(tk.Frame, _Mp4PreviewMixin):
             self.runner._append(
                 "[Overfit is toggled on but no video picked; "
                 "falling back to generator]\n")
+        # Aux real-video dataset (empty string = disabled).
+        aux_dir = self.aux_dir_var.get().strip()
+        if aux_dir:
+            cmd += ["--aux-data-dir", aux_dir,
+                    "--aux-data-mix", str(self.aux_mix_var.get()),
+                    "--aux-data-workers",
+                    str(self.aux_workers_var.get()),
+                    "--aux-data-recursive",
+                    "1" if self.aux_recursive_var.get() else "0"]
+        # Prefill bank (empty = off).
+        pf_dir = self.prefill_dir_var.get().strip()
+        if pf_dir:
+            cmd += ["--prefill-dir", pf_dir,
+                    "--prefill-mix", str(self.prefill_mix_var.get())]
         if self.disco_var.get():
             cmd.append("--disco")
         pvid = self.preview_img_var.get().strip()
@@ -641,7 +740,7 @@ class ElasticTokInfTab(tk.Frame, _Mp4PreviewMixin):
 
         # Input video row
         vid_row = tk.Frame(top, bg=BG_PANEL)
-        vid_row.pack(fill="x", pady=(5, 0))
+        vid_row.pack(fill="x", pady=(3, 0))
         tk.Label(vid_row, text="Input video:", bg=BG_PANEL, fg=FG_DIM,
                  font=FONT_SMALL).pack(side="left", padx=(0, 4))
         self.vid_var = tk.StringVar(value="")
@@ -656,7 +755,7 @@ class ElasticTokInfTab(tk.Frame, _Mp4PreviewMixin):
 
         # Params row
         par_row = tk.Frame(top, bg=BG_PANEL)
-        par_row.pack(fill="x", pady=(5, 0))
+        par_row.pack(fill="x", pady=(3, 0))
         f, self.T_var = make_spin(par_row, "T (frames)", default=48, width=5)
         f.pack(side="left", padx=(0, 10))
         f, self.skip_var = make_spin(par_row, "Frame skip", default=0,

@@ -1585,4 +1585,190 @@ class VideoGenTab(tk.Frame):
         self.after(33, self._play_video_loop, self._play_gen)
 
 
+# -- Prefill Bank Tab ----------------------------------------------------------
+# Generates + manages a directory of cached generator clips. Training
+# tabs (ElasticTok / Tokenizer) then sample from this bank at a user-
+# chosen mix ratio, skipping the CPU cost of live generation. Sub-
+# processes training.build_prefill with mode=grow / fill / trim / clear.
+
+class PrefillBankTab(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self.build()
+
+    def build(self):
+        top = tk.Frame(self, bg=BG_PANEL, padx=10, pady=10)
+        top.pack(fill="x", padx=5, pady=5)
+        tk.Label(top, text="Prefill Clip Bank",
+                 bg=BG_PANEL, fg=FG, font=FONT_TITLE).pack(anchor="w")
+        tk.Label(top,
+                 text=("Cache generated clips on disk once, sample from "
+                       "them during training.  Each .pt is a uint8 "
+                       "(T,3,H,W) tensor; 4-frame 368x640 clip = 2.83 MB."),
+                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL,
+                 justify="left", anchor="w").pack(
+                     fill="x", pady=(2, 8))
+
+        # Bank dir row
+        row = tk.Frame(top, bg=BG_PANEL)
+        row.pack(fill="x", pady=(0, 4))
+        tk.Label(row, text="Bank dir", bg=BG_PANEL, fg=FG_DIM,
+                 font=FONT_SMALL).pack(side="left", padx=(0, 4))
+        self.dir_var = tk.StringVar(
+            value=os.path.join(VAEPP_ROOT, "prefill_banks", "default"))
+        tk.Entry(row, textvariable=self.dir_var,
+                 bg=BG_INPUT, fg=FG, insertbackground=FG,
+                 font=FONT_SMALL).pack(
+                     side="left", fill="x", expand=True, padx=(0, 4))
+        make_btn(row, "Browse", self._pick_dir, BLUE, 8).pack(
+            side="left")
+
+        # Clip geometry row — must match what training uses
+        row = tk.Frame(top, bg=BG_PANEL)
+        row.pack(fill="x", pady=(4, 0))
+        f, self.H_var = make_spin(row, "H", default=368, width=5)
+        f.pack(side="left", padx=(0, 10))
+        f, self.W_var = make_spin(row, "W", default=640, width=5)
+        f.pack(side="left", padx=(0, 10))
+        f, self.T_var = make_spin(row, "T", default=4, width=4)
+        f.pack(side="left", padx=(0, 10))
+        tk.Label(row,
+                 text="(must match ElasticTok Train H / W / T)",
+                 bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL).pack(
+                     side="left")
+
+        # Generator config row
+        row = tk.Frame(top, bg=BG_PANEL)
+        row.pack(fill="x", pady=(4, 0))
+        f, self.bank_size_var = make_spin(
+            row, "bank", default=5000, width=6)
+        f.pack(side="left", padx=(0, 10))
+        f, self.n_layers_var = make_spin(
+            row, "layers", default=128, width=5)
+        f.pack(side="left", padx=(0, 10))
+        f, self.pool_var = make_spin(
+            row, "pool", default=200, width=5)
+        f.pack(side="left", padx=(0, 10))
+        self.disco_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row, text="Disco BG",
+                       variable=self.disco_var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG_INPUT, font=FONT_SMALL).pack(
+                           side="left", padx=(0, 10))
+        f, self.gen_batch_var = make_spin(
+            row, "gen batch", default=8, width=4)
+        f.pack(side="left")
+
+        # Action row
+        row = tk.Frame(top, bg=BG_PANEL)
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(row, text="Mode", bg=BG_PANEL, fg=FG_DIM,
+                 font=FONT_SMALL).pack(side="left", padx=(0, 4))
+        self.mode_var = tk.StringVar(value="grow")
+        tk.OptionMenu(row, self.mode_var,
+                      "grow", "fill", "trim", "clear").pack(
+                          side="left", padx=(0, 10))
+        f, self.n_clips_var = make_spin(
+            row, "n_clips (grow)", default=1000, width=6)
+        f.pack(side="left", padx=(0, 10))
+        f, self.target_var = make_spin(
+            row, "target (fill/trim)", default=8000, width=6)
+        f.pack(side="left")
+
+        # Button row
+        btn = tk.Frame(top, bg=BG_PANEL)
+        btn.pack(fill="x", pady=(10, 0))
+        make_btn(btn, "Run", self.start, GREEN).pack(
+            side="left", padx=(0, 5))
+        make_btn(btn, "Stop", self.kill, RED).pack(side="left")
+
+        # Bank status
+        status = tk.Frame(top, bg=BG_PANEL)
+        status.pack(fill="x", pady=(6, 0))
+        self.status_var = tk.StringVar(value="(no bank loaded)")
+        tk.Label(status, textvariable=self.status_var,
+                 bg=BG_PANEL, fg=ACCENT, font=FONT_SMALL,
+                 anchor="w").pack(fill="x")
+        make_btn(status, "Refresh count", self._refresh_count,
+                 BLUE, 14).pack(side="left", pady=(4, 0))
+
+        self.log = make_log(self)
+        self.log.pack(fill="both", expand=True, padx=5, pady=5)
+        self.runner = ProcRunner(self.log)
+
+        # Update the count on startup and whenever the dir changes.
+        self.dir_var.trace_add("write", lambda *a: self._refresh_count())
+        self.after(200, self._refresh_count)
+
+    def _pick_dir(self):
+        from tkinter import filedialog
+        p = filedialog.askdirectory(title="Pick prefill bank directory")
+        if p:
+            self.dir_var.set(p)
+
+    def _refresh_count(self):
+        try:
+            d = self.dir_var.get().strip()
+            if not d or not os.path.isdir(d):
+                self.status_var.set(f"(dir does not exist yet: {d})")
+                return
+            # Current format is mp4; legacy is .pt. Count both, show
+            # breakdown so stale .pt files are visible.
+            n_mp4 = 0
+            n_pt = 0
+            bytes_mp4 = 0
+            bytes_pt = 0
+            for f in os.listdir(d):
+                fp = os.path.join(d, f)
+                if f.startswith("clip_") and f.endswith(".mp4"):
+                    n_mp4 += 1
+                    try: bytes_mp4 += os.path.getsize(fp)
+                    except Exception: pass
+                elif f.startswith("clip_") and f.endswith(".pt"):
+                    n_pt += 1
+                    try: bytes_pt += os.path.getsize(fp)
+                    except Exception: pass
+            gb_mp4 = bytes_mp4 / (1024 ** 3)
+            gb_pt = bytes_pt / (1024 ** 3)
+            parts = [f"mp4: {n_mp4} clips ~{gb_mp4:.2f} GB"]
+            if n_pt > 0:
+                parts.append(
+                    f"legacy .pt: {n_pt} clips ~{gb_pt:.2f} GB "
+                    f"(run mode=clear to delete)")
+            self.status_var.set(
+                f"Bank ({d}): " + "  |  ".join(parts))
+        except Exception as e:
+            self.status_var.set(f"(err: {e})")
+
+    def start(self):
+        cmd = [VENV_PYTHON, "-m",
+               "training.build_prefill",
+               "--bank-dir", self.dir_var.get(),
+               "--mode", self.mode_var.get(),
+               "--n-clips", str(self.n_clips_var.get()),
+               "--target-size", str(self.target_var.get()),
+               "--H", str(self.H_var.get()),
+               "--W", str(self.W_var.get()),
+               "--T", str(self.T_var.get()),
+               "--bank-size", str(self.bank_size_var.get()),
+               "--n-layers", str(self.n_layers_var.get()),
+               "--pool-size", str(self.pool_var.get()),
+               "--gen-batch", str(self.gen_batch_var.get())]
+        if self.disco_var.get():
+            cmd.append("--disco")
+        self.runner.run(cmd, cwd=VAEPP_ROOT)
+        # Poll the bank count every 2s while the subprocess is
+        # running so the status row reflects progress live.
+        def _poll():
+            try:
+                self._refresh_count()
+            except Exception:
+                pass
+            if self.runner.running:
+                self.after(2000, _poll)
+        self.after(1000, _poll)
+
+    def kill(self):
+        self.runner.kill()
+
+
 # -- Video Training Tab --------------------------------------------------------
