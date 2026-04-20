@@ -641,16 +641,36 @@ def _handle_stop(sig, frame):
     print("\n[Stop requested]", flush=True)
 
 
-signal.signal(signal.SIGTERM, _handle_stop)
-signal.signal(signal.SIGINT, _handle_stop)
-if sys.platform == "win32":
-    signal.signal(signal.SIGBREAK, _handle_stop)
+def _install_signal_handlers():
+    """Register SIGTERM/SIGINT handlers for graceful shutdown.
+
+    Deferred to training entry (not module scope) because signal.signal
+    only works on the main thread — and this module is imported by the
+    GUI's inference tab from a background worker thread, which was
+    raising 'signal only works in main thread of the main interpreter'
+    on import. Called from train() (main thread via main()).
+    """
+    try:
+        signal.signal(signal.SIGTERM, _handle_stop)
+        signal.signal(signal.SIGINT, _handle_stop)
+        if sys.platform == "win32":
+            signal.signal(signal.SIGBREAK, _handle_stop)
+    except (ValueError, OSError):
+        # ValueError: "signal only works in main thread"
+        # OSError: handler can't be set on this platform.
+        # Either way, graceful stop via .stop sentinel still works.
+        pass
 
 
 def train(args):
     print("=" * 60)
     print("  ElasticTok (PyTorch port) — training")
     print("=" * 60, flush=True)
+
+    # Register graceful-stop signal handlers here (main thread), not
+    # at module scope — the inference tab imports this module from a
+    # background worker thread and signal.signal is main-thread-only.
+    _install_signal_handlers()
 
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
